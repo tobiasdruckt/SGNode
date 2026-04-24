@@ -17,7 +17,7 @@
 #define I2C_SCL 22
 
 // System configuration
-#define MEASUREMENT_INTERVAL 180  // seconds (configurable 60-300)
+#define MEASUREMENT_INTERVAL 180  // seconds (configurable 60-600)
 #define SAMPLE_COUNT 5            // samples per measurement (reduced for power efficiency)
 #define MAX_RETRIES 1             // transmission retry attempts
 #define MAX_INIT_RETRIES 3        // sensor initialization retry attempts
@@ -319,14 +319,13 @@ void configureUnusedGPIOs() {
     23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33  // Safe unused
   };
   
-  for (int i = 0; i < sizeof(unusedGpios); i++) {
+  for (int i = 0; i < sizeof(unusedGpios) / sizeof(unusedGpios[0]); i++) {
     pinMode(unusedGpios[i], OUTPUT);
     digitalWrite(unusedGpios[i], LOW);
   }
   
   if (debug_mode) Serial.println("Unused GPIOs configured as OUTPUT LOW for power saving");
 }
-
 float measureTilt() {
   float angles[SAMPLE_COUNT];
   int valid_samples = 0;

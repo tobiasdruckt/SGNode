@@ -29,13 +29,16 @@
 // ESP-NOW configuration
 #define ESPNOW_CHANNEL 1
 
-// Data structure for received data
+// Data structure for received data (must match float unit)
 typedef struct {
-  uint32_t timestamp;
+  uint16_t sequence_id;    // Rolling sequence number
+  uint32_t uptime_s;       // Uptime in seconds
   float angle;
   float density;
   float temperature;
-  uint8_t battery;
+  float battery_voltage;   // Battery voltage in volts
+  uint8_t flags;           // Bitfield: bit0=delayed, bit1=sensor_err, bit2=low_batt
+  uint16_t crc;            // CRC16 checksum
 } payload_t;
 
 // Calibration command structure
@@ -193,6 +196,7 @@ void checkExistingFermentation();
 void checkOGStability(float currentSG);
 void logOGToSD();
 float calculateABV(float og, float currentSG);
+uint8_t calculateBatteryPercentage(float voltage);
 
 void setup() {
   Serial.begin(115200);
@@ -278,8 +282,26 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
     payload_t receivedData;
     memcpy(&receivedData, incomingData, len);
     
-    Serial.printf("Received: angle=%.2f°, density=%.3f, temp=%.1f°C, battery=%d%%\n", 
-                  receivedData.angle, receivedData.density, receivedData.temperature, receivedData.battery);
+    // Verify CRC
+    size_t payload_size = sizeof(receivedData) - sizeof(receivedData.crc);
+    uint16_t calculated_crc = 0xFFFF;
+    for (size_t i = 0; i < payload_size; i++) {
+      calculated_crc ^= ((uint8_t*)&receivedData)[i];
+      for (uint8_t j = 0; j < 8; j++) {
+        calculated_crc = (calculated_crc >> 1) ^ (calculated_crc & 1 ? 0xA001 : 0);
+      }
+    }
+    
+    if (calculated_crc != receivedData.crc) {
+      Serial.printf("CRC mismatch: expected %d, got %d\n", receivedData.crc, calculated_crc);
+      return;
+    }
+    
+    uint8_t batteryPercent = calculateBatteryPercentage(receivedData.battery_voltage);
+    
+    Serial.printf("Received: seq=%d, angle=%.2f°, density=%.3f, temp=%.1f°C, battery=%.2fV (%d%%)\n", 
+                  receivedData.sequence_id, receivedData.angle, receivedData.density, 
+                  receivedData.temperature, receivedData.battery_voltage, batteryPercent);
     
     // Check OG stability if not yet captured
     if (!ogCaptured && fermentationFileOpen) {
@@ -446,11 +468,12 @@ void drawLiveView() {
   
   // Battery
   int battY = tempY + 30;
+  uint8_t batteryPercent = calculateBatteryPercentage(latest.battery_voltage);
   tft.setCursor(20, battY);
   tft.setTextColor(TFT_ORANGE);
   tft.print("Battery: ");
   tft.setTextColor(TFT_WHITE);
-  tft.printf("%d%%\n", latest.battery);
+  tft.printf("%d%%\n", batteryPercent);
   
   // Battery indicator bar
   int batteryBarX = 150;
@@ -459,11 +482,11 @@ void drawLiveView() {
   int batteryBarH = 20;
   
   tft.drawRect(batteryBarX, batteryBarY, batteryBarW, batteryBarH, TFT_WHITE);
-  int fillWidth = (latest.battery * batteryBarW) / 100;
+  int fillWidth = (batteryPercent * batteryBarW) / 100;
   
-  if (latest.battery > 50) {
+  if (batteryPercent > 50) {
     tft.fillRect(batteryBarX + 2, batteryBarY + 2, fillWidth - 4, batteryBarH - 4, TFT_GREEN);
-  } else if (latest.battery > 20) {
+  } else if (batteryPercent > 20) {
     tft.fillRect(batteryBarX + 2, batteryBarY + 2, fillWidth - 4, batteryBarH - 4, TFT_YELLOW);
   } else {
     tft.fillRect(batteryBarX + 2, batteryBarY + 2, fillWidth - 4, batteryBarH - 4, TFT_RED);
@@ -1078,7 +1101,7 @@ void createNewFermentationFile() {
   }
   
   // Write CSV header
-  file.println("timestamp,angle,density,temperature,battery");
+  file.println("uptime_s,angle,density,temperature,battery_voltage,battery_percent");
   file.close();
   
   strcpy(currentFermentationFile, filename);
@@ -1104,10 +1127,13 @@ void logDataToSD(payload_t data) {
   }
   
   // Write CSV data
-  file.printf("%lu,%.2f,%.4f,%.2f,%d\n", 
-             data.timestamp, data.angle, data.density, data.temperature, data.battery);
+  uint8_t batteryPercent = calculateBatteryPercentage(data.battery_voltage);
+  file.printf("%lu,%.2f,%.4f,%.2f,%.2f,%d\n", 
+             data.uptime_s, data.angle, data.density, data.temperature, 
+             data.battery_voltage, batteryPercent);
   
-  Serial.printf("Logged data to SD: SG=%.4f, Temp=%.2f°C\n", data.density, data.temperature);
+  Serial.printf("Logged data to SD: SG=%.4f, Temp=%.2f°C, Battery=%.2fV (%d%%)\n", 
+               data.density, data.temperature, data.battery_voltage, batteryPercent);
 }
 
 void checkOGStability(float currentSG) {
@@ -1168,9 +1194,6 @@ void logOGToSD() {
   // Write OG as a comment line in the CSV file
   file.printf("# OG_CAPTURED: %.4f at reading #%d\n", originalGravity, readingCount);
   
-  file.close();
-  
-  Serial.printf("Logged OG to SD: %.4f\n", originalGravity);
 }
 
 float calculateABV(float og, float currentSG) {
@@ -1181,4 +1204,13 @@ float calculateABV(float og, float currentSG) {
   if (abv < 0) abv = 0;
   
   return abv;
+}
+
+uint8_t calculateBatteryPercentage(float voltage) {
+  // Convert voltage to percentage (assuming 18650 Li-ion: 3.0V = 0%, 4.2V = 100%)
+  if (voltage <= 3.0) return 0;
+  if (voltage >= 4.2) return 100;
+  
+  // Linear interpolation between 3.0V and 4.2V
+  return (uint8_t)((voltage - 3.0) / 1.2 * 100);
 }

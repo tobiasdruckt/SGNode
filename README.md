@@ -1,4 +1,6 @@
-# Fermentation Monitoring System
+# SGNode - Fermentation Monitoring System
+
+**Version: 0.1.0-alpha**
 
 A two-part ESP32-based system for monitoring fermentation progress by measuring the tilt of a floating sensor device.
 
@@ -100,17 +102,19 @@ Calibration Switch:
 
 ### 1. Base Station Setup
 1. Insert MicroSD card into the base station's SD card slot
-2. Upload `Fermentation_Base.ino` to the base station ESP32
-3. On first boot, the system will check for existing fermentation files
-4. If existing files are found, you'll be prompted to continue or start new fermentation
-5. Use the touch screen to select your choice
-6. Open Serial Monitor to get the MAC address
-7. Note the MAC address for configuring the float unit
+2. Open the `SGNode_Base` folder in Arduino IDE
+3. Upload `SGNode_Base.ino` to the base station ESP32
+4. On first boot, the system will check for existing fermentation files
+5. If existing files are found, you'll be prompted to continue or start new fermentation
+6. Use the touch screen to select your choice
+7. Open Serial Monitor to get the MAC address
+8. Note the MAC address for configuring the float unit
 
 ### 2. Float Unit Setup
-1. Update the `baseStationMac` array in `Fermenttation_Float.ino` with the base station MAC address
-2. Upload `Fermenttation_Float.ino` to the float ESP32
-3. Perform calibration (see below)
+1. Open the `SGNode_Float` folder in Arduino IDE
+2. Update the `baseStationMac` array in `SGNode_Float.ino` with the base station MAC address
+3. Upload `SGNode_Float.ino` to the float ESP32
+4. Perform calibration (see below)
 
 ## Calibration Procedure
 
@@ -207,7 +211,7 @@ Reference points (4 points required):
 
 ### Float Unit
 - Powers on, takes measurements, transmits data, then enters deep sleep
-- Measurement interval: 120 seconds (configurable)
+- Measurement interval: 180 seconds (configurable 60-600)
 - Automatic power management for extended battery life
 
 ### Base Station
@@ -263,9 +267,9 @@ The base station automatically logs all fermentation data to a MicroSD card in C
 
 **CSV Format:**
 ```
-timestamp,angle,density,temperature,battery
-1234567890,7.1,1.071,20.5,71
-1234568010,7.2,1.070,20.6,70
+uptime_s,angle,density,temperature,battery_voltage,battery_percent
+1234567890,7.1,1.071,20.5,3.85,71
+1234568010,7.2,1.070,20.6,3.84,70
 ...
 ```
 
@@ -390,11 +394,14 @@ The float unit includes several power-saving features:
 
 ```
 Fermentation/
-├── Fermenttation_Float.ino    # Float unit firmware
-├── Fermentation_Base.ino      # Base station firmware
-├── polynomial_calibration.h   # Calibration functions
-├── README.md                  # This documentation
-└── WIRING_DIAGRAM.md          # Detailed wiring instructions
+├── SGNode_Float/
+│   ├── SGNode_Float.ino           # Float unit firmware
+│   └── polynomial_calibration.h   # Calibration functions
+├── SGNode_Base/
+│   ├── SGNode_Base.ino            # Base station firmware
+│   └── polynomial_calibration.h   # Calibration functions
+├── README.md                      # This documentation
+└── WIRING_DIAGRAM.md              # Detailed wiring instructions
 ```
 
 ## License
