@@ -399,9 +399,12 @@ Fermentation/
 │   └── polynomial_calibration.h   # Calibration functions
 ├── SGNode_Base/
 │   ├── SGNode_Base.ino            # Base station firmware
+│   ├── logo.h                     # Boot logo image data (RGB565)
 │   └── polynomial_calibration.h   # Calibration functions
 ├── README.md                      # This documentation
-└── WIRING_DIAGRAM.md              # Detailed wiring instructions
+├── hardware.md                    # Hardware specifications and BOM
+├── WIRING_DIAGRAM.md              # Detailed wiring instructions
+└── CHANGELOG.md                   # Project changelog
 ```
 
 ## License

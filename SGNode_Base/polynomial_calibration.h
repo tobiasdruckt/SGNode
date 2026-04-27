@@ -154,10 +154,13 @@ bool calculatePolynomialCoefficients() {
     
     // Solve using Gaussian elimination
     for (int col = 0; col < 4; col++) {
+        // Feed watchdog to prevent timeout during calculation
+        esp_task_wdt_reset(NULL);
+        
         // Find pivot row
         int pivot = col;
         for (int row = col + 1; row < 4; row++) {
-            if (abs(matrix[row][col]) > abs(matrix[pivot][col])) {
+            if (fabs(matrix[row][col]) > fabs(matrix[pivot][col])) {
                 pivot = row;
             }
         }
@@ -226,9 +229,13 @@ void saveCalibrationCoefficients() {
     uint8_t version = 1;
     EEPROM.put(EEPROM_CALIB_VERSION, version);
     
-    EEPROM.commit();
+    bool success = EEPROM.commit();
     
-    Serial.println("Calibration coefficients saved to EEPROM");
+    if (success) {
+        Serial.println("Calibration coefficients saved to EEPROM");
+    } else {
+        Serial.println("ERROR: Failed to save calibration coefficients to EEPROM");
+    }
 }
 
 /**
@@ -285,7 +292,7 @@ void testCalibrationAccuracy() {
     float totalError = 0;
     for (int i = 0; i < numCalibPoints; i++) {
         float calculated = calculateGravity(calibPoints[i].tilt);
-        float error = abs(calculated - calibPoints[i].gravity);
+        float error = fabs(calculated - calibPoints[i].gravity);
         totalError += error;
         
         Serial.printf("%4d  | %6.2f | %6.3f | %10.3f | %6.6f\n",

@@ -2,11 +2,19 @@
  * Fermentation Monitor - Float Unit (Sensor)
  * Measures tilt via BMI160 IMU and transmits via ESP-NOW
  * Battery-powered with deep sleep for power efficiency
+ * 
+ * REQUIRED LIBRARIES (install via Arduino Library Manager):
+ * - EmotiBit BMI160 (by Connected Future Labs) - Install from:
+ *   https://github.com/EmotiBit/EmotiBit_BMI160
+ *   Download as ZIP and install via Sketch -> Include Library -> Add .ZIP Library
+ * - Adafruit BMP085 Library (by Adafruit)
+ * - Wire (built-in)
+ * - EEPROM (built-in)
  */
 
 #include <WiFi.h>
 #include <esp_now.h>
-#include <BMI160.h>
+#include <BMI160Gen.h>
 #include <Wire.h>
 #include <Adafruit_BMP085.h>
 #include <esp_task_wdt.h>
@@ -35,26 +43,27 @@
 uint8_t baseStationMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 // Data structure for transmission
-typedef struct {
-  uint16_t sequence_id;    // Rolling sequence number
-  uint32_t uptime_s;       // Uptime in seconds
+typedef struct __attribute__((packed)) {
+  uint8_t version;        // Protocol version (current: 2)
+  uint16_t sequence_id;   // Rolling sequence number
+  uint32_t uptime_s;      // Uptime in seconds
   float angle;
   float density;
   float temperature;
-  float battery_voltage;   // Battery voltage in volts
-  uint8_t flags;           // Bitfield: bit0=delayed, bit1=sensor_err, bit2=low_batt
-  uint16_t crc;            // CRC16 checksum
+  float battery_voltage;  // Battery voltage in volts
+  uint8_t flags;          // Bitfield: bit0=delayed, bit1=sensor_err, bit2=low_batt
+  uint16_t crc;           // CRC16 checksum
 } payload_t;
 
 // Calibration command structure
-typedef struct {
+typedef struct __attribute__((packed)) {
   uint8_t command;        // 0=CALIBRATE_POINT1, 1=CALIBRATE_POINT2, 2=CALIBRATE_POINT3, 3=CALIBRATE_POINT4, 4=APPLY_CALIBRATION
   float target_sg;        // Target specific gravity for calibration point
   uint8_t request_id;     // Unique ID for response tracking
 } calib_command_t;
 
 // Calibration response structure
-typedef struct {
+typedef struct __attribute__((packed)) {
   uint8_t response_type;  // 0=CALIBRATION_DATA, 1=ACK, 2=ERROR
   float angle;           // Measured angle
   float sg;              // Calculated SG
@@ -64,7 +73,8 @@ typedef struct {
 
 payload_t sensorData;
 
-BMI160 bmi160;
+// BMI160 instance provided by EmotiBit_BMI160 library
+// No need to declare - library provides global BMI160 instance
 Adafruit_BMP085 bmp180;
 
 // Global variables for filtering and tracking
@@ -116,6 +126,17 @@ float medianFilter(float arr[], int n);
 float ema(float prev, float x, float alpha);
 
 void setup() {
+  // Configure pins first
+  pinMode(BATTERY_PIN, INPUT);
+  analogSetPinAttenuation(BATTERY_PIN, ADC_11db);
+  pinMode(CALIBRATION_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(LED_EXTRA, OUTPUT);
+  
+  // Initialize LEDs
+  digitalWrite(LED_BUILTIN, LOW);
+  digitalWrite(LED_EXTRA, LOW);
+  
   // Check calibration switch first to determine debug mode
   calibrationMode = (digitalRead(CALIBRATION_SWITCH_PIN) == LOW);
   debug_mode = calibrationMode;  // Debug mode enabled by calibration switch
@@ -129,8 +150,13 @@ void setup() {
   // Disable Bluetooth for power saving
   btStop();
   
-  // Initialize hardware watchdog (30s timeout)
-  esp_task_wdt_init(30, true);
+  // Initialize hardware watchdog (30s timeout) - new ESP-IDF signature
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 30000,
+    .idle_core_mask = 0,  // Watch all cores
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
   esp_task_wdt_add(NULL);
   
   // Initialize calibration system first
@@ -138,7 +164,15 @@ void setup() {
   
   // Configure I2C
   Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000); // 400 kHz I2C
+  Wire.setClock(100000); // 100 kHz I2C
+  
+  // Check I2C bus is working
+  Wire.beginTransmission(0x68); // BMI160 default address
+  if (Wire.endTransmission() != 0) {
+    if (debug_mode) Serial.println("I2C bus check failed - no device detected");
+  } else {
+    if (debug_mode) Serial.println("I2C bus initialized successfully");
+  }
   
   // Configure pins
   pinMode(BATTERY_PIN, INPUT);
@@ -225,6 +259,7 @@ void loop() {
       sensorData.battery_voltage = getBatteryVoltage();
       sensorData.uptime_s = (millis() / 1000) - boot_time;
       sensorData.sequence_id = sequence_counter++;
+      sensorData.version = 2;  // Protocol version 2
       sensorData.flags = 0;  // Clear flags
       currentState = SEND;
       break;
@@ -252,10 +287,10 @@ void loop() {
 
 void initIMU() {
   for (int i = 0; i < MAX_INIT_RETRIES; i++) {
-    if (bmi160.begin(BMI160GenClass::I2C_MODE)) {
+    if (BMI160.begin(BMI160GenClass::I2C_MODE)) {
       if (debug_mode) Serial.println("BMI160 initialized successfully");
-      bmi160.setAccelerometerRange(BMI160_ACCEL_RANGE_2G);
-      bmi160.setAccelerometerRate(BMI160_ACCEL_RATE_25HZ);  // Lower rate for power
+      BMI160.setAccelerometerRange(2);  // 2G range
+      BMI160.setAccelerometerRate(25);  // 25Hz for power saving
       if (debug_mode) Serial.println("IMU ready");
       return;
     }
@@ -269,7 +304,7 @@ void initIMU() {
 void initBMP180() {
   for (int i = 0; i < MAX_INIT_RETRIES; i++) {
     if (bmp180.begin()) {
-      bmp180.setSampling(Adafruit_BMP085::MODE_ULTRALOWPOWER);
+      // BMP085 library doesn't have setSampling, uses default settings
       if (debug_mode) Serial.println("BMP180 ready");
       return;
     }
@@ -282,6 +317,8 @@ void initBMP180() {
 
 void initESPNow() {
   WiFi.mode(WIFI_STA);
+  // esp_wifi_set_channel is deprecated in newer ESP-IDF versions
+  // ESP-NOW will automatically use the current WiFi channel
   
   if (esp_now_init() != ESP_OK) {
     if (debug_mode) Serial.println("Error initializing ESP-NOW");
@@ -299,7 +336,10 @@ void initESPNow() {
   }
   
   if (calibrationMode) {
-    esp_now_register_recv_cb(onCalibrationCommand);
+    // Register receive callback (new ESP-IDF signature)
+    esp_now_register_recv_cb([](const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
+      onCalibrationCommand(recv_info->src_addr, data, len);
+    });
     if (debug_mode) Serial.println("ESP-NOW initialized with calibration support");
   } else {
     if (debug_mode) Serial.println("ESP-NOW initialized (transmit only)");
@@ -309,11 +349,10 @@ void initESPNow() {
 void configureUnusedGPIOs() {
   // Configure unused GPIOs as OUTPUT LOW to minimize power consumption
   // Used GPIOs: 5(LED), 12(switch), 16(LED), 21(I2C_SDA), 22(I2C_SCL), 35(battery)
-  // Skip strapping pins (0, 2, 12, 15) and input-only pins (34-39)
+  // Skip strapping pins (0, 2, 12, 15), FLASH pins (6-11), and input-only pins (34-39)
   
   const uint8_t unusedGpios[] = {
     1, 3, 4,           // Safe unused
-    6, 7, 8, 9, 10, 11, // Safe unused
     13, 14,             // Safe unused (14 is JTAG, can be used)
     17, 18, 19, 20,     // Safe unused
     23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33  // Safe unused
@@ -326,6 +365,7 @@ void configureUnusedGPIOs() {
   
   if (debug_mode) Serial.println("Unused GPIOs configured as OUTPUT LOW for power saving");
 }
+
 float measureTilt() {
   float angles[SAMPLE_COUNT];
   int valid_samples = 0;
@@ -335,12 +375,16 @@ float measureTilt() {
   for (int i = 0; i < SAMPLE_COUNT; i++) {
     int ax_raw, ay_raw, az_raw;
     
-    if (bmi160.getAccelerometer(ax_raw, ay_raw, az_raw)) {
+    BMI160.readAccelerometer(ax_raw, ay_raw, az_raw);
+    
+    // Check if values are valid (non-zero)
+    if (ax_raw != 0 || ay_raw != 0 || az_raw != 0) {
       float ax = ax_raw / 16384.0;
       float ay = ay_raw / 16384.0;
       float az = az_raw / 16384.0;
       
-      float angle_rad = atan2(ax, az);
+      // Improved 3D tilt formula using all axes
+      float angle_rad = atan2(ax, sqrt(ay*ay + az*az));
       angles[valid_samples++] = angle_rad * 180.0 / PI;
       
       delay(200);  // 200ms between samples
@@ -420,9 +464,9 @@ float getBatteryVoltage() {
 }
 
 void transmitData() {
-  // Calculate CRC before transmission
-  size_t payload_size = sizeof(sensorData) - sizeof(sensorData.crc);
-  sensorData.crc = crc16((const uint8_t*)&sensorData, payload_size);
+  // Calculate CRC before transmission (exclude version from CRC for backward compatibility)
+  size_t payload_size = sizeof(sensorData) - sizeof(sensorData.crc) - sizeof(sensorData.version);
+  sensorData.crc = crc16((const uint8_t*)&sensorData + sizeof(sensorData.version), payload_size);
   
   if (debug_mode) Serial.println("Transmitting data...");
   
@@ -453,12 +497,16 @@ void transmitData() {
   if (!calibrationMode) {
     esp_now_deinit();
     WiFi.mode(WIFI_OFF);
-    esp_wifi_stop();
   }
 }
 
 void enterDeepSleep() {
   if (debug_mode) Serial.println("Entering deep sleep...");
+  
+  // Ensure WiFi/ESP-NOW is fully deinitialized before sleep
+  esp_now_deinit();
+  WiFi.mode(WIFI_OFF);
+  // esp_wifi_stop is deprecated in newer ESP-IDF versions
   
   // Adjust sleep interval based on battery voltage
   uint64_t sleep_duration = MEASUREMENT_INTERVAL * 1000000ULL;
@@ -466,6 +514,9 @@ void enterDeepSleep() {
     sleep_duration *= 2;  // Double interval at low voltage
     if (debug_mode) Serial.println("Low battery: doubling sleep interval");
   }
+  
+  // Flush Serial to ensure all debug output is sent before sleep
+  if (debug_mode) Serial.flush();
   
   esp_sleep_enable_timer_wakeup(sleep_duration);
   esp_deep_sleep_start();
