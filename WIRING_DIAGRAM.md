@@ -131,9 +131,10 @@ Key internal connections (for reference):
 - GPIO2: Display RESET
 - GPIO15: Touch CS
 - GPIO27: Touch IRQ
-- GPIO23: SPI MOSI (shared)
-- GPIO18: SPI SCK (shared)
-- GPIO19: SPI MISO (shared)
+- GPIO13: SD Card CS (Chip Select)
+- GPIO23: SPI MOSI (shared with display/SD)
+- GPIO18: SPI SCK (shared with display/SD)
+- GPIO19: SPI MISO (shared with display/SD)
 
 External connections:
 - USB Port: 5V power supply and programming

@@ -2,7 +2,41 @@
 
 All notable changes to SGNode will be documented in this file.
 
-## [Unreleased]
+## [0.2.0-beta] - 2026-04-28
+
+### Critical Fixes
+- **Fixed:** Missing `computeSensorData()` function causing state machine failure
+- **Fixed:** ESP-NOW broadcast communication - now uses reliable unicast with peer management
+- **Fixed:** Header multiple definition errors - converted globals to extern declarations
+- **Fixed:** Base station MAC address displaying as zeros - added WiFi initialization delay
+- **Fixed:** Calibration header design preventing project expansion
+- **Fixed:** Function prototype mismatches and missing implementations
+
+### Major Enhancements
+- **Added:** Comprehensive debug system with conditional compilation (DEBUG_NONE/ERROR/INFO/VERBOSE)
+- **Added:** Automatic ESP-NOW peer registration and MAC address tracking
+- **Added:** Enhanced error handling and recovery for ESP-NOW operations
+- **Added:** Complete state machine implementation (INIT/MEASURE/COMPUTE/SEND/SLEEP)
+- **Added:** Hardware watchdog timer for system reliability
+
+### Code Quality
+- **Improved:** Project structure - archived unnecessary files (~1.2MB saved)
+- **Improved:** Memory management with proper header/definition separation
+- **Improved:** Error reporting with detailed debug output
+- **Improved:** Calibration command reliability with unicast transmission
+
+### Performance
+- **Enhanced:** Sensor initialization with retry logic and error detection
+- **Enhanced:** Battery voltage monitoring with proper ADC configuration
+- **Enhanced:** Temperature filtering with EMA (Exponential Moving Average)
+- **Enhanced:** Deep sleep power management
+
+### Documentation
+- **Updated:** README.md with current features and installation instructions
+- **Updated:** Library requirements with specific BMI160 installation steps
+- **Added:** Recent fixes and improvements section
+
+## [0.1.0-alpha] - 2026-04-20
 
 ### Fixed
 - **Critical:** Added `__attribute__((packed))` to all payload structures to prevent memory alignment issues

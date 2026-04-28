@@ -33,8 +33,8 @@ struct CalibrationCoefficients {
     float norm_range;  // Normalization range
 };
 
-// Global calibration coefficients
-CalibrationCoefficients calibCoeffs;
+// Global calibration coefficients (extern declaration)
+extern CalibrationCoefficients calibCoeffs;
 
 // Calibration measurement points
 struct CalibrationPoint {
@@ -45,8 +45,8 @@ struct CalibrationPoint {
 
 // Maximum calibration points (for robust fitting)
 #define MAX_CALIB_POINTS 10
-CalibrationPoint calibPoints[MAX_CALIB_POINTS];
-int numCalibPoints = 0;
+extern CalibrationPoint calibPoints[MAX_CALIB_POINTS];
+extern int numCalibPoints;
 
 /**
  * Initialize calibration system

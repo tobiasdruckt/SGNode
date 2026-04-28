@@ -1,24 +1,32 @@
 # SGNode - Fermentation Monitoring System
 
-**Version: 0.1.0-alpha**
+**Version: 0.2.0-beta**
 
-A two-part ESP32-based system for monitoring fermentation progress by measuring the tilt of a floating sensor device.
+A robust two-part ESP32-based system for monitoring fermentation progress by measuring the tilt of a floating sensor device. Features real-time data display, calibration system, and comprehensive data logging.
 
 ## System Overview
 
-### Float Unit
+### Float Unit (Sensor)
 - Battery-powered autonomous sensor with WeMos D32 board
-- Measures tilt using BMI160 IMU sensor
-- Transmits data via ESP-NOW protocol
+- Measures tilt using BMI160 IMU sensor with advanced 3D tilt calculation
+- Measures temperature using BMP180 sensor with EMA filtering
+- Transmits data via ESP-NOW protocol with CRC verification
 - Deep sleep for power efficiency (weeks of battery life)
 - Built-in 18650 battery holder with charging circuit
 - LED indicators for status and calibration mode
+- Advanced polynomial calibration system (1st-3rd degree)
+- Hardware watchdog timer for reliability
 
-### Base Station
-- Receives data via ESP-NOW
-- Displays real-time data on TFT screen
-- Touch interface for user interaction
+### Base Station (Display)
+- Receives data via ESP-NOW with automatic peer management
+- Displays real-time data on TFT screen with modern UI
+- Touch interface for navigation and calibration
 - Historical graph visualization
+- SD card data logging with CSV format
+- OG (Original Gravity) stability detection
+- ABV (Alcohol By Volume) calculation
+- Dark/light theme support
+- Comprehensive debug system with conditional compilation
 
 ## Hardware Requirements
 
@@ -39,25 +47,28 @@ A two-part ESP32-based system for monitoring fermentation progress by measuring 
 ## Installation
 
 ### Required Libraries
-```cpp
-// For Float Unit
-#include <WiFi.h>
-#include <esp_now.h>
-#include <BMI160.h>
-#include <Wire.h>
-#include <Adafruit_BMP085.h>
 
-// For Base Station (4.0inch ESP32-32E Display)
-#include <WiFi.h>
-#include <esp_now.h>
-#include <TFT_eSPI.h>
-#include <XPT2046_Touchscreen.h>
-#include <FS.h>
-#include <SD.h>
-#include <SPI.h>
-```
+#### For Float Unit
+- **EmotiBit BMI160** (by Connected Future Labs) - Install from GitHub ZIP
+  - Download: https://github.com/EmotiBit/EmotiBit_BMI160
+  - Install via Sketch → Include Library → Add .ZIP Library
+- **Adafruit BMP085 Library** (by Adafruit)
+- **Wire** (built-in)
+- **EEPROM** (built-in)
 
-Install libraries using Arduino IDE Library Manager or PlatformIO.
+#### For Base Station (4.0inch ESP32-32E Display)
+- **TFT_eSPI** (by Bodmer)
+- **XPT2046_Touchscreen** (by Paul Stoffregen)
+- **SD** (built-in)
+- **FS** (built-in)
+- **SPI** (built-in)
+
+### Installation Steps
+1. Install Arduino IDE 2.0+
+2. Install required libraries via Library Manager
+3. For BMI160: Download ZIP from GitHub and install manually
+4. Configure TFT_eSPI User_Setup.h for 4.0inch ESP32-32E display
+5. Select appropriate board in Arduino IDE (ESP32 Dev Module)
 
 ## Wiring
 
@@ -207,19 +218,42 @@ Reference points (4 points required):
 - Point 3: Medium sugar solution (SG ≈ 1.080)
 - Point 4: Heavy sugar solution (SG ≈ 1.120)
 
+## Recent Fixes & Improvements (v0.2.0)
+
+### Critical Fixes
+- **✅ State Machine Completion** - Fixed missing `computeSensorData()` function
+- **✅ ESP-NOW Reliability** - Implemented unicast communication with peer management
+- **✅ Compilation Issues** - Resolved header multiple definition errors
+- **✅ MAC Address Display** - Fixed base station MAC address showing as zeros
+- **✅ Memory Management** - Proper separation of header declarations and definitions
+
+### Enhancements
+- **🔧 Debug System** - Comprehensive conditional compilation debug levels
+- **🔧 Peer Management** - Automatic float unit registration and tracking
+- **🔧 Error Handling** - Enhanced ESP-NOW error reporting and recovery
+- **🔧 Code Organization** - Clean project structure with unnecessary files archived
+
+### Performance
+- **⚡ Reliable Communication** - Unicast instead of broadcast for calibration commands
+- **⚡ Better Error Recovery** - Improved sensor initialization and retry logic
+- **⚡ Memory Optimization** - Efficient data structures and reduced footprint
+
 ## Operation
 
 ### Float Unit
 - Powers on, takes measurements, transmits data, then enters deep sleep
 - Measurement interval: 180 seconds (configurable 60-600)
 - Automatic power management for extended battery life
+- Complete state machine: INIT → MEASURE → COMPUTE → SEND → SLEEP
 
 ### Base Station
-- Continuous ESP-NOW reception
-- Two display modes:
+- Continuous ESP-NOW reception with automatic peer management
+- Three display modes:
   - **Live View**: Real-time data display
   - **Graph View**: Historical time-series visualization
+  - **Calibration View**: Step-by-step calibration wizard
 - Touch buttons to switch between views
+- Automatic OG stability detection and ABV calculation
 
 ## Display Features
 

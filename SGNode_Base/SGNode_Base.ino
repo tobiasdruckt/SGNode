@@ -10,6 +10,13 @@
  * - FS (built-in)
  */
 
+// Debug Configuration - Set debug level for compilation
+// DEBUG_NONE: No debug output (production)
+// DEBUG_ERROR: Only error messages
+// DEBUG_INFO: Info and error messages  
+// DEBUG_VERBOSE: All debug output
+#define DEBUG_LEVEL DEBUG_VERBOSE
+
 #include <WiFi.h>
 #include <esp_now.h>
 #include <TFT_eSPI.h>
@@ -17,7 +24,44 @@
 #include <FS.h>
 #include <SD.h>
 #include <SPI.h>
-#include "logo.h"
+#include "Logo2_Optimized.h"
+
+// Debug macros for conditional compilation
+#if DEBUG_LEVEL >= DEBUG_VERBOSE
+  #define DEBUG_VERBOSE_PRINT(x) Serial.print(x)
+  #define DEBUG_VERBOSE_PRINTLN(x) Serial.println(x)
+  #define DEBUG_VERBOSE_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+  #define DEBUG_VERBOSE_PRINT(x)
+  #define DEBUG_VERBOSE_PRINTLN(x)
+  #define DEBUG_VERBOSE_PRINTF(...)
+#endif
+
+#if DEBUG_LEVEL >= DEBUG_INFO
+  #define DEBUG_INFO_PRINT(x) Serial.print(x)
+  #define DEBUG_INFO_PRINTLN(x) Serial.println(x)
+  #define DEBUG_INFO_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+  #define DEBUG_INFO_PRINT(x)
+  #define DEBUG_INFO_PRINTLN(x)
+  #define DEBUG_INFO_PRINTF(...)
+#endif
+
+#if DEBUG_LEVEL >= DEBUG_ERROR
+  #define DEBUG_ERROR_PRINT(x) Serial.print(x)
+  #define DEBUG_ERROR_PRINTLN(x) Serial.println(x)
+  #define DEBUG_ERROR_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+  #define DEBUG_ERROR_PRINT(x)
+  #define DEBUG_ERROR_PRINTLN(x)
+  #define DEBUG_ERROR_PRINTF(...)
+#endif
+
+// Debug level constants
+#define DEBUG_NONE 0
+#define DEBUG_ERROR 1
+#define DEBUG_INFO 2
+#define DEBUG_VERBOSE 3
 
 // 4.0inch ESP32-32E Display configuration
 #define SCREEN_W    320
@@ -108,6 +152,9 @@ Theme darkTheme = {
 // Current theme and mode
 Theme* currentTheme = &lightTheme;
 bool darkMode = false;
+
+// Boot screen state
+bool bootScreenComplete = false;
 
 // Screen dirty flag for efficient display updates
 bool screenDirty = true;
@@ -234,11 +281,19 @@ const unsigned long TOUCH_CHECK_INTERVAL = 50; // ms
 #define BUTTON_NEW_W 100
 #define BUTTON_NEW_H 40
 
-// SD card and file management
 char currentFermentationFile[32] = "";
 bool fermentationFileOpen = false;
 bool rebootPromptShown = false;
 bool waitingForRebootChoice = false;
+bool sdCardInitialized = false;
+bool fermentationCheckDone = false;
+bool sdErrorMessageShown = false;
+unsigned long bootScreenCompleteTime = 0;
+#define SD_ERROR_DELAY 2000 // 2 seconds delay after boot screen
+
+// ESP-NOW peer management
+uint8_t lastFloatMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+bool floatPeerRegistered = false;
 
 // Calibration buttons (step-by-step wizard)
 #define BUTTON_CALIB_START_X 110
@@ -271,6 +326,7 @@ void initESPNow();
 void initDisplay();
 void initTouch();
 void initSDCard();
+void showSDErrorIfFailed();
 void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len);
 void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int len);
 void drawLiveView();
@@ -299,34 +355,54 @@ void drawCard(int x, int y, int w, int h);
 void drawButton(int x, int y, int w, int h, const char* label, bool active);
 void toggleTheme();
 void drawBootScreen();
+void drawLogo2Optimized(int16_t x, int16_t y);
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("=== Fermentation Base Station Starting ===");
+  DEBUG_INFO_PRINTLN("=== Fermentation Base Station Starting ===");
+  
+  // Initialize WiFi and display MAC address for ESP-NOW configuration
+  WiFi.mode(WIFI_STA);
+  delay(100); // Allow WiFi to initialize
+  DEBUG_INFO_PRINT("Base Station MAC Address: ");
+  DEBUG_INFO_PRINTLN(WiFi.macAddress());
   
   initDisplay();
+  
+  // Show boot screen immediately after display initialization
+  drawBootScreen();
+  
   initTouch();
   initSDCard();
   initESPNow();
-  
-  // Show boot screen first
-  drawBootScreen();
-  
-  // Check for existing fermentation and show prompt if needed
-  checkExistingFermentation();
-  
-  if (!waitingForRebootChoice) {
-    Serial.println("Base station ready");
-    // Initial screen draw
-    drawLiveView();
-  }
 }
 
 void loop() {
+  // Don't process anything during boot screen
+  if (!bootScreenComplete) {
+    delay(10);
+    return;
+  }
+  
   // Check for touch input
   if (millis() - lastTouchCheck > TOUCH_CHECK_INTERVAL) {
     checkTouch();
     lastTouchCheck = millis();
+  }
+  
+  // Show SD card error message if initialization failed (after boot screen)
+  showSDErrorIfFailed();
+  
+  // Check for existing fermentation after boot screen completes
+  if (!fermentationCheckDone) {
+    checkExistingFermentation();
+    fermentationCheckDone = true;
+    
+    if (!waitingForRebootChoice) {
+      DEBUG_INFO_PRINTLN("Base station ready");
+      // Initial screen draw
+      drawLiveView();
+    }
   }
   
   // Update display only when screen is dirty
@@ -349,14 +425,11 @@ void loop() {
 }
 
 void initESPNow() {
-  // Set device as a Wi-Fi Station
-  WiFi.mode(WIFI_STA);
-  // esp_wifi_set_channel is deprecated in newer ESP-IDF versions
   // ESP-NOW will automatically use the current WiFi channel
   
   // Initialize ESP-NOW
   if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
+    DEBUG_ERROR_PRINTLN("Error initializing ESP-NOW");
     return;
   }
   
@@ -365,29 +438,47 @@ void initESPNow() {
     onDataReceived(recv_info->src_addr, data, len);
   });
   
-  Serial.println("ESP-NOW initialized");
+  DEBUG_INFO_PRINTLN("ESP-NOW initialized");
 }
 
 void initDisplay() {
   tft.init();
   tft.setRotation(3); // Landscape mode
-  tft.fillScreen(currentTheme->background);
+  // Don't fill screen here - boot screen will handle it
   tft.setTextColor(currentTheme->textPrimary, currentTheme->background);
   
-  Serial.println("Display initialized");
+  DEBUG_INFO_PRINTLN("Display initialized");
 }
 
 void initTouch() {
   ts.begin();
   ts.setRotation(3);
   
-  Serial.println("Touch screen initialized");
+  DEBUG_INFO_PRINTLN("Touch screen initialized");
 }
 
 void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
   if (len == sizeof(payload_t)) {
     payload_t receivedData;
     memcpy(&receivedData, incomingData, len);
+    
+    // Track float MAC address for unicast communication
+    memcpy(lastFloatMac, mac, 6);
+    
+    // Register float as peer if not already registered
+    if (!floatPeerRegistered) {
+      esp_now_peer_info_t peerInfo;
+      memcpy(peerInfo.peer_addr, lastFloatMac, 6);
+      peerInfo.channel = ESPNOW_CHANNEL;
+      peerInfo.encrypt = false;
+      
+      if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+        floatPeerRegistered = true;
+        DEBUG_INFO_PRINTLN("Float unit registered as peer");
+      } else {
+        DEBUG_ERROR_PRINTLN("Failed to register float unit as peer");
+      }
+    }
     
     // Verify CRC (exclude version field for backward compatibility)
     size_t payload_size = sizeof(receivedData) - sizeof(receivedData.crc) - sizeof(receivedData.version);
@@ -400,18 +491,18 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
     }
     
     if (calculated_crc != receivedData.crc) {
-      Serial.printf("CRC mismatch: expected %d, got %d\n", receivedData.crc, calculated_crc);
+      DEBUG_ERROR_PRINTF("CRC mismatch: expected %d, got %d\n", receivedData.crc, calculated_crc);
       return;
     }
     
     // Check protocol version
     if (receivedData.version != 2) {
-      Serial.printf("Warning: Unknown protocol version %d\n", receivedData.version);
+      DEBUG_INFO_PRINTF("Warning: Unknown protocol version %d\n", receivedData.version);
     }
     
     uint8_t batteryPercent = calculateBatteryPercentage(receivedData.battery_voltage);
     
-    Serial.printf("Received: seq=%d, angle=%.2f°, density=%.3f, temp=%.1f°C, battery=%.2fV (%d%%)\n", 
+    DEBUG_VERBOSE_PRINTF("Received: seq=%d, angle=%.2f°, density=%.3f, temp=%.1f°C, battery=%.2fV (%d%%)\n", 
                   receivedData.sequence_id, receivedData.angle, receivedData.density, 
                   receivedData.temperature, receivedData.battery_voltage, batteryPercent);
     
@@ -449,7 +540,7 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
     calibrationModeActive = true;
     
   } else {
-    Serial.printf("Received invalid data size: %d bytes\n", len);
+    DEBUG_ERROR_PRINTF("Received invalid data size: %d bytes\n", len);
   }
 }
 
@@ -964,8 +1055,7 @@ void toggleTheme() {
   darkMode = !darkMode;
   currentTheme = darkMode ? &darkTheme : &lightTheme;
   
-  // Redraw entire screen with new theme
-  tft.fillScreen(currentTheme->background);
+  // Redraw screen with new theme
   screenDirty = true;
 }
 
@@ -973,14 +1063,26 @@ void drawBootScreen() {
   tft.fillScreen(currentTheme->background);
   
   // Center logo on screen
-  int logoX = (SCREEN_W - logo_width) / 2;
-  int logoY = (SCREEN_H - logo_height) / 2 - 20; // Move up to make room for text
+  int logoX = (SCREEN_W - logo2_width) / 2;
+  int logoY = (SCREEN_H - logo2_height) / 2 - 20; // Move up to make room for text
   
-  // Draw logo from RGB565 data using setAddrWindow and pushColors
-  tft.setAddrWindow(logoX, logoY, logo_width, logo_height);
-  tft.pushColors((uint16_t*)logo_data, logo_width * logo_height);
+  // Draw optimized logo (only non-white pixels)
+  drawLogo2Optimized(logoX, logoY);
   
   delay(2000); // Show boot screen for 2 seconds
+  
+  // Mark boot screen as complete and record time
+  bootScreenComplete = true;
+  bootScreenCompleteTime = millis();
+}
+
+void drawLogo2Optimized(int16_t x, int16_t y) {
+  // Draw each non-white pixel at the specified offset
+  for (uint16_t i = 0; i < logo2_pixel_count; i++) {
+    Pixel pixel = logo2_pixels[i];
+    // Draw pixel at screen coordinates (x + pixel.x, y + pixel.y)
+    tft.drawPixel(x + pixel.x, y + pixel.y, pixel.color);
+  }
 }
 
 void checkTouch() {
@@ -996,7 +1098,7 @@ void checkTouch() {
         continueFermentationFile();
         waitingForRebootChoice = false;
         screenDirty = true;
-        Serial.println("Continuing existing fermentation");
+        DEBUG_INFO_PRINTLN("Continuing existing fermentation");
       }
       
       if (touchX >= BUTTON_NEW_X && touchX <= BUTTON_NEW_X + BUTTON_NEW_W &&
@@ -1004,7 +1106,7 @@ void checkTouch() {
         createNewFermentationFile();
         waitingForRebootChoice = false;
         screenDirty = true;
-        Serial.println("Starting new fermentation");
+        DEBUG_INFO_PRINTLN("Starting new fermentation");
       }
       
       delay(50); // Debounce
@@ -1026,7 +1128,7 @@ void checkTouch() {
       if (currentMode != LIVE_VIEW) {
         currentMode = LIVE_VIEW;
         screenDirty = true;
-        Serial.println("Switched to Live View");
+        DEBUG_INFO_PRINTLN("Switched to Live View");
       }
     }
     
@@ -1036,7 +1138,7 @@ void checkTouch() {
       if (currentMode != GRAPH_VIEW) {
         currentMode = GRAPH_VIEW;
         screenDirty = true;
-        Serial.println("Switched to Graph View");
+        DEBUG_INFO_PRINTLN("Switched to Graph View");
       }
     }
     
@@ -1046,7 +1148,7 @@ void checkTouch() {
       if (currentMode != CALIBRATION_VIEW) {
         currentMode = CALIBRATION_VIEW;
         screenDirty = true;
-        Serial.println("Switched to Calibration View");
+        DEBUG_INFO_PRINTLN("Switched to Calibration View");
       }
     }
     
@@ -1058,7 +1160,7 @@ void checkTouch() {
           touchY >= BUTTON_CALIB_START_Y && touchY <= BUTTON_CALIB_START_Y + BUTTON_CALIB_START_H) {
         calibMode = CALIB_INSTRUCTIONS;
         screenDirty = true;
-        Serial.println("Started calibration wizard");
+        DEBUG_INFO_PRINTLN("Started calibration wizard");
       }
       
       // Next button (instructions to step 1)
@@ -1067,7 +1169,7 @@ void checkTouch() {
           touchY >= BUTTON_CALIB_NEXT_Y && touchY <= BUTTON_CALIB_NEXT_Y + BUTTON_CALIB_NEXT_H) {
         calibMode = CALIB_POINT1;
         screenDirty = true;
-        Serial.println("Moved to Step 1");
+        DEBUG_INFO_PRINTLN("Moved to Step 1");
       }
       
       // Record button for each step
@@ -1075,28 +1177,28 @@ void checkTouch() {
           touchX >= BUTTON_CALIB_RECORD_X && touchX <= BUTTON_CALIB_RECORD_X + BUTTON_CALIB_RECORD_W &&
           touchY >= BUTTON_CALIB_RECORD_Y && touchY <= BUTTON_CALIB_RECORD_Y + BUTTON_CALIB_RECORD_H) {
         sendCalibrationCommand(0, 1.000);
-        Serial.println("Sent calibration command for Point 1 (SG=1.000)");
+        DEBUG_INFO_PRINTF("Sent calibration command for Point 1 (SG=1.000)\n");
       }
       
       if (calibMode == CALIB_POINT2 &&
           touchX >= BUTTON_CALIB_RECORD_X && touchX <= BUTTON_CALIB_RECORD_X + BUTTON_CALIB_RECORD_W &&
           touchY >= BUTTON_CALIB_RECORD_Y && touchY <= BUTTON_CALIB_RECORD_Y + BUTTON_CALIB_RECORD_H) {
         sendCalibrationCommand(1, 1.040);
-        Serial.println("Sent calibration command for Point 2 (SG=1.040)");
+        DEBUG_INFO_PRINTF("Sent calibration command for Point 2 (SG=1.040)\n");
       }
       
       if (calibMode == CALIB_POINT3 &&
           touchX >= BUTTON_CALIB_RECORD_X && touchX <= BUTTON_CALIB_RECORD_X + BUTTON_CALIB_RECORD_W &&
           touchY >= BUTTON_CALIB_RECORD_Y && touchY <= BUTTON_CALIB_RECORD_Y + BUTTON_CALIB_RECORD_H) {
         sendCalibrationCommand(2, 1.080);
-        Serial.println("Sent calibration command for Point 3 (SG=1.080)");
+        DEBUG_INFO_PRINTF("Sent calibration command for Point 3 (SG=1.080)\n");
       }
       
       if (calibMode == CALIB_POINT4 &&
           touchX >= BUTTON_CALIB_RECORD_X && touchX <= BUTTON_CALIB_RECORD_X + BUTTON_CALIB_RECORD_W &&
           touchY >= BUTTON_CALIB_RECORD_Y && touchY <= BUTTON_CALIB_RECORD_Y + BUTTON_CALIB_RECORD_H) {
         sendCalibrationCommand(3, 1.120);
-        Serial.println("Sent calibration command for Point 4 (SG=1.120)");
+        DEBUG_INFO_PRINTF("Sent calibration command for Point 4 (SG=1.120)\n");
       }
       
       // Apply button
@@ -1105,7 +1207,7 @@ void checkTouch() {
           touchY >= BUTTON_CALIB_APPLY_Y && touchY <= BUTTON_CALIB_APPLY_Y + BUTTON_CALIB_APPLY_H) {
         applyCalibration();
         screenDirty = true;
-        Serial.println("Applied calibration");
+        DEBUG_INFO_PRINTLN("Applied calibration");
       }
       
       // Exit button
@@ -1116,7 +1218,7 @@ void checkTouch() {
         // Reset calibration data
         for (int i = 0; i < 4; i++) calibAngles[i] = 0.0;
         screenDirty = true;
-        Serial.println("Exited calibration mode");
+        DEBUG_INFO_PRINTLN("Exited calibration mode");
       }
     }
     
@@ -1125,23 +1227,46 @@ void checkTouch() {
 }
 
 void sendCalibrationCommand(uint8_t command, float target_sg) {
-  // Send calibration command to float unit
+  // Send calibration command to float unit using unicast
+  if (!floatPeerRegistered) {
+    DEBUG_ERROR_PRINTLN("Cannot send calibration command - float unit not registered");
+    return;
+  }
+  
   calib_command_t calibCmd;
   calibCmd.command = command;
   calibCmd.target_sg = target_sg;
   calibCmd.request_id = currentRequestId++;
   
-  esp_now_send(NULL, (uint8_t*)&calibCmd, sizeof(calibCmd));
+  esp_err_t result = esp_now_send(lastFloatMac, (uint8_t*)&calibCmd, sizeof(calibCmd));
+  
+  if (result == ESP_OK) {
+    DEBUG_INFO_PRINTF("Calibration command sent: cmd=%d, target_sg=%.3f, request_id=%d\n", 
+                      command, target_sg, currentRequestId - 1);
+  } else {
+    DEBUG_ERROR_PRINTF("Failed to send calibration command: %d\n", result);
+  }
 }
 
 void applyCalibration() {
   // Apply calibration - send command to calculate polynomial coefficients
+  if (!floatPeerRegistered) {
+    DEBUG_ERROR_PRINTLN("Cannot apply calibration - float unit not registered");
+    return;
+  }
+  
   calib_command_t calibCmd;
   calibCmd.command = 4; // APPLY_CALIBRATION
   calibCmd.target_sg = 0.0;
   calibCmd.request_id = currentRequestId++;
   
-  esp_now_send(NULL, (uint8_t*)&calibCmd, sizeof(calibCmd));
+  esp_err_t result = esp_now_send(lastFloatMac, (uint8_t*)&calibCmd, sizeof(calibCmd));
+  
+  if (result == ESP_OK) {
+    DEBUG_INFO_PRINTF("Apply calibration command sent: request_id=%d\n", currentRequestId - 1);
+  } else {
+    DEBUG_ERROR_PRINTF("Failed to send apply calibration command: %d\n", result);
+  }
 }
 
 void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int len) {
@@ -1149,7 +1274,7 @@ void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int 
   calib_response_t calibResp;
   memcpy(&calibResp, incomingData, len);
   
-  Serial.printf("Calibration response: angle=%.2f°, sg=%.3f, request_id=%d\n", 
+  DEBUG_VERBOSE_PRINTF("Calibration response: angle=%.2f°, sg=%.3f, request_id=%d\n", 
                 calibResp.angle, calibResp.sg, calibResp.request_id);
   
   if (calibResp.response_type == 0) {
@@ -1159,25 +1284,25 @@ void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int 
       if (calibResp.sg >= 0.995 && calibResp.sg <= 1.005) {
         // Point 1 - Water (SG=1.000)
         calibAngles[0] = calibResp.angle;
-        Serial.printf("Stored Point 1 angle: %.2f°\n", calibAngles[0]);
+        DEBUG_VERBOSE_PRINTF("Stored Point 1 angle: %.2f°\n", calibAngles[0]);
         calibMode = CALIB_POINT2;
         screenDirty = true;
       } else if (calibResp.sg >= 1.035 && calibResp.sg <= 1.045) {
         // Point 2 - Light Sugar (SG=1.040)
         calibAngles[1] = calibResp.angle;
-        Serial.printf("Stored Point 2 angle: %.2f°\n", calibAngles[1]);
+        DEBUG_VERBOSE_PRINTF("Stored Point 2 angle: %.2f°\n", calibAngles[1]);
         calibMode = CALIB_POINT3;
         screenDirty = true;
       } else if (calibResp.sg >= 1.075 && calibResp.sg <= 1.085) {
         // Point 3 - Medium Sugar (SG=1.080)
         calibAngles[2] = calibResp.angle;
-        Serial.printf("Stored Point 3 angle: %.2f°\n", calibAngles[2]);
+        DEBUG_VERBOSE_PRINTF("Stored Point 3 angle: %.2f°\n", calibAngles[2]);
         calibMode = CALIB_POINT4;
         screenDirty = true;
       } else if (calibResp.sg >= 1.115 && calibResp.sg <= 1.125) {
         // Point 4 - Heavy Sugar (SG=1.120)
         calibAngles[3] = calibResp.angle;
-        Serial.printf("Stored Point 4 angle: %.2f°\n", calibAngles[3]);
+        DEBUG_VERBOSE_PRINTF("Stored Point 4 angle: %.2f°\n", calibAngles[3]);
         calibMode = CALIB_COMPLETE;
         screenDirty = true;
       }
@@ -1186,36 +1311,51 @@ void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int 
 }
 
 void initSDCard() {
-  Serial.println("Initializing SD card...");
+  DEBUG_INFO_PRINTLN("Initializing SD card...");
   
   if (!SD.begin(SD_CS)) {
-    Serial.println("SD card initialization failed!");
-    tft.setTextColor(currentTheme->error);
-    tft.setTextSize(1);
-    tft.setCursor(10, 100);
-    tft.println("SD Card Failed!");
+    DEBUG_ERROR_PRINTLN("SD card initialization failed!");
+    sdCardInitialized = false;
     return;
   }
   
-  Serial.println("SD card initialized successfully");
+  DEBUG_INFO_PRINTLN("SD card initialized successfully");
+  sdCardInitialized = true;
   
   // Check if fermentation directory exists
   if (!SD.exists("/fermentation")) {
     SD.mkdir("/fermentation");
-    Serial.println("Created fermentation directory");
+    DEBUG_INFO_PRINTLN("Created fermentation directory");
+  }
+}
+
+void showSDErrorIfFailed() {
+  // Show error if SD card failed to initialize, boot screen is complete, and 2-second delay has passed
+  if (!sdCardInitialized && bootScreenComplete && !sdErrorMessageShown) {
+    // Check if 2-second delay has passed since boot screen completed
+    if (millis() - bootScreenCompleteTime >= SD_ERROR_DELAY) {
+      // Draw error message in lower right corner without background
+      tft.setTextColor(currentTheme->error);
+      tft.setTextSize(1);
+      tft.setCursor(SCREEN_W - 150, SCREEN_H - 20);
+      tft.println("SD Card Failed!");
+      
+      // Mark error message as shown
+      sdErrorMessageShown = true;
+    }
   }
 }
 
 void checkExistingFermentation() {
   if (!SD.begin(SD_CS)) {
-    Serial.println("SD card not available, skipping fermentation check");
+    DEBUG_ERROR_PRINTLN("SD card not available, skipping fermentation check");
     return;
   }
   
   // Check for existing fermentation files
   File root = SD.open("/fermentation");
   if (!root) {
-    Serial.println("Failed to open fermentation directory");
+    DEBUG_ERROR_PRINTLN("Failed to open fermentation directory");
     return;
   }
   
@@ -1227,7 +1367,7 @@ void checkExistingFermentation() {
       hasExistingFiles = true;
       // Get the most recent file
       strcpy(currentFermentationFile, file.name());
-      Serial.printf("Found existing fermentation file: %s\n", currentFermentationFile);
+      DEBUG_INFO_PRINTF("Found existing fermentation file: %s\n", currentFermentationFile);
       break;
     }
     file = root.openNextFile();
@@ -1292,7 +1432,7 @@ void createNewFermentationFile() {
   
   File file = SD.open(filename, FILE_WRITE);
   if (!file) {
-    Serial.println("Failed to create new fermentation file");
+    DEBUG_ERROR_PRINTLN("Failed to create new fermentation file");
     return;
   }
   
@@ -1304,12 +1444,12 @@ void createNewFermentationFile() {
   strcpy(currentFermentationFile, filename);
   fermentationFileOpen = true;
   
-  Serial.printf("Created new fermentation file: %s\n", currentFermentationFile);
+  DEBUG_INFO_PRINTF("Created new fermentation file: %s\n", currentFermentationFile);
 }
 
 void continueFermentationFile() {
   fermentationFileOpen = true;
-  Serial.printf("Continuing fermentation file: %s\n", currentFermentationFile);
+  DEBUG_INFO_PRINTF("Continuing fermentation file: %s\n", currentFermentationFile);
 }
 
 void logDataToSD(payload_t data) {
@@ -1319,7 +1459,7 @@ void logDataToSD(payload_t data) {
   
   File file = SD.open(currentFermentationFile, FILE_APPEND);
   if (!file) {
-    Serial.println("Failed to open fermentation file for writing");
+    DEBUG_ERROR_PRINTLN("Failed to open fermentation file for writing");
     return;
   }
   
@@ -1333,10 +1473,10 @@ void logDataToSD(payload_t data) {
   file.close();
   
   if (bytesWritten > 0) {
-    Serial.printf("Logged data to SD: SG=%.4f, Temp=%.2f°C, Battery=%.2fV (%d%%)\n", 
+    DEBUG_VERBOSE_PRINTF("Logged data to SD: SG=%.4f, Temp=%.2f°C, Battery=%.2fV (%d%%)\n", 
                  data.density, data.temperature, data.battery_voltage, batteryPercent);
   } else {
-    Serial.println("Failed to write data to SD card");
+    DEBUG_ERROR_PRINTLN("Failed to write data to SD card");
   }
 }
 
@@ -1345,7 +1485,7 @@ void checkOGStability(float currentSG) {
   last3Readings[readingCount % 3] = currentSG;
   readingCount++;
   
-  Serial.printf("OG check: reading #%d, SG=%.4f\n", readingCount, currentSG);
+  DEBUG_VERBOSE_PRINTF("OG check: reading #%d, SG=%.4f\n", readingCount, currentSG);
   
   // Check if we have at least 3 readings
   if (readingCount >= 3) {
@@ -1359,14 +1499,14 @@ void checkOGStability(float currentSG) {
     float minSG = min(r1, min(r2, r3));
     float variance = maxSG - minSG;
     
-    Serial.printf("Last 3 readings: %.4f, %.4f, %.4f, variance: %.4f\n", r1, r2, r3, variance);
+    DEBUG_VERBOSE_PRINTF("Last 3 readings: %.4f, %.4f, %.4f, variance: %.4f\n", r1, r2, r3, variance);
     
     // Check if 3 readings in a row are stable (within threshold)
     if (variance < OG_STABILITY_THRESHOLD) {
       // Calculate average of the 3 stable readings
       originalGravity = (r1 + r2 + r3) / 3.0;
       ogCaptured = true;
-      Serial.printf("OG captured as stable: %.4f (average of 3 readings)\n", originalGravity);
+      DEBUG_INFO_PRINTF("OG captured as stable: %.4f (average of 3 readings)\n", originalGravity);
       logOGToSD();
       return;
     }
@@ -1379,7 +1519,7 @@ void checkOGStability(float currentSG) {
     float r3 = last3Readings[(readingCount - 3) % 3];
     originalGravity = (r1 + r2 + r3) / 3.0;
     ogCaptured = true;
-    Serial.printf("OG captured by fallback (reading #%d): %.4f (average of last 3)\n", readingCount, originalGravity);
+    DEBUG_INFO_PRINTF("OG captured by fallback (reading #%d): %.4f (average of last 3)\n", readingCount, originalGravity);
     logOGToSD();
   }
 }
@@ -1391,7 +1531,7 @@ void logOGToSD() {
   
   File file = SD.open(currentFermentationFile, FILE_APPEND);
   if (!file) {
-    Serial.println("Failed to open fermentation file for OG logging");
+    DEBUG_ERROR_PRINTLN("Failed to open fermentation file for OG logging");
     return;
   }
   
@@ -1402,9 +1542,9 @@ void logOGToSD() {
   file.close();
   
   if (bytesWritten > 0) {
-    Serial.printf("OG logged to SD: %.4f at reading #%d\n", originalGravity, readingCount);
+    DEBUG_INFO_PRINTF("OG logged to SD: %.4f at reading #%d\n", originalGravity, readingCount);
   } else {
-    Serial.println("Failed to write OG to SD card");
+    DEBUG_ERROR_PRINTLN("Failed to write OG to SD card");
   }
 }
 

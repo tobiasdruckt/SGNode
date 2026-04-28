@@ -77,6 +77,11 @@ payload_t sensorData;
 // No need to declare - library provides global BMI160 instance
 Adafruit_BMP085 bmp180;
 
+// Calibration system variables (actual definitions)
+CalibrationCoefficients calibCoeffs;
+CalibrationPoint calibPoints[MAX_CALIB_POINTS];
+int numCalibPoints = 0;
+
 // Global variables for filtering and tracking
 uint16_t sequence_counter = 0;
 uint32_t boot_time = 0;
@@ -117,6 +122,7 @@ float measureTilt();
 float measureTemperature();
 float calculateDensity(float angle, float temperature);
 float getBatteryVoltage();
+void computeSensorData();
 void transmitData();
 void enterDeepSleep();
 void onCalibrationCommand(const uint8_t *mac, const uint8_t *incomingData, int len);
@@ -254,13 +260,7 @@ void loop() {
       
     case COMPUTE:
       if (debug_mode) Serial.println("State: COMPUTE");
-      sensorData.temperature = measureTemperature();
-      sensorData.density = calculateDensity(sensorData.angle, sensorData.temperature);
-      sensorData.battery_voltage = getBatteryVoltage();
-      sensorData.uptime_s = (millis() / 1000) - boot_time;
-      sensorData.sequence_id = sequence_counter++;
-      sensorData.version = 2;  // Protocol version 2
-      sensorData.flags = 0;  // Clear flags
+      computeSensorData();
       currentState = SEND;
       break;
       
@@ -461,6 +461,22 @@ float getBatteryVoltage() {
   if (debug_mode) Serial.printf("Battery: %.2fV (ADC: %d)\n", voltage, adc_value);
   
   return voltage;
+}
+
+void computeSensorData() {
+  sensorData.temperature = measureTemperature();
+  sensorData.density = calculateDensity(sensorData.angle, sensorData.temperature);
+  sensorData.battery_voltage = getBatteryVoltage();
+  sensorData.uptime_s = (millis() / 1000) - boot_time;
+  sensorData.sequence_id = sequence_counter++;
+  sensorData.version = 2;  // Protocol version 2
+  sensorData.flags = 0;  // Clear flags
+  
+  if (debug_mode) {
+    Serial.printf("Computed: SG=%.4f, Temp=%.1f°C, Batt=%.2fV, Seq=%d\n",
+                  sensorData.density, sensorData.temperature, 
+                  sensorData.battery_voltage, sensorData.sequence_id);
+  }
 }
 
 void transmitData() {
