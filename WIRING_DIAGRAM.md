@@ -35,6 +35,20 @@ SCL         →    GPIO22 (I2C SCL)  [Shared with BMI160]
 
 **Note:** The BMP180 shares the same I2C bus as the BMI160. Both sensors can be connected simultaneously as they have different I2C addresses (BMI160: 0x68, BMP180: 0x77).
 
+### Battery Voltage Monitoring
+```
+Battery Voltage Divider:
+Battery+ → 51kΩ → GPIO15 → 51kΩ → GND
+                     ↑
+                   └─── 10µF capacitor → GND
+
+GPIO15 (ADC1_CH3) → Battery voltage measurement
+- 51kΩ:51kΩ voltage divider (2:1 ratio)
+- 10µF electrolytic capacitor for noise filtering
+- ADC with 11dB attenuation for accurate readings
+- Calibration factor: 1.048 (corrected for measurement accuracy)
+```
+
 ### Calibration Switch Connection
 ```
 SPST Switch    WeMos D32
@@ -107,15 +121,20 @@ WeMos D32 Pin    Connection
 ---------------    ----------
 GPIO21            BMI160 SDA, BMP180 SDA
 GPIO22            BMI160 SCL, BMP180 SCL
-GPIO35            Battery Voltage (built-in ADC)
+GPIO15            Battery Voltage (ADC1_CH3) via 51kΩ:51kΩ divider
 GPIO12            Calibration Switch (INPUT_PULLUP)
 GPIO5             LED_BUILTIN (programmable)
 GPIO16            LED_EXTRA (calibration indicator)
 3.3V              BMI160 VCC, BMP180 VCC, Pull-ups
-GND               BMI160 GND, BMP180 GND, Switch
+GND               BMI160 GND, BMP180 GND, Switch, Divider GND
 Built-in          18650 Battery (built-in holder)
 Built-in          Charging circuit (USB-C)
 Built-in          Power switch
+
+Battery Voltage Divider:
+Battery+ → 51kΩ → GPIO15 → 51kΩ → GND
+                     ↑
+                   └─── 10µF capacitor → GND
 ```
 
 ### Base Station Pin Map

@@ -54,13 +54,13 @@ WeMos D32 ESP32 Board:
 ├── BMI160 IMU (I2C)
 │   ├── VCC → 3.3V
 │   ├── GND → GND
-│   ├── SDA → GPIO 21
-│   └── SCL → GPIO 22
+│   ├── SDA → GPIO 26
+│   └── SCL → GPIO 27
 ├── BMP180 (I2C)
 │   ├── VCC → 3.3V
 │   ├── GND → GND
-│   ├── SDA → GPIO 21 (shared with BMI160)
-│   └── SCL → GPIO 22 (shared with BMI160)
+│   ├── SDA → GPIO 26 (shared with BMI160)
+│   └── SCL → GPIO 27 (shared with BMI160)
 ├── Calibration Switch
 │   ├── One side → GPIO 12
 │   └── Other side → GND

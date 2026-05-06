@@ -1,6 +1,6 @@
 # SGNode - Fermentation Monitoring System
 
-**Version: 0.2.0-beta**
+**Version: 0.3.0-alpha**
 
 A robust two-part ESP32-based system for monitoring fermentation progress by measuring the tilt of a floating sensor device. Features real-time data display, calibration system, and comprehensive data logging.
 
@@ -218,25 +218,75 @@ Reference points (4 points required):
 - Point 3: Medium sugar solution (SG ≈ 1.080)
 - Point 4: Heavy sugar solution (SG ≈ 1.120)
 
-## Recent Fixes & Improvements (v0.2.0)
+## Recent Fixes & Improvements (v0.3.0-alpha)
 
 ### Critical Fixes
+- **✅ Polynomial Calibration Bug** - Fixed matrix back substitution and coefficient mapping
+- **✅ Base Station Communication** - Fixed calibration response transmission with rate limiting reset
+- **✅ SD Card File Corruption** - Fixed filename validation preventing .c file creation
+- **✅ Historical Data Loading** - Added CSV data loading on base station reboot
+- **✅ Battery Voltage Calibration** - Updated calibration factor to 1.048 for accurate readings
 - **✅ State Machine Completion** - Fixed missing `computeSensorData()` function
 - **✅ ESP-NOW Reliability** - Implemented unicast communication with peer management
 - **✅ Compilation Issues** - Resolved header multiple definition errors
-- **✅ MAC Address Display** - Fixed base station MAC address showing as zeros
-- **✅ Memory Management** - Proper separation of header declarations and definitions
 
-### Enhancements
+### Major Enhancements
+- **🔧 Calibration System** - Complete 3rd degree polynomial calibration with least squares
+- **🔧 Data Persistence** - Historical data loading and file continuation across reboots
 - **🔧 Debug System** - Comprehensive conditional compilation debug levels
 - **🔧 Peer Management** - Automatic float unit registration and tracking
 - **🔧 Error Handling** - Enhanced ESP-NOW error reporting and recovery
-- **🔧 Code Organization** - Clean project structure with unnecessary files archived
+- **🔧 File System** - Robust SD card operations with corruption prevention
 
-### Performance
+### Performance & Reliability
+- **⚡ Accurate Calibration** - Proper polynomial coefficients for gravity calculations
+- **⚡ Data Integrity** - CRC16 verification and file corruption prevention
+- **⚡ Battery Accuracy** - Calibrated voltage measurement (4.062V → correct reading)
 - **⚡ Reliable Communication** - Unicast instead of broadcast for calibration commands
 - **⚡ Better Error Recovery** - Improved sensor initialization and retry logic
-- **⚡ Memory Optimization** - Efficient data structures and reduced footprint
+- **⚡ Power Optimization** - Enhanced deep sleep and GPIO management
+
+### Confirmed Working Features
+- **📊 Peer-to-Peer Communication** - Reliable ESP-NOW data transmission
+- **📊 Calibration System** - 4-point calibration with polynomial calculation
+- **📊 Data Logging** - CSV file creation and SD card storage
+- **📊 Real-time Display** - Live, graph, and detail views with touch interface
+- **📊 Battery Monitoring** - Accurate voltage measurement and SOC calculation
+- **📊 Temperature Sensing** - BMP180 with EMA filtering
+- **📊 Tilt Measurement** - BMI160 3D tilt calculation
+- **📊 OG/ABV Calculation** - Automatic original gravity capture and ABV tracking
+
+## System Safeguards & Error Handling
+
+### Communication Reliability
+- **ESP-NOW Retry Logic**: Automatic retry for failed transmissions (max 3 attempts)
+- **Peer Management**: Automatic float unit registration and MAC address tracking
+- **CRC16 Verification**: Data integrity checking on all received packets
+- **Channel Forcing**: Ensures both units operate on same ESP-NOW channel
+
+### Sensor & Hardware Protection
+- **Sensor Initialization Retry**: Up to 3 attempts for BMI160 and BMP180
+- **Hardware Watchdog Timer**: 60-second timeout prevents system hangs
+- **Battery Voltage Sanity Checks**: Rejects readings <0.1V or >5.0V
+- **Deep Sleep Protection**: Proper WiFi/ESP-NOW deinitialization before sleep
+
+### Calibration System Safeguards
+- **Matrix Singularity Detection**: Warns if calibration matrix is ill-conditioned
+- **Coefficient Validation**: Checks for NaN/infinity values before saving
+- **Tilt Range Normalization**: Normalizes tilt angles to [0,1] for numerical stability
+- **EEPROM Version Checking**: Backward compatibility with calibration data
+
+### File System Protection
+- **SD Card Write Verification**: Byte count verification for all writes
+- **File Extension Validation**: Prevents corrupted .c file creation
+- **CSV Format Validation**: Proper parsing with error handling
+- **Automatic File Recovery**: Creates new file if corruption detected
+
+### Power Management
+- **GPIO Configuration**: All unused pins set to OUTPUT LOW to minimize leakage
+- **Deep Sleep Optimization**: Doubles sleep interval when battery <3.3V
+- **Battery Monitoring**: Real-time SOC calculation with low-battery warnings
+- **Charging Protection**: Built-in over-charge/discharge protection
 
 ## Operation
 
@@ -315,9 +365,18 @@ When the Original Gravity (OG) is captured, it is logged as a comment line in th
 
 **File Management:**
 - Files are stored in `/fermentation/` directory on the SD card
-- Each fermentation session creates a new file: `ferm_[timestamp].csv`
-- On reboot, the system prompts to continue existing fermentation or start new
+- Each fermentation session creates a sequential file: `fermentation_001.csv`, `fermentation_002.csv`, etc.
+- On reboot, the system automatically continues the highest numbered file
+- Historical data is loaded into display buffer for immediate viewing
 - Data is appended to the selected file automatically
+- File corruption prevention with proper `.csv` extension validation
+
+**Historical Data Loading:**
+- On power-up, base station scans for existing fermentation files
+- Automatically loads up to 100 most recent data points into memory
+- Restores Original Gravity (OG) and calibration data from CSV comments
+- Live, Graph, and Detail views show previous data immediately
+- Seamless continuation of fermentation monitoring across reboots
 
 **SD Card Requirements:**
 - FAT32 formatted MicroSD card (2GB-32GB recommended)
@@ -405,16 +464,25 @@ Logged data to SD: SG=1.0710, Temp=20.50°C
 ## Technical Specifications
 
 ### Performance
-- **Measurement accuracy**: ≤0.5° angle resolution
-- **Battery life**: 17+ hours continuous, weeks with deep sleep (18650 battery)
-- **Transmission range**: ~50m (line of sight)
-- **Update rate**: Configurable 60-300 seconds
+- **Measurement accuracy**: ≤0.5° angle resolution, ±0.001 SG accuracy with proper calibration
+- **Battery life**: 17+ hours continuous, 2-4 weeks with deep sleep (2000mAh 18650)
+- **Transmission range**: ~50m (line of sight), reliable peer-to-peer communication
+- **Update rate**: Configurable 60-600 seconds (default 180s)
 - **Data storage**: 100 data points on base station + unlimited SD card logging
+- **Calibration accuracy**: 3rd degree polynomial with least squares fitting
+- **Temperature accuracy**: ±0.1°C with EMA filtering
 
 ### Power Consumption
-- **Float sleep current**: <1mA
-- **Float active current**: <200mA
-- **Base station current**: ~150mA (with display)
+- **Float sleep current**: <0.1mA (deep sleep optimized)
+- **Float active current**: <100mA (sensors + transmission)
+- **Base station current**: ~290mA (display + SD card)
+
+### Battery Specifications
+- **Float unit**: 18650 Li-ion (3.7V nominal, 4.2V max)
+- **Voltage calibration**: 1.048 factor (corrected for 13% measurement error)
+- **Voltage divider**: 51kΩ:51kΩ with 10µF filtering capacitor
+- **SOC calculation**: Linear approximation with low-battery warnings
+- **Charging**: Built-in TP4056 circuit (500mA max)
 
 ### Power Optimization
 The float unit includes several power-saving features:

@@ -53,6 +53,7 @@ extern int numCalibPoints;
  * Load coefficients from EEPROM if available
  */
 void initCalibration() {
+    yield();  // Allow system tasks to run
     EEPROM.begin(64); // Reserve 64 bytes for calibration data
     
     // Check if valid calibration data exists
@@ -134,6 +135,7 @@ void addCalibrationPoint(float tilt, float gravity, float temperature = 20.0) {
  * @return true if calculation successful, false otherwise
  */
 bool calculatePolynomialCoefficients() {
+    yield();  // Allow system tasks to run
     if (numCalibPoints < 2) {
         Serial.println("Need at least 2 calibration points");
         return false;
@@ -161,6 +163,9 @@ bool calculatePolynomialCoefficients() {
     float sum_x = 0, sum_x2 = 0, sum_x3 = 0, sum_x4 = 0, sum_x5 = 0, sum_x6 = 0;
     float sum_y = 0, sum_xy = 0, sum_x2y = 0, sum_x3y = 0;
     
+    Serial.printf("DEBUG: Processing %d calibration points\n", numCalibPoints);
+    Serial.printf("DEBUG: Tilt range: %.2f to %.2f (range: %.2f)\n", min_tilt, max_tilt, tilt_range);
+    
     // Calculate sums with normalized tilt
     for (int i = 0; i < numCalibPoints; i++) {
         float x = (calibPoints[i].tilt - min_tilt) / tilt_range; // Normalize to [0,1]
@@ -170,6 +175,8 @@ bool calculatePolynomialCoefficients() {
         float x4 = x3 * x;
         float x5 = x4 * x;
         float x6 = x5 * x;
+        
+        Serial.printf("DEBUG: Point %d: tilt=%.2f -> x=%.4f, gravity=%.3f\n", i+1, calibPoints[i].tilt, x, y);
         
         sum_x += x;
         sum_x2 += x2;
@@ -184,10 +191,13 @@ bool calculatePolynomialCoefficients() {
         sum_x3y += x3 * y;
     }
     
+    Serial.printf("DEBUG: Sums - sum_x=%.4f, sum_x2=%.4f, sum_x3=%.4f, sum_x4=%.4f\n", sum_x, sum_x2, sum_x3, sum_x4);
+    Serial.printf("DEBUG: Sums - sum_y=%.4f, sum_xy=%.4f, sum_x2y=%.4f, sum_x3y=%.4f\n", sum_y, sum_xy, sum_x2y, sum_x3y);
+    
     int n = numCalibPoints;
     
-    // Build matrix based on degree
-    float matrix[4][5] = {0};
+    // Build augmented matrix [A|b] for Gaussian elimination
+    float matrix[4][5] = {0}; // 4x4 matrix + RHS column
     
     if (degree == 1) {
         // Linear: [x, 1] * [a, b] = y
@@ -206,14 +216,13 @@ bool calculatePolynomialCoefficients() {
         matrix[3][0] = sum_x3; matrix[3][1] = sum_x2; matrix[3][2] = sum_x;  matrix[3][3] = n;     matrix[3][4] = sum_y;
     }
     
-    // Solve using Gaussian elimination
-    for (int col = 0; col < degree; col++) {
-        // Feed watchdog to prevent timeout during calculation
-        esp_task_wdt_reset();
+    // Solve using Gaussian elimination on augmented matrix [A|b]
+    for (int col = 0; col <= degree; col++) {
+        yield();  // Allow system tasks to run
         
         // Find pivot row
         int pivot = col;
-        for (int row = col + 1; row < degree; row++) {
+        for (int row = col + 1; row <= degree; row++) {
             if (fabs(matrix[row][col]) > fabs(matrix[pivot][col])) {
                 pivot = row;
             }
@@ -227,7 +236,7 @@ bool calculatePolynomialCoefficients() {
         
         // Swap rows if needed
         if (pivot != col) {
-            for (int i = col; i <= degree; i++) {
+            for (int i = col; i <= degree + 1; i++) { // Include RHS column
                 float temp = matrix[col][i];
                 matrix[col][i] = matrix[pivot][i];
                 matrix[pivot][i] = temp;
@@ -235,29 +244,44 @@ bool calculatePolynomialCoefficients() {
         }
         
         // Eliminate column
-        for (int row = col + 1; row < degree; row++) {
+        for (int row = col + 1; row <= degree; row++) {
             float factor = matrix[row][col] / matrix[col][col];
-            for (int i = col; i <= degree; i++) {
+            for (int i = col; i <= degree + 1; i++) { // Include RHS column
                 matrix[row][i] -= factor * matrix[col][i];
             }
         }
     }
     
-    // Back substitution
+    // Back substitution on augmented matrix
     float solution[4] = {0};
-    for (int row = degree - 1; row >= 0; row--) {
-        solution[row] = matrix[row][degree];
-        for (int col = row + 1; col < degree; col++) {
+    for (int row = degree; row >= 0; row--) {
+        solution[row] = matrix[row][degree + 1]; // RHS is in column degree+1
+        for (int col = row + 1; col <= degree; col++) {
             solution[row] -= matrix[row][col] * solution[col];
         }
         solution[row] /= matrix[row][row];
+        
+        // Debug output for each coefficient
+        Serial.printf("DEBUG: solution[%d] = %.12f\n", row, solution[row]);
     }
     
-    // Store coefficients and normalization parameters
-    calibCoeffs.coeff3 = (degree >= 3) ? solution[0] : 0;
-    calibCoeffs.coeff2 = (degree >= 2) ? solution[degree == 3 ? 1 : 0] : 0;
-    calibCoeffs.coeff1 = (degree >= 1) ? solution[degree == 3 ? 2 : (degree == 2 ? 1 : 0)] : 0;
-    calibCoeffs.coeff0 = solution[degree - 1];
+    // Store coefficients with simplified mapping
+    if (degree == 3) {
+        calibCoeffs.coeff3 = solution[0];
+        calibCoeffs.coeff2 = solution[1];
+        calibCoeffs.coeff1 = solution[2];
+        calibCoeffs.coeff0 = solution[3];
+    } else if (degree == 2) {
+        calibCoeffs.coeff3 = 0.0;
+        calibCoeffs.coeff2 = solution[0];
+        calibCoeffs.coeff1 = solution[1];
+        calibCoeffs.coeff0 = solution[2];
+    } else { // degree == 1
+        calibCoeffs.coeff3 = 0.0;
+        calibCoeffs.coeff2 = 0.0;
+        calibCoeffs.coeff1 = solution[0];
+        calibCoeffs.coeff0 = solution[1];
+    }
     
     // Validate coefficients (check for NaN or infinity)
     if (isnan(calibCoeffs.coeff3) || isinf(calibCoeffs.coeff3) ||
@@ -294,6 +318,7 @@ bool calculatePolynomialCoefficients() {
  * Save calibration coefficients to EEPROM
  */
 void saveCalibrationCoefficients() {
+    yield();  // Allow system tasks to run
     if (!calibCoeffs.isValid) {
         Serial.println("Cannot save invalid calibration coefficients");
         return;

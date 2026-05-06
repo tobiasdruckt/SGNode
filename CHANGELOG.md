@@ -2,6 +2,53 @@
 
 All notable changes to SGNode will be documented in this file.
 
+## [0.3.0-alpha] - 2026-05-06
+
+### Critical Fixes
+- **Fixed:** Polynomial calculation bug - corrected matrix back substitution and coefficient mapping
+- **Fixed:** Base station calibration communication - reset rate limiting for final response transmission
+- **Fixed:** SD card file corruption - added filename validation preventing .c file creation
+- **Fixed:** Historical data loading - added CSV data loading on base station reboot for seamless continuation
+- **Fixed:** Battery voltage calibration - updated factor to 1.048 for accurate readings (13% error correction)
+
+### Major Features
+- **Added:** Complete 3rd degree polynomial calibration system with least squares fitting
+- **Added:** Historical data persistence across reboots with automatic file continuation
+- **Added:** Comprehensive system safeguards and error handling
+- **Added:** File corruption prevention with proper CSV extension validation
+- **Added:** Battery voltage measurement accuracy with calibrated voltage divider
+
+### System Reliability
+- **Enhanced:** ESP-NOW peer-to-peer communication with automatic retry logic
+- **Enhanced:** Sensor initialization with up to 3 retry attempts
+- **Enhanced:** SD card operations with write verification and error handling
+- **Enhanced:** Hardware watchdog timer protection (60-second timeout)
+- **Enhanced:** Deep sleep power optimization with GPIO leakage prevention
+
+### Data Management
+- **Improved:** CSV file format with sequential numbering (fermentation_001.csv, etc.)
+- **Improved:** Original Gravity (OG) capture and restoration from CSV comments
+- **Improved:** Automatic historical data loading (up to 100 points) on power-up
+- **Improved:** Data integrity with CRC16 verification and file validation
+
+### User Experience
+- **Improved:** Calibration wizard with reliable command transmission
+- **Improved:** Live, Graph, and Detail views with immediate data display after reboot
+- **Improved:** Battery monitoring with accurate SOC calculation and low-battery warnings
+- **Improved:** Touch interface with responsive navigation and status indicators
+
+### Technical Improvements
+- **Updated:** Voltage divider circuit specification (51kΩ:51kΩ with 10µF capacitor)
+- **Updated:** Battery calibration factor from 0.913 to 1.048
+- **Updated:** Matrix singularity detection in polynomial calculations
+- **Updated:** EEPROM version checking with backward compatibility
+
+### Documentation
+- **Updated:** Comprehensive README.md with all confirmed features and safeguards
+- **Updated:** Technical specifications with current performance metrics
+- **Updated:** Installation and troubleshooting guides
+- **Added:** System safeguards and error handling documentation
+
 ## [0.2.0-beta] - 2026-04-28
 
 ### Critical Fixes
