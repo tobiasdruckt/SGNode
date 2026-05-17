@@ -1,4 +1,4 @@
-# ESP32 Fermentation Float Unit - Alpha v0.1.0
+# ESP32 Fermentation Float Unit - v0.3.0-alpha
 
 ## Overview
 Battery-powered ESP32 fermentation monitoring float unit that measures tilt via BMI160 IMU and temperature via BMP180, transmitting data via ESP-NOW to base station.
@@ -14,14 +14,14 @@ Battery-powered ESP32 fermentation monitoring float unit that measures tilt via 
 
 ## Hardware Configuration
 - **Board**: ESP32 (WeMos D32 compatible)
-- **I2C**: SDA=GPIO26, SCL=GPIO27
-- **Battery**: GPIO15 (ADC1_CH3) with 2:1 voltage divider
+- **I2C**: SDA=GPIO21, SCL=GPIO22
+- **Battery**: GPIO15 (ADC1_CH3) with 51kΩ:51kΩ voltage divider
 - **LEDs**: GPIO5 (built-in), GPIO16 (extra)
 - **Calibration**: GPIO12 (pull-down switch)
 
 ## Battery Monitoring
-- **Voltage Divider**: 10kΩ + 10kΩ (2:1 ratio)
-- **Calibration Factor**: 0.913 (cumulative)
+- **Voltage Divider**: 51kΩ + 51kΩ (2:1 ratio) with 10µF filtering capacitor
+- **Calibration Factor**: 1.048 (corrected for 13% measurement error)
 - **SOC Range**: 3.0V (0%) to 4.175V (100%)
 - **Accuracy**: ±0.01V after calibration
 
@@ -51,12 +51,14 @@ Interval: 180 seconds (configurable 60-600s)
 - Use base station commands for calibration points
 
 ## Status
-**Alpha v0.1.0 - Working Nightly Build**
+**v0.3.0-alpha - Design Freeze - Stable Release**
 - ✅ All core functions operational
-- ✅ Battery monitoring calibrated
-- ✅ ESP-NOW transmission reliable
+- ✅ Battery monitoring calibrated (1.048 factor)
+- ✅ ESP-NOW transmission reliable with CRC verification
 - ✅ Deep sleep power management
 - ✅ Sensor data accurate
+- ✅ Polynomial calibration system working
+- ✅ Hardware watchdog timer implemented
 
 ## Power Consumption
 - **Active**: ~80mA (sensors + WiFi)

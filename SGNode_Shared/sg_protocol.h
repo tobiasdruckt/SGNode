@@ -36,7 +36,21 @@ typedef struct __attribute__((packed)) {
   char message[32];       // Status message
 } calib_response_t;
 
+// Calibration coefficients structure
+// Size: 1 + 4 + 4 + 4 + 4 + 4 + 4 + 1 = 26 bytes
+typedef struct __attribute__((packed)) {
+  uint8_t response_type;  // 3=COEFFICIENTS
+  float coeff3;          // Cubic coefficient
+  float coeff2;          // Quadratic coefficient
+  float coeff1;          // Linear coefficient
+  float coeff0;          // Constant term
+  float norm_offset;     // Normalization offset (Tilt - offset)
+  float norm_scale;      // Normalization scale (divide by scale)
+  uint8_t request_id;    // Echo back request ID
+} calib_coeffs_t;
+
 // Compile-time size validation
 static_assert(sizeof(payload_t) == 26, "payload_t size mismatch");
 static_assert(sizeof(calib_command_t) == 6, "calib_command_t size mismatch");
 static_assert(sizeof(calib_response_t) == 42, "calib_response_t size mismatch");
+static_assert(sizeof(calib_coeffs_t) == 26, "calib_coeffs_t size mismatch");

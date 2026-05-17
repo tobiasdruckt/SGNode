@@ -18,8 +18,16 @@
 #define EEPROM_NORM_MIN 22
 #define EEPROM_NORM_RANGE 26
 
+// EEPROM addresses for sensor offset calibration
+#define EEPROM_OFFSET_X 30
+#define EEPROM_OFFSET_Y 34
+#define EEPROM_OFFSET_Z 38
+#define EEPROM_OFFSET_VALID 42
+#define EEPROM_OFFSET_MAGIC 46
+
 // Magic number to verify valid calibration data
 #define CALIB_MAGIC 0x43414C49 // "CALI" in hex
+#define OFFSET_MAGIC 0x4F464654 // "OFFT" in hex
 
 // Calibration data structure
 struct CalibrationCoefficients {
@@ -33,8 +41,19 @@ struct CalibrationCoefficients {
     float norm_range;  // Normalization range
 };
 
+// Sensor offset calibration data structure
+struct SensorOffsets {
+    float offsetX;  // X-axis offset
+    float offsetY;  // Y-axis offset
+    float offsetZ;  // Z-axis offset
+    bool isValid;   // Flag indicating if offsets are valid
+};
+
 // Global calibration coefficients (extern declaration)
 extern CalibrationCoefficients calibCoeffs;
+
+// Global sensor offsets (extern declaration)
+extern SensorOffsets sensorOffsets;
 
 // Calibration measurement points
 struct CalibrationPoint {
@@ -431,6 +450,64 @@ void testCalibrationAccuracy() {
  * Get calibration status
  * @return true if calibration is valid and loaded
  */
+bool isCalibrationValid();
+
+/**
+ * Print current calibration coefficients
+ */
+void printCalibrationCoefficients();
+
+/**
+ * Initialize sensor offset calibration system
+ * Load offsets from EEPROM if available
+ */
+void initSensorOffsets();
+
+/**
+ * Calibrate sensor offsets for zero-angle output
+ * Read raw sensor data and calculate offsets for 0° output when flat
+ * @return true if calibration successful
+ */
+bool calibrateSensorOffset();
+
+/**
+ * Load sensor offsets from EEPROM
+ * @return true if offsets loaded successfully
+ */
+bool loadSensorOffsets();
+
+/**
+ * Save sensor offsets to EEPROM
+ * @return true if offsets saved successfully
+ */
+bool saveSensorOffsets();
+
+/**
+ * Apply sensor offsets to raw accelerometer readings
+ * @param ax Raw X-axis accelerometer value
+ * @param ay Raw Y-axis accelerometer value
+ * @param az Raw Z-axis accelerometer value
+ * @return true if offsets applied successfully
+ */
+bool applySensorOffsets(int &ax, int &ay, int &az);
+
+/**
+ * Get sensor offset status
+ * @return true if sensor offsets are valid and loaded
+ */
+bool isSensorOffsetValid();
+
+/**
+ * Print current sensor offsets
+ */
+void printSensorOffsets();
+
+// Implementation of sensor offset functions
+
+/**
+ * Get calibration status
+ * @return true if calibration is valid and loaded
+ */
 bool isCalibrationValid() {
     return calibCoeffs.isValid;
 }
@@ -445,6 +522,211 @@ void printCalibrationCoefficients() {
                      calibCoeffs.coeff3, calibCoeffs.coeff2, calibCoeffs.coeff1, calibCoeffs.coeff0);
     } else {
         Serial.println("No valid calibration coefficients available");
+    }
+}
+
+/**
+ * Initialize sensor offset calibration system
+ * Load offsets from EEPROM if available
+ */
+void initSensorOffsets() {
+    yield();  // Allow system tasks to run
+    
+    // Check if valid offset data exists
+    uint32_t magic;
+    EEPROM.get(EEPROM_OFFSET_MAGIC, magic);
+    
+    if (magic == OFFSET_MAGIC) {
+        // Load offsets from EEPROM
+        EEPROM.get(EEPROM_OFFSET_X, sensorOffsets.offsetX);
+        EEPROM.get(EEPROM_OFFSET_Y, sensorOffsets.offsetY);
+        EEPROM.get(EEPROM_OFFSET_Z, sensorOffsets.offsetZ);
+        EEPROM.get(EEPROM_OFFSET_VALID, sensorOffsets.isValid);
+        
+        if (sensorOffsets.isValid) {
+            Serial.println("Sensor offsets loaded from EEPROM");
+            Serial.printf("Offsets: X=%.2f, Y=%.2f, Z=%.2f\n", 
+                         sensorOffsets.offsetX, sensorOffsets.offsetY, sensorOffsets.offsetZ);
+        } else {
+            Serial.println("Invalid sensor offsets in EEPROM - using defaults");
+            sensorOffsets.offsetX = 0.0;
+            sensorOffsets.offsetY = 0.0;
+            sensorOffsets.offsetZ = 0.0;
+            sensorOffsets.isValid = false;
+        }
+    } else {
+        // Initialize with default offsets
+        sensorOffsets.offsetX = 0.0;
+        sensorOffsets.offsetY = 0.0;
+        sensorOffsets.offsetZ = 0.0;
+        sensorOffsets.isValid = false;
+        
+        Serial.println("No valid sensor offsets found in EEPROM");
+        Serial.println("Using default offsets (no compensation)");
+    }
+}
+
+/**
+ * Calibrate sensor offsets for zero-angle output
+ * Read raw sensor data and calculate offsets for 0° output when flat
+ * @return true if calibration successful
+ */
+bool calibrateSensorOffset() {
+    yield();  // Allow system tasks to run
+    
+    Serial.println("Starting sensor offset calibration...");
+    
+    // Take multiple readings to average out noise
+    const int numReadings = 10;
+    float totalX = 0.0, totalY = 0.0, totalZ = 0.0;
+    
+    for (int i = 0; i < numReadings; i++) {
+        int ax, ay, az;
+        BMI160.readAccelerometer(ax, ay, az);
+        
+        totalX += ax;
+        totalY += ay;
+        totalZ += az;
+        
+        delay(50); // Small delay between readings
+    }
+    
+    // Calculate average raw values
+    float avgX = totalX / numReadings;
+    float avgY = totalY / numReadings;
+    float avgZ = totalZ / numReadings;
+    
+    // Debug: Print raw readings for analysis
+    Serial.printf("Raw sensor readings: X=%.2f, Y=%.2f, Z=%.2f\n", avgX, avgY, avgZ);
+    Serial.printf("Expected ranges: X,Y within ±2000 of 0, Z within ±2000 of 16384\n");
+    
+    // Determine which axis should be closest to expected gravity range
+    // Simple offset calculation:
+    // 1. Read raw values (done above)
+    // 2. Find offset that brings X to 0
+    sensorOffsets.offsetX = avgX;
+    // 3. Find offset that brings Y to -16384
+    sensorOffsets.offsetY = avgY + 16384.0;
+    // 4. Find offset that brings Z to 0
+    sensorOffsets.offsetZ = avgZ;
+    
+    sensorOffsets.isValid = true;
+    
+    Serial.printf("Simple offset calculation:\n");
+    Serial.printf("  X offset: %.2f (brings X to 0)\n", sensorOffsets.offsetX);
+    Serial.printf("  Y offset: %.2f (brings Y to -16384)\n", sensorOffsets.offsetY);
+    Serial.printf("  Z offset: %.2f (brings Z to 0)\n", sensorOffsets.offsetZ);
+    
+    // Save offsets to EEPROM
+    if (saveSensorOffsets()) {
+        Serial.println("Sensor offsets calibrated and saved successfully");
+        return true;
+    } else {
+        Serial.println("Failed to save sensor offsets to EEPROM");
+        return false;
+    }
+}
+
+/**
+ * Load sensor offsets from EEPROM
+ * @return true if offsets loaded successfully
+ */
+bool loadSensorOffsets() {
+    yield();  // Allow system tasks to run
+    
+    uint32_t magic;
+    EEPROM.get(EEPROM_OFFSET_MAGIC, magic);
+    
+    if (magic != OFFSET_MAGIC) {
+        Serial.println("No valid sensor offset magic in EEPROM");
+        return false;
+    }
+    
+    EEPROM.get(EEPROM_OFFSET_X, sensorOffsets.offsetX);
+    EEPROM.get(EEPROM_OFFSET_Y, sensorOffsets.offsetY);
+    EEPROM.get(EEPROM_OFFSET_Z, sensorOffsets.offsetZ);
+    EEPROM.get(EEPROM_OFFSET_VALID, sensorOffsets.isValid);
+    
+    if (!sensorOffsets.isValid) {
+        Serial.println("Sensor offsets marked as invalid in EEPROM");
+        return false;
+    }
+    
+    Serial.println("Sensor offsets loaded from EEPROM");
+    return true;
+}
+
+/**
+ * Save sensor offsets to EEPROM
+ * @return true if offsets saved successfully
+ */
+bool saveSensorOffsets() {
+    yield();  // Allow system tasks to run
+    
+    if (!sensorOffsets.isValid) {
+        Serial.println("Cannot save invalid sensor offsets");
+        return false;
+    }
+    
+    // Write magic number
+    EEPROM.put(EEPROM_OFFSET_MAGIC, OFFSET_MAGIC);
+    
+    // Write offsets
+    EEPROM.put(EEPROM_OFFSET_X, sensorOffsets.offsetX);
+    EEPROM.put(EEPROM_OFFSET_Y, sensorOffsets.offsetY);
+    EEPROM.put(EEPROM_OFFSET_Z, sensorOffsets.offsetZ);
+    EEPROM.put(EEPROM_OFFSET_VALID, sensorOffsets.isValid);
+    
+    bool success = EEPROM.commit();
+    
+    if (success) {
+        Serial.println("Sensor offsets saved to EEPROM");
+    } else {
+        Serial.println("ERROR: Failed to save sensor offsets to EEPROM");
+    }
+    
+    return success;
+}
+
+/**
+ * Apply sensor offsets to raw accelerometer readings
+ * @param ax Raw X-axis accelerometer value (reference)
+ * @param ay Raw Y-axis accelerometer value (reference)
+ * @param az Raw Z-axis accelerometer value (reference)
+ * @return true if offsets applied successfully
+ */
+bool applySensorOffsets(int &ax, int &ay, int &az) {
+    if (!sensorOffsets.isValid) {
+        return false; // No valid offsets to apply
+    }
+    
+    // Apply offsets to raw values
+    ax = ax - (int)sensorOffsets.offsetX;
+    ay = ay - (int)sensorOffsets.offsetY;
+    az = az - (int)sensorOffsets.offsetZ;
+    
+    return true;
+}
+
+/**
+ * Get sensor offset status
+ * @return true if sensor offsets are valid and loaded
+ */
+bool isSensorOffsetValid() {
+    return sensorOffsets.isValid;
+}
+
+/**
+ * Print current sensor offsets
+ */
+void printSensorOffsets() {
+    if (sensorOffsets.isValid) {
+        Serial.println("Current Sensor Offsets:");
+        Serial.printf("  X offset: %.2f\n", sensorOffsets.offsetX);
+        Serial.printf("  Y offset: %.2f\n", sensorOffsets.offsetY);
+        Serial.printf("  Z offset: %.2f\n", sensorOffsets.offsetZ);
+    } else {
+        Serial.println("No valid sensor offsets available");
     }
 }
 

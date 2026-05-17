@@ -22,6 +22,7 @@
 // Typography tokens (FreeFont Sans Serif)
 #define FONT_SIZE_XS    &FreeSans9pt7b
 #define FONT_SIZE_SM    &FreeSans12pt7b
+#define FONT_SIZE_SM_BOLD    &FreeSansBold12pt7b
 #define FONT_SIZE_MD    &FreeSans18pt7b
 #define FONT_SIZE_LG    &FreeSans24pt7b
 #define FONT_SIZE_XL    &FreeSansBold24pt7b
@@ -35,7 +36,7 @@
 #define TAB_COUNT       4
 #define TAB_LIVE        0
 #define TAB_GRAPH       1
-#define TAB_CALIB       2
+#define TAB_BATTERY     2
 #define TAB_MORE        3
 
 // Color constants (RGB565)
@@ -47,6 +48,23 @@
 #define COLOR_NAVY      0x0822  // #0B1F2A approx
 #define COLOR_GOLD      0xE3C4  // #C78A1A approx
 #define COLOR_BLUE      0x1E96  // #2196F3 approx (info blue)
+
+// Polynomial graph positioning constants
+#define POLY_GRAPH_X      MARGIN
+#define POLY_GRAPH_Y      TOPBAR_H + MARGIN
+#define POLY_GRAPH_W      UI_W - MARGIN * 2
+#define POLY_GRAPH_H      UI_H - TOPBAR_H - NAV_H - MARGIN * 2
+
+// Graph dimensions within the card
+#define POLY_GRAPH_INNER_X  MARGIN + 20
+#define POLY_GRAPH_INNER_Y  POLY_GRAPH_Y + 40
+#define POLY_GRAPH_INNER_W  POLY_GRAPH_W - 40
+#define POLY_GRAPH_INNER_H  POLY_GRAPH_H - 80
+
+// Graph axes and grid
+#define POLY_GRAPH_AXIS_COLOR    COLOR_BORDER
+#define POLY_GRAPH_GRID_COLOR    COLOR_MUTED
+#define POLY_GRAPH_CURVE_COLOR   COLOR_GOLD
 
 // Helper function to convert RGB to RGB565
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {

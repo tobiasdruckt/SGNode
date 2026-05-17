@@ -25,7 +25,7 @@
 #define I2C_SCL 27
 
 // System configuration
-#define MEASUREMENT_INTERVAL 180  // seconds (configurable 60-600)
+#define MEASUREMENT_INTERVAL 600  // seconds (configurable 60-600)
 #define SAMPLE_COUNT 5            // samples per measurement (reduced for power efficiency)
 #define MAX_RETRIES 1             // transmission retry attempts
 #define MAX_INIT_RETRIES 3        // sensor initialization retry attempts
@@ -53,6 +53,9 @@ Adafruit_BMP085 bmp180;
 CalibrationCoefficients calibCoeffs;
 CalibrationPoint calibPoints[MAX_CALIB_POINTS];
 int numCalibPoints = 0;
+
+// Sensor offset calibration variables
+SensorOffsets sensorOffsets;
 
 // Global variables for filtering and tracking
 uint16_t sequence_counter = 0;
@@ -120,6 +123,7 @@ void transmitData();
 void enterDeepSleep();
 void onCalibrationCommand(const uint8_t *mac, const uint8_t *incomingData, int len);
 void sendCalibrationResponse(float angle, float target_sg, uint8_t request_id, const char* message);
+void sendCalibrationCoefficients(uint8_t request_id);
 uint16_t crc16(const uint8_t* data, size_t length);
 float medianFilter(float arr[], int n);
 float ema(float prev, float x, float alpha);
@@ -131,6 +135,11 @@ void setup() {
   // Configure pins (after unused GPIOs are set)
   pinMode(BATTERY_PIN, INPUT);
   analogSetPinAttenuation(BATTERY_PIN, ADC_11db);  // Pin 15 is ADC1_CH3 - can use attenuation
+  
+  // Configure ADC for higher accuracy battery measurements
+  analogReadResolution(12);  // Use 12-bit resolution (0-4095)
+  // ESP32 Arduino doesn't have analogSetCycles/analogSetSamples functions
+  // We'll use our own averaging in the measurement function
   pinMode(CALIBRATION_SWITCH_PIN, INPUT_PULLUP);
   pinMode(LED_BUILTIN, OUTPUT);
   
@@ -144,12 +153,12 @@ void setup() {
   if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
     // Woke up from deepsleep due to external interrupt (calibration switch)
     calibrationWakeup = true;
-    Serial.println("Woke up from deepsleep - calibration switch detected");
+    if (debug_mode) Serial.println("Woke up from deepsleep - calibration switch detected");
   }
   
   // Read battery voltage BEFORE WiFi is enabled (no interference)
   cachedBatteryVoltage = getBatteryVoltage();
-  Serial.printf("Initial battery voltage: %.2fV\n", cachedBatteryVoltage);
+  if (debug_mode) Serial.printf("Initial battery voltage: %.2fV\n", cachedBatteryVoltage);
   
   // Initialize push button state
   lastButtonState = digitalRead(CALIBRATION_SWITCH_PIN);
@@ -160,33 +169,34 @@ void setup() {
   // Activate calibration mode if switch is pressed OR woke up from calibration interrupt
   if (switchPressed || calibrationWakeup) {
     calibrationMode = true;
-    debug_mode = true;
+  } else {
+    calibrationMode = false;
+  }
+  
+  debug_mode = calibrationMode;  // Debug mode follows calibration mode
+  
+  // Start Serial only if in debug mode
+  if (debug_mode) {
+    Serial.begin(115200);
+    delay(100);  // Wait for Serial to initialize
+    
     Serial.println("=== CALIBRATION MODE ACTIVATED AT BOOT ===");
     if (switchPressed) {
       Serial.println("Switch pressed at boot");
     } else {
       Serial.println("Woke up from calibration interrupt");
     }
+    
+    Serial.printf("Base Station MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  baseStationMac[0], baseStationMac[1], baseStationMac[2],
+                  baseStationMac[3], baseStationMac[4], baseStationMac[5]);
+  }
+  
+  if (calibrationMode) {
     lastCalibrationActivity = millis();
     
     // IMPORTANT: Send calibration trigger after ESP-NOW is initialized
     // This will be called in the state machine after initESPNow()
-  } else {
-    calibrationMode = false;
-    debug_mode = true; // Enable debug mode to see button state readings
-  }
-  
-  // Always start Serial for basic monitoring
-  Serial.begin(115200);
-  delay(100);  // Wait for Serial
-  
-  if (debug_mode) {
-    Serial.println("=== Fermentation Float Unit Starting ===");
-    Serial.printf("Base Station MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                  baseStationMac[0], baseStationMac[1], baseStationMac[2],
-                  baseStationMac[3], baseStationMac[4], baseStationMac[5]);
-  } else {
-    Serial.println("=== Fermentation Float Unit ===");
   }
   
   // Disable Bluetooth
@@ -195,6 +205,9 @@ void setup() {
   
   // Initialize calibration system
   initCalibration();
+  
+  // Initialize sensor offset system
+  initSensorOffsets();
   
   // Configure I2C with pull-ups
   pinMode(I2C_SDA, INPUT_PULLUP);
@@ -214,10 +227,8 @@ void setup() {
   boot_time = millis() / 1000;
   
   if (calibrationMode) {
-    if (debug_mode) Serial.println("=== CALIBRATION MODE ACTIVATED ===");
     if (debug_mode) Serial.println("Button activated - Deep sleep disabled");
-    if (debug_mode) Serial.println("WARNING: High battery drain expected!");
-    lastCalibrationActivity = millis(); // Initialize timeout counter
+        lastCalibrationActivity = millis(); // Initialize timeout counter
     if (isCalibrationValid()) {
       if (debug_mode) Serial.println("Valid calibration found from EEPROM");
       if (debug_mode) printCalibrationCoefficients();
@@ -231,12 +242,15 @@ void setup() {
 
 void loop() {
   
+  // Ensure debug_mode follows calibration mode
+  debug_mode = calibrationMode;
+  
   // Handle push button detection with debouncing
   bool currentButtonState = digitalRead(CALIBRATION_SWITCH_PIN);
   
   // Debug button state (remove after testing) - only in non-calibration mode
   static unsigned long lastDebugPrint = 0;
-  if (!calibrationMode && millis() - lastDebugPrint > 1000) {
+  if (!calibrationMode && debug_mode && millis() - lastDebugPrint > 1000) {
     Serial.printf("Button state: %d (pin %d)\n", currentButtonState, CALIBRATION_SWITCH_PIN);
     lastDebugPrint = millis();
   }
@@ -252,7 +266,7 @@ void loop() {
       stableButtonState = currentButtonState;
       if (stableButtonState == LOW) {
         // Button pressed (falling edge detected)
-        Serial.println("Button press detected!");
+        if (debug_mode) Serial.println("Button press detected!");
         toggleCalibrationMode();
       }
     }
@@ -423,12 +437,24 @@ void initESPNow() {
   if (addResult != ESP_OK) {
     if (debug_mode) {
       Serial.printf("Failed to add peer, error: %d\n", addResult);
-      if (addResult == ESP_ERR_ESPNOW_NOT_INIT) Serial.println("  ESP-NOW not initialized");
-      if (addResult == ESP_ERR_ESPNOW_IF) Serial.println("  Invalid WiFi interface");
-      if (addResult == ESP_ERR_INVALID_ARG) Serial.println("  Invalid argument");
-      if (addResult == ESP_ERR_ESPNOW_NO_MEM) Serial.println("  Out of memory");
-      if (addResult == ESP_ERR_ESPNOW_FULL) Serial.println("  Peer list full");
-      if (addResult == ESP_ERR_ESPNOW_EXIST) Serial.println("  Peer already exists");
+      if (addResult == ESP_ERR_ESPNOW_NOT_INIT) {
+        if (debug_mode) Serial.println("  ESP-NOW not initialized");
+      }
+      if (addResult == ESP_ERR_ESPNOW_IF) {
+        if (debug_mode) Serial.println("  Invalid WiFi interface");
+      }
+      if (addResult == ESP_ERR_INVALID_ARG) {
+        if (debug_mode) Serial.println("  Invalid argument");
+      }
+      if (addResult == ESP_ERR_ESPNOW_NO_MEM) {
+        if (debug_mode) Serial.println("  Out of memory");
+      }
+      if (addResult == ESP_ERR_ESPNOW_FULL) {
+        if (debug_mode) Serial.println("  Peer list full");
+      }
+      if (addResult == ESP_ERR_ESPNOW_EXIST) {
+        if (debug_mode) Serial.println("  Peer already exists");
+      }
     }
     return;
   }
@@ -480,20 +506,30 @@ float measureTilt() {
     return 45.0; // Fallback
   }
   
+  // Apply sensor offsets if available
+  bool offsetsApplied = applySensorOffsets(ax, ay, az);
+  
   // Convert to tilt angle (deviation from vertical) - clean approach
   float ax_f = ax / 16384.0;
   float ay_f = ay / 16384.0;
   float az_f = az / 16384.0;
+  
+  // For Y-axis pointing down, use absolute value for tilt calculation
+  ay_f = fabs(ay_f);
+  
   float magnitude = sqrt(ax_f*ax_f + ay_f*ay_f + az_f*az_f);
   float angle_rad = acos(ay_f / magnitude);  // Angle from Y-axis
   float angle_deg = angle_rad * 180.0 / PI;
-  angle_deg = 180.0 - angle_deg;  // Invert for correct tilt measurement
   
   // Only show tilt data if NOT in calibration mode
   if (!calibrationMode) {
     Serial.printf("Tilt: %.2f°\n", angle_deg);
     if (debug_mode) {
       Serial.printf("  Raw: ax=%d, ay=%d, az=%d\n", ax, ay, az);
+      if (offsetsApplied) {
+        Serial.printf("  Offsets applied: X=%.1f, Y=%.1f, Z=%.1f\n", 
+                     sensorOffsets.offsetX, sensorOffsets.offsetY, sensorOffsets.offsetZ);
+      }
     }
   }
   
@@ -758,6 +794,68 @@ void onCalibrationCommand(const uint8_t *mac, const uint8_t *incomingData, int l
                 cmd.command, cmd.target_sg, cmd.request_id);
   
   switch (cmd.command) {
+    case 5: // CALIBRATE_OFFSET
+      if (debug_mode) Serial.println("Sensor offset calibration requested");
+      {
+        if (calibrateSensorOffset()) {
+          // Send response with the calculated offset angle (should be close to 0°)
+          float offsetAngle = measureTilt(); // This should now be close to 0° with offsets applied
+          sendCalibrationResponse(offsetAngle, 0.0, cmd.request_id, "Offset calibrated");
+          
+          if (debug_mode) {
+            Serial.printf("Offset calibration completed: %.2f°\n", offsetAngle);
+            printSensorOffsets();
+          }
+        } else {
+          // Send error response
+          sendCalibrationResponse(0.0, 0.0, cmd.request_id, "Offset calibration failed");
+          if (debug_mode) Serial.println("Offset calibration failed");
+        }
+      }
+      break;
+      
+    case 4: // APPLY_CALIBRATION
+      if (debug_mode) Serial.println("Apply calibration requested");
+      {
+        // Calculate polynomial coefficients from calibration points
+        if (calculatePolynomialCoefficients()) {
+          // Save coefficients to EEPROM
+          saveCalibrationCoefficients();
+          
+          // Send confirmation response
+          sendCalibrationResponse(0.0, 0.0, cmd.request_id, "Calibration applied successfully");
+          
+          // Send coefficients to base station for graph display
+          sendCalibrationCoefficients(cmd.request_id);
+          
+          if (debug_mode) {
+            Serial.println("Polynomial coefficients calculated and saved");
+            printCalibrationCoefficients();
+          }
+        } else {
+          // Send error response
+          sendCalibrationResponse(0.0, 0.0, cmd.request_id, "Failed to calculate coefficients");
+          if (debug_mode) Serial.println("Failed to calculate polynomial coefficients");
+        }
+        
+        // Exit calibration mode regardless of success/failure
+        exitCalibrationMode();
+      }
+      break;
+      
+    case 7: // EXIT_CALIBRATION
+      if (debug_mode) Serial.println("Exit calibration requested");
+      {
+        // Send confirmation response
+        sendCalibrationResponse(0.0, 0.0, cmd.request_id, "Calibration mode exited");
+        
+        // Exit calibration mode
+        exitCalibrationMode();
+        
+        if (debug_mode) Serial.println("Calibration mode exited (offset only saved)");
+      }
+      break;
+      
     case 0: // CALIBRATE_POINT1 (Water SG=1.000)
       if (debug_mode) Serial.println("Point 1 calibration measurement requested (SG=1.000)");
       {
@@ -862,33 +960,42 @@ void onCalibrationCommand(const uint8_t *mac, const uint8_t *incomingData, int l
       }
       break;
       
-    case 4: // APPLY_CALIBRATION (calculate 3rd degree polynomial)
-      if (debug_mode) Serial.println("Calculating 3rd degree polynomial coefficients using least squares");
-      if (calculatePolynomialCoefficients()) {
-        saveCalibrationCoefficients();
-        testCalibrationAccuracy();
-        
-        // Reset rate limiting to ensure final response gets through
-        lastCalibrationResponse = 0;
-        calibrationResponsePending = false;
-        
-        sendCalibrationResponse(0, 0, cmd.request_id, "3rd degree polynomial calculated and saved");
-        
-        // Auto-exit calibration mode after successful apply
-        if (debug_mode) Serial.println("Calibration completed - auto-exiting calibration mode");
-        exitCalibrationMode();
-      } else {
-        // Reset rate limiting for error response too
-        lastCalibrationResponse = 0;
-        calibrationResponsePending = false;
-        sendCalibrationResponse(0, 0, cmd.request_id, "Error: Need at least 4 calibration points");
-      }
-      break;
-      
+          
     default:
       if (debug_mode) Serial.println("Unknown calibration command");
       sendCalibrationResponse(0, 0, cmd.request_id, "Unknown command");
       break;
+  }
+}
+
+void sendCalibrationCoefficients(uint8_t request_id) {
+  calib_coeffs_t coeffs;
+  coeffs.response_type = 3; // COEFFICIENTS
+  coeffs.coeff3 = calibCoeffs.coeff3;
+  coeffs.coeff2 = calibCoeffs.coeff2;
+  coeffs.coeff1 = calibCoeffs.coeff1;
+  coeffs.coeff0 = calibCoeffs.coeff0;
+  
+  // Calculate normalization parameters from calibration points
+  if (numCalibPoints >= 2) {
+    coeffs.norm_offset = calibPoints[0].tilt; // First point as offset
+    coeffs.norm_scale = calibPoints[numCalibPoints-1].tilt - calibPoints[0].tilt; // Range
+  } else {
+    coeffs.norm_offset = 0.0;
+    coeffs.norm_scale = 1.0;
+  }
+  
+  coeffs.request_id = request_id;
+  
+  // Send to base station
+  esp_err_t result = esp_now_send(baseStationMac, (uint8_t*)&coeffs, sizeof(coeffs));
+  if (result == ESP_OK) {
+    if (debug_mode) {
+      Serial.println("Calibration coefficients sent to base station");
+      Serial.printf("Normalization: norm(Tilt) = (Tilt - %.2f) / %.2f\n", coeffs.norm_offset, coeffs.norm_scale);
+    }
+  } else {
+    if (debug_mode) Serial.printf("Failed to send coefficients: %d\n", result);
   }
 }
 
@@ -959,11 +1066,9 @@ void toggleCalibrationMode() {
     // Entering calibration mode
     if (debug_mode) {
       if (!Serial) Serial.begin(115200);
-      Serial.println("=== CALIBRATION MODE ACTIVATED ===");
     }
     if (debug_mode) Serial.println("Button pressed - Deep sleep disabled");
-    if (debug_mode) Serial.println("WARNING: High battery drain expected!");
-    
+        
     lastCalibrationActivity = millis(); // Reset timeout counter
     currentState = INIT; // Restart state machine
     
@@ -971,7 +1076,6 @@ void toggleCalibrationMode() {
     sendCalibrationTrigger();
   } else {
     // Exiting calibration mode
-    if (debug_mode) Serial.println("=== CALIBRATION MODE DEACTIVATED ===");
     if (debug_mode) Serial.println("Deep sleep enabled - Power saving mode");
     
     digitalWrite(LED_BUILTIN, LOW); // Turn off LED
@@ -983,7 +1087,6 @@ void exitCalibrationMode() {
   calibrationMode = false;
   debug_mode = false;
   
-  if (debug_mode) Serial.println("=== CALIBRATION MODE TIMEOUT ===");
   if (debug_mode) Serial.println("Auto-exit - Deep sleep enabled");
   
   digitalWrite(LED_BUILTIN, LOW); // Turn off LED
@@ -992,13 +1095,13 @@ void exitCalibrationMode() {
 
 void sendCalibrationTrigger() {
   Serial.println("=== SENDING CALIBRATION TRIGGER ===");
-  Serial.printf("Target MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+  Serial.printf("Target MAC: %02X:%02X:%02X:%02X:%02X\n", 
                 baseStationMac[0], baseStationMac[1], baseStationMac[2], 
                 baseStationMac[3], baseStationMac[4], baseStationMac[5]);
   
   // Send a special calibration trigger to base station
   calib_command_t triggerCmd;
-  triggerCmd.command = 5; // Use command 5 as CALIBRATION_TRIGGER
+  triggerCmd.command = 6; // Use command 6 as CALIBRATION_TRIGGER
   triggerCmd.target_sg = 0.0;
   triggerCmd.request_id = 255; // Special ID for trigger
   

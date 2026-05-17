@@ -118,7 +118,7 @@ void uiDrawBottomNav(int activeTab) {
   tft.fillRect(0, navY, UI_W, NAV_H, uiColorCardBackground);
   
   // Tab labels
-  const char* tabLabels[] = {"LIVE", "GRAPH", "CALIB", ""};
+  const char* tabLabels[] = {"LIVE", "GRAPH", "BATTERY", ""};
   
   for (int i = 0; i < TAB_COUNT; i++) {
     int tabX = i * tabWidth;
@@ -166,21 +166,17 @@ void uiTile(int x, int y, int w, int h, int icon, const char* label,
   // Draw rounded card with border
   uiCard(x, y, w, h, CARD_RADIUS);
   
-  // Draw icon placeholder (minimal circle)
-  tft.fillCircle(x + 20, y + h / 2, ICON_SIZE_SM / 2, 
-                muted ? uiColorTextMuted : uiColorAccent);
-  
-  // Draw label (small, above value)
+  // Draw label (small, above value) - adjusted +6px to compensate for tile lift
   tft.setTextColor(muted ? uiColorTextMuted : uiColorTextSecondary);
   tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(x + 40, y + 18);  // Adjust for FreeFont baseline
+  tft.setCursor(x + 20, y + 24);  // Adjusted for FreeFont baseline and tile lift
   tft.print(label);
   
-  // Draw value (larger, prominent) - centered in tile
+  // Draw value (larger, prominent) - centered in tile - adjusted +6px to compensate for tile lift
   tft.setTextColor(muted ? uiColorTextMuted : uiColorTextPrimary);
   tft.setFreeFont(FONT_SIZE_MD);
-  int valueY = y + h / 2 + 6;  // Center vertically
-  tft.setCursor(x + 40, valueY);
+  int valueY = y + h / 2 + 12;  // Center vertically, adjusted for tile lift
+  tft.setCursor(x + 20, valueY);
   tft.print(value);
   
   // Draw unit (small, right-aligned using textWidth)
@@ -204,25 +200,25 @@ void uiHeroSG(int x, int y, int w, int h, float sgValue, const char* trendText,
   tft.setCursor(x + 20, y + 22);
   tft.print("SG");
   
-  // Large SG value in textPrimary
+  // Large SG value in textPrimary (lowered by 4px)
   tft.setTextColor(uiColorTextPrimary);
   tft.setFreeFont(FONT_SIZE_XL);
   char sgBuf[16];
   snprintf(sgBuf, sizeof(sgBuf), "%.3f", sgValue);
-  tft.setCursor(x + 20, y + 55);
+  tft.setCursor(x + 20, y + 59);
   tft.print(sgBuf);
   
-  // Draw trend pill if trend text provided
+  // Draw trend pill if trend text provided (moved below SG value)
   if (trendText != NULL && strlen(trendText) > 0) {
-    // Determine color based on trend direction
-    uint16_t trendColor = uiColorGold;  // Default gold for positive (fermentation)
+    // Determine color based on trend direction (green for negative/down, red for positive/up)
+    uint16_t trendColor = uiColorError;  // Red for positive (up slope)
     if (trendText[0] == '-') {
-      trendColor = uiColorSuccess;  // Green for negative/stable
+      trendColor = uiColorSuccess;  // Green for negative (down slope)
     }
     
-    // Calculate trend text position (right side of hero)
-    int trendX = x + w - 80;
-    int trendY = y + 35;
+    // Calculate trend text position (below SG value, aligned left)
+    int trendX = x + 20;
+    int trendY = y + 75;
     
     // Draw trend background pill
     tft.fillRoundRect(trendX - 5, trendY - 12, 70, 24, 4, uiColorCardBackground);
@@ -235,12 +231,12 @@ void uiHeroSG(int x, int y, int w, int h, float sgValue, const char* trendText,
     tft.print(trendText);
   }
   
-  // Draw sparkline showing last ~20 SG readings
+  // Draw sparkline showing last ~20 SG readings (right 2/3 of tile)
   if (sparklineData != NULL && sparklineCount >= 2) {
-    int sparkW = w - 40;  // Width of sparkline area
-    int sparkH = 25;      // Height of sparkline
-    int sparkX = x + 20;  // Left margin
-    int sparkY = y + h - sparkH - 10;  // Bottom margin
+    int sparkW = (w - 40) * 2 / 3;  // Width of sparkline area (right 2/3)
+    int sparkH = h - 20;  // Height of sparkline (increased by 60px)
+    int sparkX = x + 20 + (w - 40) / 3;  // Start at right 1/3 margin
+    int sparkY = y + h - sparkH - 10;  // Moved 60px higher
     
     uiDrawSparkline(sparkX, sparkY, sparkW, sparkH, sparklineData, sparklineCount);
   }
