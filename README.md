@@ -78,7 +78,7 @@ WeMos D32 ESP32 Board:
 - Built-in 18650 battery holder
 - Built-in charging circuit (500mA max, USB-C input)
 - Built-in power switch
-- Built-in battery monitoring (GPIO35)
+- Built-in battery monitoring (GPIO15 via 51kΩ:51kΩ voltage divider with 10µF capacitor)
 - LED_BUILTIN (GPIO5)
 - LED_EXTRA (GPIO16) - Calibration mode indicator
 
@@ -150,21 +150,30 @@ The float unit includes a physical calibration switch for easy calibration via t
    - Touch "START" to begin the calibration wizard
    - Read the setup instructions, then touch "NEXT"
 
-3. **Prepare Calibration Solutions:**
+3. **Step 1/5 - Sensor Offset Calibration:**
+   - Place the float unit on a completely flat, level surface
+   - Ensure the device is perfectly still (no movement or vibration)
+   - Touch the "CALIBRATE" button
+   - The float will take 10 accelerometer readings and calculate offset values
+   - Offsets are saved to EEPROM and applied to all future readings
+   - This ensures the sensor reads 0° when the float is perfectly flat
+   - After successful calibration, the system automatically advances to the next step
+
+4. **Prepare Calibration Solutions:**
    - Get a bowl with minimum 3L capacity
    - Fill with 2L tap water (this will be your base solution)
    - Have normal table sugar ready (you'll need 240g total: 80g × 3 additions)
 
-4. **Step-by-Step Calibration:**
+5. **Step-by-Step SG Calibration:**
    
-   **Step 1/4 - Water (SG = 1.000):**
+   **Step 2/5 - Water (SG = 1.000):**
    - Place float in the 2L tap water
    - Wait for float to stabilize (no movement)
    - Touch "RECORD" button
    - Float records current tilt angle
    - System automatically advances to next step
    
-   **Step 2/4 - Add Sugar (SG = 1.040):**
+   **Step 3/5 - Add Sugar (SG = 1.040):**
    - Add 80g normal sugar to the bowl
    - Swirl gently to dissolve completely
    - Wait for float to stabilize
@@ -172,7 +181,7 @@ The float unit includes a physical calibration switch for easy calibration via t
    - Float records current tilt angle
    - System automatically advances to next step
    
-   **Step 3/4 - Add Sugar (SG = 1.080):**
+   **Step 4/5 - Add Sugar (SG = 1.080):**
    - Add another 80g normal sugar to the bowl
    - Swirl gently to dissolve completely
    - Wait for float to stabilize
@@ -180,7 +189,7 @@ The float unit includes a physical calibration switch for easy calibration via t
    - Float records current tilt angle
    - System automatically advances to next step
    
-   **Step 4/4 - Add Sugar (SG = 1.120):**
+   **Step 5/5 - Add Sugar (SG = 1.120):**
    - Add final 80g normal sugar to the bowl
    - Swirl gently to dissolve completely
    - Wait for float to stabilize
@@ -188,23 +197,25 @@ The float unit includes a physical calibration switch for easy calibration via t
    - Float records current tilt angle
    - System automatically advances to completion
 
-5. **Apply Calibration:**
+6. **Apply Calibration:**
    - Review all 4 recorded angles displayed on screen
    - Touch "APPLY" button
    - Float calculates 3rd degree polynomial coefficients using least squares method
    - Coefficients are saved to EEPROM
    - Base station displays confirmation message
 
-6. **Exit Calibration Mode:**
+7. **Exit Calibration Mode:**
    - Turn off the physical calibration switch on the float unit
    - Float will resume normal deep sleep operation
    - Touch "EXIT" button on base station to return to live view
 
 **Calibration Notes:**
-- Use accurate reference solutions for best results
-- Ensure float is fully submerged and stable before recording points
-- Calibration coefficients persist in EEPROM across power cycles
-- Recalibrate if readings become inaccurate
+- Sensor offset calibration (Step 1/5) compensates for IMU manufacturing variations
+- SG calibration (Steps 2-5) maps tilt angles to specific gravity values
+- Both calibrations persist in EEPROM across power cycles
+- Perform sensor offset calibration if the float reads non-zero degrees when flat
+- Perform SG calibration if density readings are inaccurate
+- Recalibrate either system if readings become inaccurate
 
 ### Calibration Theory
 The system uses a 3rd degree polynomial for accurate calibration:
