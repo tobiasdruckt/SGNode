@@ -16,10 +16,21 @@
 #include <FS.h>
 #include <SD.h>
 #include <SPI.h>
+#include <Wire.h>
 #include <EEPROM.h>
 #include "Logo2_Optimized.h"
 #include "ui_tokens.h"
 #include "ui_components.h"
+#include "brew_profile.h"
+#include "brew_wizard_controller.h"
+#include "brix_converter.h"
+#include "og_verifier.h"
+#include "derived_calculations.h"
+#include "target_curve.h"
+#include "fermentation_state_machine.h"
+#include "recommendation_engine.h"
+#include "eta_predictor.h"
+#include "yeast_preset_repository.h"
 #include "../SGNode_Shared/sg_protocol.h"
 #include "../SGNode_Base/polynomial_calibration.h"
 
@@ -32,6 +43,24 @@
 
 // Custom color definitions (TFT_eSPI doesn't have TFT_GRAY)
 #define TFT_GRAY 0x8410  // Dark gray color
+
+enum DebugLevel {
+  DEBUG_QUIET = 0,
+  DEBUG_ERROR = 1,
+  DEBUG_INFO = 2,
+  DEBUG_VERBOSE = 3
+};
+
+#ifndef SGNODE_DEBUG_LEVEL
+#define SGNODE_DEBUG_LEVEL DEBUG_ERROR
+#endif
+
+#define LOG_ERROR(...) do { if (SGNODE_DEBUG_LEVEL >= DEBUG_ERROR) Serial.printf(__VA_ARGS__); } while (0)
+#define LOG_ERRORLN(msg) do { if (SGNODE_DEBUG_LEVEL >= DEBUG_ERROR) Serial.println(msg); } while (0)
+#define LOG_INFO(...) do { if (SGNODE_DEBUG_LEVEL >= DEBUG_INFO) Serial.printf(__VA_ARGS__); } while (0)
+#define LOG_INFOLN(msg) do { if (SGNODE_DEBUG_LEVEL >= DEBUG_INFO) Serial.println(msg); } while (0)
+#define LOG_VERBOSE(...) do { if (SGNODE_DEBUG_LEVEL >= DEBUG_VERBOSE) Serial.printf(__VA_ARGS__); } while (0)
+#define LOG_VERBOSELN(msg) do { if (SGNODE_DEBUG_LEVEL >= DEBUG_VERBOSE) Serial.println(msg); } while (0)
 
 // Theme system for UI
 struct Theme {
@@ -75,8 +104,8 @@ Theme lightTheme = {
   .background = rgb565(255, 255, 255),      // White
   .cardBackground = rgb565(248, 248, 248), // Light gray
   .buttonInactive = rgb565(224, 224, 224), // Lighter gray
-  .primary = rgb565(11, 31, 42),           // Navy
-  .primaryText = rgb565(255, 255, 255),   // White
+  .primary = rgb565(248, 248, 248),        // Light top bar
+  .primaryText = rgb565(11, 31, 42),       // Navy text
   .accent = rgb565(235, 235, 235),          // Gold
   .accentText = rgb565(255, 255, 255),     // White
   .gold = rgb565(199, 138, 26),            // Gold accent
@@ -100,17 +129,17 @@ Theme darkTheme = {
   .cardBackground   = rgb565(22, 30, 56),
   .buttonInactive   = rgb565(38, 48, 74),
 
-  .primary          = rgb565(110, 131, 142),    // 
-  .primaryText      = rgb565(11, 31, 42),
+  .primary          = rgb565(8, 18, 32),
+  .primaryText      = rgb565(255, 255, 255),
 
   .accent           = rgb565(22, 30, 56),
-  .accentText       = rgb565(11, 31, 42),
+  .accentText       = rgb565(255, 255, 255),
 
-  .gold             = rgb565(110, 131, 142),
+  .gold             = rgb565(235, 190, 92),
 
-  .textPrimary      = rgb565(245, 247, 250),
-  .textSecondary    = rgb565(170, 180, 195),
-  .textMuted        = rgb565(110, 120, 140),
+  .textPrimary      = rgb565(255, 255, 255),
+  .textSecondary    = rgb565(215, 224, 235),
+  .textMuted        = rgb565(160, 174, 192),
 
   .success          = rgb565(46, 204, 113),
   .warning          = rgb565(255, 193, 7),
@@ -160,6 +189,13 @@ SPIClass sdSPI(HSPI);
 // SD card enable/disable flag
 #define SD_ENABLED  true
 
+// DS3230/DS323x RTC on the base station I2C bus
+#define RTC_SDA_PIN 32
+#define RTC_SCL_PIN 25
+#define RTC_I2C_ADDR 0x68
+#define RTC_COMPILE_UPLOAD_OFFSET_S 11
+#define RTC_VALID_FROM_YEAR 2024
+
 // ESP-NOW configuration
 #define ESPNOW_CHANNEL 1
 
@@ -167,7 +203,8 @@ SPIClass sdSPI(HSPI);
 #define MAX_DATA_BUFFER 500  // Buffer up to 500 sensor readings (increased from 100)
 struct BufferedData {
   payload_t data;
-  unsigned long timestamp;
+  uint32_t epoch_s;
+  unsigned long buffered_millis;
   bool written;
 };
 BufferedData dataBuffer[MAX_DATA_BUFFER];
@@ -185,12 +222,17 @@ const unsigned long TOUCH_TIMEOUT = 3000;     // 3 seconds of inactivity before 
 // Data buffer for historical data (display)
 #define MAX_DATA_POINTS 150
 payload_t displayDataBuffer[MAX_DATA_POINTS];
+uint32_t displayTimestampBuffer[MAX_DATA_POINTS];
 int displayDataIndex = 0;
 int displayDataCount = 0;
 int totalCSVDataLines = 0;  // Total data points in CSV file
+int lastHistoricalLoadedLines = 0;
+int lastHistoricalSkippedLines = 0;
+int lastHistoricalParseErrors = 0;
 
 // Separate buffer for discharge rate calculation (25 recent points only)
 payload_t dischargeRateBuffer[25];
+uint32_t dischargeRateTimestampBuffer[25];
 int dischargeRateBufferCount = 0;
 
 // Cursor state for graph view
@@ -248,6 +290,14 @@ enum ViewMode {
   TEMP_GRAPH_VIEW,
   ANGLE_GRAPH_VIEW,
   ABV_GRAPH_VIEW
+  ,
+  BREW_WIZARD_VIEW,
+  OG_VERIFICATION_VIEW,
+  TARGET_CHART_VIEW,
+  DASHBOARD_VIEW,
+  NEW_YEAST_VIEW,
+  MANAGE_YEAST_VIEW,
+  MANAGE_BREW_VIEW
 };
 
 ViewMode currentMode = LIVE_VIEW;
@@ -298,10 +348,12 @@ bool floatMacKnown = false; // Flag to indicate if float MAC is known
 // EEPROM addresses for float MAC storage
 #define EEPROM_FLOAT_MAC_MAGIC 100
 #define EEPROM_FLOAT_MAC_ADDR 104
+#define EEPROM_THEME_MAGIC 120
+#define EEPROM_THEME_VALUE 124
 #define FLOAT_MAC_MAGIC 0x4D414346 // "MACF" in hex
+#define THEME_MAGIC 0x54484D45 // "THME" in hex
 
 // Touch handling
-bool touchPressed = false;
 uint16_t touchX, touchY;
 
 // Timing
@@ -350,10 +402,72 @@ const unsigned long TOUCH_CHECK_INTERVAL = 50; // ms
 // SD card and file management
 char currentFermentationFile[64] = "";
 bool fermentationFileOpen = false;
-bool rebootPromptShown = false;
-bool waitingForRebootChoice = false;
-bool sdErrorMessageShown = false;
 bool showingCreateNewDialog = false;
+
+// Phase 1 intelligent fermentation assistant state
+BrewProfile activeBrewProfile;
+BrewWizardController brewWizard;
+OGVerifier ogVerifier;
+FermentationStateMachine fermentationStateMachine;
+DerivedMetrics fermentationMetrics = {1.000f, 0.0f, 0.0f, 0.0f, 0.0f};
+Recommendation currentRecommendation = {0, "Start Brew Wizard to enable guidance"};
+ETAResult currentETA = {0, 0, false, false, 0};
+bool brewProfileLoaded = false;
+bool ogVerificationPending = false;
+bool targetCurveAvailable = false;
+bool yeastPerformanceSaved = false;
+float previousAnalyticsSG = 0.0f;
+uint32_t previousAnalyticsEpoch = 0;
+
+enum NewYeastStep {
+  NY_NAME,
+  NY_CATEGORY,
+  NY_ATT_MIN,
+  NY_ATT_MAX,
+  NY_ATT_DEFAULT,
+  NY_SPEED,
+  NY_LAG,
+  NY_DURATION,
+  NY_TEMP_MIN,
+  NY_TEMP_MAX,
+  NY_FLOC,
+  NY_CURVE,
+  NY_DREST,
+  NY_NOTES,
+  NY_REVIEW
+};
+
+struct EditableYeastPreset {
+  char id[24];
+  char displayName[32];
+  char category[32];
+  int typicalAttenuationMin;
+  int typicalAttenuationMax;
+  int defaultAttenuation;
+  char fermentationSpeed[16];
+  float lagPhaseHours;
+  float typicalDurationHours;
+  float recommendedTempMinC;
+  float recommendedTempMaxC;
+  char flocculation[16];
+  char curveTemplate[32];
+  bool diacetylRestRecommended;
+  char notes[64];
+};
+
+EditableYeastPreset yeastDraft;
+NewYeastStep newYeastStep = NY_NAME;
+char yeastEditBuffer[64] = "";
+bool yeastEditPristine = false;
+bool editingExistingYeast = false;
+int manageYeastIndex = 0;
+char managedYeastIds[12][24];
+char managedYeastNames[12][32];
+int managedYeastCount = 0;
+int manageBatchIndex = 0;
+char managedBatchIds[16][24];
+char managedBatchNames[16][40];
+int managedBatchCount = 0;
 
 // Calibration buttons (step-by-step wizard) - reorganized for consistent layout
 #define BUTTON_CALIB_START_X 110
@@ -365,11 +479,6 @@ bool showingCreateNewDialog = false;
 #define BUTTON_CALIB_NEXT_Y 180
 #define BUTTON_CALIB_NEXT_W 100
 #define BUTTON_CALIB_NEXT_H 40
-
-#define BUTTON_CALIB_RECORD_X 110
-#define BUTTON_CALIB_RECORD_Y 180
-#define BUTTON_CALIB_RECORD_W 100
-#define BUTTON_CALIB_RECORD_H 40
 
 #define BUTTON_CALIB_APPLY_X 220
 #define BUTTON_CALIB_APPLY_Y 194
@@ -392,6 +501,10 @@ bool showingCreateNewDialog = false;
 #define BUTTON_CALIB_RECORD_Y 194
 #define BUTTON_CALIB_RECORD_W 100
 #define BUTTON_CALIB_RECORD_H 40
+
+// Battery view buttons
+#define BATTERY_BUTTON_H 40
+#define BATTERY_BUTTON_Y (UI_H - NAV_H - BATTERY_BUTTON_H - GAP)
 
 // Exit button for Step 1/5 - lower left
 #define BUTTON_CALIB_EXIT_OFFSET_X 80   // Lower left
@@ -420,7 +533,16 @@ bool showingCreateNewDialog = false;
 void initESPNow();
 void initDisplay();
 void initTouch();
-void initSDCard();
+void initRTC();
+bool readRTCDateTime(uint16_t* year, uint8_t* month, uint8_t* day,
+                     uint8_t* hour, uint8_t* minute, uint8_t* second);
+bool setRTCDateTime(uint16_t year, uint8_t month, uint8_t day,
+                    uint8_t hour, uint8_t minute, uint8_t second);
+uint32_t getCurrentEpoch();
+bool isEpochValid(uint32_t epoch);
+void formatTimestamp(uint32_t epoch, char* buf, size_t bufSize);
+uint32_t buildEpochWithUploadOffset();
+uint32_t parseDateTimeToEpoch(const char* timestamp);
 void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len);
 void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int len);
 void onCalibrationCommandFromFloat(const uint8_t *mac, const uint8_t *incomingData, int len);
@@ -435,13 +557,21 @@ void drawPolynomialGraph();
 void drawTempGraphView();
 void drawAngleGraphView();
 void drawAbvGraphView();
+void drawBrewWizardScreen();
+void drawOGVerificationScreen();
+void drawTargetVsActualChart();
+void drawDashboardScreen();
+void drawNewYeastScreen();
+void drawManageYeastScreen();
+void drawManageBrewScreen();
+void drawRecommendationPanel(int x, int y, int w, int h);
 void calculateGraphPoints();
 void drawGraphAxes();
 void drawGraphCurve();
 void checkTouch();
 float calculateGravity(float tilt);
 
-void addDataPoint(payload_t data);
+void addDataPoint(payload_t data, uint32_t epoch_s);
 void drawGrid();
 void drawGraph();
 void loadFloatMacFromEEPROM();
@@ -451,10 +581,9 @@ void checkWaitTimeout();
 void stopWait();
 void sendCalibrationCommand(uint8_t command, float target_sg);
 void applyCalibration();
-bool logDataToSD(payload_t data);
+bool logDataToSD(payload_t data, uint32_t epoch_s);
 void createNewFermentationFile();
-void continueFermentationFile();
-void drawRebootPrompt();
+bool ensureFermentationLogFile(const char* batchId);
 void drawCreateNewDialog();
 void checkExistingFermentation();
 bool loadHistoricalDataFromCSV(const char* filename, 
@@ -464,15 +593,45 @@ bool loadHistoricalDataFromCSV(const char* filename,
 void checkOGStability(float currentSG);
 void logOGToSD();
 float calculateABV(float og, float currentSG);
+void beginBrewWizard();
+void completeBrewWizard();
+void beginNewYeastWizard(const char* presetId = NULL);
+void loadYeastStepBuffer();
+void commitYeastStepBuffer();
+void drawNewYeastNav(const char* nextLabel);
+bool handleNewYeastTouch(int x, int y);
+void saveNewYeastWizard();
+void loadManagedYeasts();
+bool handleManageYeastTouch(int x, int y);
+void loadManagedBatches();
+bool handleManageBrewTouch(int x, int y);
+void updateFermentationAssistant(payload_t data, uint32_t epoch_s);
+void refreshFermentationAssistantFromProfile();
+void finalizeHistoricalDataLoad();
+void markScreenDirtyForFloatData();
+void clearHistoricalDisplayData();
+void drawWrappedText(int x, int y, int w, const char* text, uint16_t color);
+void persistActiveBrewProfile();
+void startNewBatchStorage(const char* batchId);
+void formatDurationShort(unsigned long seconds, char* buffer, size_t bufferSize);
+void handleOGChoice(bool useMeasuredOG);
+void saveYeastPerformanceSummary(float finalGravity, uint32_t completedAt);
 uint8_t calculateBatteryPercentage(float voltage);
 void updateChargingState(float currentVoltage);
 float calculateDischargeRateLinearRegression();
-void showSDErrorIfFailed();
 
 // Graph cursor helper functions
 void formatTimeFromDataPoint(int index, char* buf, int bufSize);
 void updateCursorPosition();
 void drawCursorValueDisplay(int x, int y, bool showRight);
+
+// View helper functions
+void drawViewTopbar(const char* title);
+void drawNoDataCard(const char* message, const char* subtext, int activeTab);
+void drawDetailSection(int* y, const char* title);
+void drawDetailRow(int* y, const char* label, const char* value);
+void drawDetailSectionAt(int x, int* y, int w, const char* title);
+void drawDetailRowAt(int x, int* y, int w, const char* label, const char* value);
 
 // Graph button handler functions
 void handleGraphButton6h();
@@ -484,22 +643,25 @@ void handleGraphButtonRight();
 // Time-based SPI separation functions
 bool mountSDTemporarily();
 void dismountSD();
-void bufferSensorData(payload_t data);
+void bufferSensorData(payload_t data, uint32_t epoch_s);
 void writeBufferedDataToSD();
 bool isSafeForSDOperation();
 
 // UI Design System Helper Functions
-void drawHeader(const char* title);
-void drawFooter(const char* status);
-void drawCard(int x, int y, int w, int h);
 void drawButton(int x, int y, int w, int h, const char* label, bool active);
+void drawThemeToggle(int x, int y, bool enabled);
+bool isLogoBackgroundPixel(uint16_t color);
 void toggleTheme();
+void loadThemePreference();
+void saveThemePreference();
 void drawBootScreen();
 void uiInitColors();
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("=== Fermentation Base Station Starting ===");
+  LOG_INFOLN("=== SGNode Base Station alpha 0.4.0 starting ===");
+  
+  loadThemePreference();
   
   // Initialize UI color tokens from theme
   uiInitColors();
@@ -507,15 +669,16 @@ void setup() {
   initDisplay();
   initTouch();
   initCalibration();
+  initRTC();
   
   // Initialize SD CS pin but don't mount SD yet (to avoid touch interference)
   #if SD_ENABLED
     pinMode(SD_CS, OUTPUT);
     digitalWrite(SD_CS, HIGH); // Ensure SD CS is HIGH initially
-    Serial.println("SD card CS pin initialized (not mounted yet)");
-    Serial.println("Touch ready - SD will mount temporarily when needed");
+    LOG_INFOLN("SD card CS pin initialized (not mounted yet)");
+    LOG_INFOLN("Touch ready - SD will mount temporarily when needed");
   #else
-    Serial.println("SD card DISABLED");
+    LOG_INFOLN("SD card DISABLED");
   #endif
   
   initESPNow();
@@ -529,9 +692,11 @@ void setup() {
   // Check for existing fermentation and auto-continue or create new
   checkExistingFermentation();
   
-  Serial.println("Base station ready");
-  // Initial screen draw
-  drawLiveView();
+  LOG_INFOLN("Base station ready");
+  // Initial screen draw happens through the normal dirty-screen path so
+  // restored historical data and the selected view use the same refresh logic.
+  screenDirty = true;
+  staticElementsDrawn = false;
 }
 
 void loop() {
@@ -587,6 +752,27 @@ void loop() {
         case ABV_GRAPH_VIEW:
           drawAbvGraphView();
           break;
+        case BREW_WIZARD_VIEW:
+          drawBrewWizardScreen();
+          break;
+        case OG_VERIFICATION_VIEW:
+          drawOGVerificationScreen();
+          break;
+        case TARGET_CHART_VIEW:
+          drawTargetVsActualChart();
+          break;
+        case DASHBOARD_VIEW:
+          drawDashboardScreen();
+          break;
+        case NEW_YEAST_VIEW:
+          drawNewYeastScreen();
+          break;
+        case MANAGE_YEAST_VIEW:
+          drawManageYeastScreen();
+          break;
+        case MANAGE_BREW_VIEW:
+          drawManageBrewScreen();
+          break;
       }
     }
     screenDirty = false;
@@ -633,6 +819,27 @@ void loop() {
         case ABV_GRAPH_VIEW:
           title = "ABV";
           break;
+        case BREW_WIZARD_VIEW:
+          title = "Wizard";
+          break;
+        case OG_VERIFICATION_VIEW:
+          title = "OG Verify";
+          break;
+        case TARGET_CHART_VIEW:
+          title = "Target";
+          break;
+        case DASHBOARD_VIEW:
+          title = "Dashboard";
+          break;
+        case NEW_YEAST_VIEW:
+          title = "New Yeast";
+          break;
+        case MANAGE_YEAST_VIEW:
+          title = "Manage Yeast";
+          break;
+        case MANAGE_BREW_VIEW:
+          title = "Manage Brew";
+          break;
       }
       
       uiDrawTopbar(title, true, fermentationFileOpen, battPercent);
@@ -641,6 +848,185 @@ void loop() {
   }
   
   delay(10);
+}
+
+uint8_t bcdToDec(uint8_t value) {
+  return ((value >> 4) * 10) + (value & 0x0F);
+}
+
+uint8_t decToBcd(uint8_t value) {
+  return ((value / 10) << 4) | (value % 10);
+}
+
+int64_t daysFromCivil(int year, unsigned month, unsigned day) {
+  year -= month <= 2;
+  const int era = (year >= 0 ? year : year - 399) / 400;
+  const unsigned yoe = (unsigned)(year - era * 400);
+  const unsigned doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int)doe - 719468;
+}
+
+uint32_t dateTimeToEpoch(uint16_t year, uint8_t month, uint8_t day,
+                         uint8_t hour, uint8_t minute, uint8_t second) {
+  int64_t days = daysFromCivil(year, month, day);
+  if (days < 0) return 0;
+  return (uint32_t)(days * 86400 + (uint32_t)hour * 3600 + (uint32_t)minute * 60 + second);
+}
+
+void civilFromDays(int64_t z, uint16_t* year, uint8_t* month, uint8_t* day) {
+  z += 719468;
+  const int era = (z >= 0 ? z : z - 146096) / 146097;
+  const unsigned doe = (unsigned)(z - era * 146097);
+  const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int y = (int)yoe + era * 400;
+  const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  const unsigned mp = (5 * doy + 2) / 153;
+  const unsigned d = doy - (153 * mp + 2) / 5 + 1;
+  const unsigned m = mp + (mp < 10 ? 3 : -9);
+  y += (m <= 2);
+  *year = (uint16_t)y;
+  *month = (uint8_t)m;
+  *day = (uint8_t)d;
+}
+
+void epochToDateTime(uint32_t epoch, uint16_t* year, uint8_t* month, uint8_t* day,
+                     uint8_t* hour, uint8_t* minute, uint8_t* second) {
+  uint32_t secondsOfDay = epoch % 86400UL;
+  civilFromDays(epoch / 86400UL, year, month, day);
+  *hour = secondsOfDay / 3600UL;
+  *minute = (secondsOfDay % 3600UL) / 60UL;
+  *second = secondsOfDay % 60UL;
+}
+
+bool isEpochValid(uint32_t epoch) {
+  return epoch >= dateTimeToEpoch(RTC_VALID_FROM_YEAR, 1, 1, 0, 0, 0);
+}
+
+uint8_t compileMonthNumber(const char* monthName) {
+  static const char* months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  const char* found = strstr(months, monthName);
+  if (!found) return 1;
+  return ((found - months) / 3) + 1;
+}
+
+uint32_t buildEpochWithUploadOffset() {
+  char monthName[4] = {0};
+  int day = 1;
+  int year = 2024;
+  int hour = 0;
+  int minute = 0;
+  int second = 0;
+  sscanf(__DATE__, "%3s %d %d", monthName, &day, &year);
+  sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &second);
+  return dateTimeToEpoch(year, compileMonthNumber(monthName), day, hour, minute, second) +
+         RTC_COMPILE_UPLOAD_OFFSET_S;
+}
+
+bool readRTCDateTime(uint16_t* year, uint8_t* month, uint8_t* day,
+                     uint8_t* hour, uint8_t* minute, uint8_t* second) {
+  Wire.beginTransmission(RTC_I2C_ADDR);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) {
+    return false;
+  }
+  
+  if (Wire.requestFrom(RTC_I2C_ADDR, 7) != 7) {
+    return false;
+  }
+  
+  *second = bcdToDec(Wire.read() & 0x7F);
+  *minute = bcdToDec(Wire.read() & 0x7F);
+  uint8_t hourReg = Wire.read();
+  if (hourReg & 0x40) {
+    *hour = bcdToDec(hourReg & 0x1F);
+    if (hourReg & 0x20) *hour = (*hour % 12) + 12;
+  } else {
+    *hour = bcdToDec(hourReg & 0x3F);
+  }
+  Wire.read(); // day-of-week
+  *day = bcdToDec(Wire.read() & 0x3F);
+  *month = bcdToDec(Wire.read() & 0x1F);
+  *year = 2000 + bcdToDec(Wire.read());
+  
+  return *month >= 1 && *month <= 12 && *day >= 1 && *day <= 31 &&
+         *hour <= 23 && *minute <= 59 && *second <= 59;
+}
+
+bool setRTCDateTime(uint16_t year, uint8_t month, uint8_t day,
+                    uint8_t hour, uint8_t minute, uint8_t second) {
+  Wire.beginTransmission(RTC_I2C_ADDR);
+  Wire.write(0x00);
+  Wire.write(decToBcd(second));
+  Wire.write(decToBcd(minute));
+  Wire.write(decToBcd(hour));
+  Wire.write(decToBcd(1)); // day-of-week is not used by SGNode
+  Wire.write(decToBcd(day));
+  Wire.write(decToBcd(month));
+  Wire.write(decToBcd(year >= 2000 ? year - 2000 : 0));
+  if (Wire.endTransmission() != 0) {
+    return false;
+  }
+  
+  Wire.beginTransmission(RTC_I2C_ADDR);
+  Wire.write(0x0F);
+  Wire.write(0x00); // clear oscillator-stop flag on DS323x-compatible RTCs
+  Wire.endTransmission();
+  return true;
+}
+
+uint32_t getCurrentEpoch() {
+  uint16_t year;
+  uint8_t month, day, hour, minute, second;
+  if (!readRTCDateTime(&year, &month, &day, &hour, &minute, &second)) {
+    return 0;
+  }
+  return dateTimeToEpoch(year, month, day, hour, minute, second);
+}
+
+void formatTimestamp(uint32_t epoch, char* buf, size_t bufSize) {
+  if (!isEpochValid(epoch)) {
+    snprintf(buf, bufSize, "RTC_UNSET");
+    return;
+  }
+  
+  uint16_t year;
+  uint8_t month, day, hour, minute, second;
+  epochToDateTime(epoch, &year, &month, &day, &hour, &minute, &second);
+  snprintf(buf, bufSize, "%04u-%02u-%02u %02u:%02u:%02u",
+           year, month, day, hour, minute, second);
+}
+
+uint32_t parseDateTimeToEpoch(const char* timestamp) {
+  int year, month, day, hour, minute, second;
+  if (sscanf(timestamp, "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) == 6) {
+    return dateTimeToEpoch(year, month, day, hour, minute, second);
+  }
+  return 0;
+}
+
+void initRTC() {
+  Wire.begin(RTC_SDA_PIN, RTC_SCL_PIN);
+  
+  uint32_t buildEpoch = buildEpochWithUploadOffset();
+  uint32_t rtcEpoch = getCurrentEpoch();
+  
+  if (!isEpochValid(rtcEpoch) || rtcEpoch < buildEpoch) {
+    uint16_t year;
+    uint8_t month, day, hour, minute, second;
+    epochToDateTime(buildEpoch, &year, &month, &day, &hour, &minute, &second);
+    if (setRTCDateTime(year, month, day, hour, minute, second)) {
+      char ts[24];
+      formatTimestamp(buildEpoch, ts, sizeof(ts));
+      LOG_INFO("RTC set from compile time (+%ds): %s\n", RTC_COMPILE_UPLOAD_OFFSET_S, ts);
+    } else {
+      LOG_ERRORLN("RTC not found on SDA=32/SCL=25 (address 0x68)");
+    }
+  } else {
+    char ts[24];
+    formatTimestamp(rtcEpoch, ts, sizeof(ts));
+    LOG_INFO("RTC running: %s\n", ts);
+  }
 }
 
 void initESPNow() {
@@ -655,7 +1041,7 @@ void initESPNow() {
   
   // Initialize ESP-NOW
   if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
+    LOG_ERRORLN("Error initializing ESP-NOW");
     return;
   }
   
@@ -682,15 +1068,15 @@ void initESPNow() {
     } else if (len == sizeof(payload_t)) { // 26 bytes - Regular sensor data (fallback)
       onDataReceived(recv_info->src_addr, data, len);
     } else {
-      Serial.printf("Unknown packet size: %d bytes\n", len);
+      LOG_ERROR("Unknown packet size: %d bytes\n", len);
     }
   });
   
-  Serial.println("ESP-NOW initialized");
+  LOG_INFOLN("ESP-NOW initialized");
   
   // Print base station MAC address after WiFi is fully initialized
   String macAddress = WiFi.macAddress();
-  Serial.printf("Base Station MAC: %s\n", macAddress.c_str());
+  LOG_INFO("Base Station MAC: %s\n", macAddress.c_str());
 }
 
 void initDisplay() {
@@ -698,12 +1084,12 @@ void initDisplay() {
   tft.setRotation(1); // Landscape mode - MUST match touchCalibration_rotate in Touch.h (which is 1)
   
   // Verify screen dimensions after rotation
-  Serial.printf("Display dimensions after rotation: %dx%d\n", tft.width(), tft.height());
+  LOG_INFO("Display dimensions after rotation: %dx%d\n", tft.width(), tft.height());
   
   tft.fillScreen(currentTheme->background);
   tft.setTextColor(currentTheme->textPrimary, currentTheme->background);
   
-  Serial.println("Display initialized for 480x320 landscape (rotation 1)");
+  LOG_INFOLN("Display initialized for 480x320 landscape (rotation 1)");
 }
 
 void initTouch() {
@@ -715,7 +1101,7 @@ void initTouch() {
   pinMode(SD_CS, OUTPUT);
   digitalWrite(SD_CS, HIGH);
   
-  Serial.println("Touch screen ready (using TFT_eSPI built-in support)");
+  LOG_INFOLN("Touch screen ready (using TFT_eSPI built-in support)");
 }
 
 void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
@@ -724,7 +1110,7 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
     if (!floatMacKnown) {
       memcpy(floatMac, mac, 6);
       floatMacKnown = true;
-      Serial.printf("Float MAC address captured: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+      LOG_INFO("Float MAC address captured: %02X:%02X:%02X:%02X:%02X:%02X\n", 
                     floatMac[0], floatMac[1], floatMac[2], floatMac[3], floatMac[4], floatMac[5]);
       
       // Save to EEPROM for permanent pairing
@@ -739,11 +1125,11 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
       
       esp_err_t addResult = esp_now_add_peer(&peerInfo);
       if (addResult == ESP_OK) {
-        Serial.println("Float unit registered as ESP-NOW peer");
+        LOG_INFOLN("Float unit registered as ESP-NOW peer");
       } else if (addResult == ESP_ERR_ESPNOW_EXIST) {
-        Serial.println("Float unit already registered as peer");
+        LOG_INFOLN("Float unit already registered as peer");
       } else {
-        Serial.printf("Failed to register float as peer: %d\n", addResult);
+        LOG_ERROR("Failed to register float as peer: %d\n", addResult);
       }
     }
     
@@ -752,7 +1138,7 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
     
     // Verify protocol version
     if (receivedData.version != SG_PROTOCOL_VERSION) {
-      Serial.printf("Warning: Protocol version mismatch (expected %d, got %d)\n", SG_PROTOCOL_VERSION, receivedData.version);
+      LOG_ERROR("Warning: Protocol version mismatch (expected %d, got %d)\n", SG_PROTOCOL_VERSION, receivedData.version);
       return;
     }
     
@@ -767,23 +1153,24 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
     }
     
     if (calculated_crc != receivedData.crc) {
-      Serial.printf("CRC mismatch: expected %d, got %d\n", receivedData.crc, calculated_crc);
+      LOG_ERROR("CRC mismatch: expected %d, got %d\n", receivedData.crc, calculated_crc);
       return;
     }
     
+    uint32_t receivedEpoch = getCurrentEpoch();
     uint8_t batteryPercent = calculateBatteryPercentage(receivedData.battery_voltage);
     
     // Update charging state based on voltage trends
     updateChargingState(receivedData.battery_voltage);
     
-    Serial.printf("Received: seq=%d, angle=%.2f°, density=%.3f, temp=%.1f°C, battery=%.2fV (%d%%) [%s]\n", 
+    LOG_VERBOSE("Received: seq=%d, angle=%.2f°, density=%.3f, temp=%.1f°C, battery=%.2fV (%d%%) [%s]\n", 
                   receivedData.sequence_id, receivedData.angle, receivedData.density, 
                   receivedData.temperature, receivedData.battery_voltage, batteryPercent,
                   chargingState == CHARGING ? "CHARGING" : 
                   chargingState == DISCHARGING ? "DISCHARGING" : "UNKNOWN");
     
     // Check OG stability if not yet captured
-    if (!ogCaptured && fermentationFileOpen) {
+    if (!brewProfileLoaded && !ogCaptured && fermentationFileOpen) {
       checkOGStability(receivedData.density);
     }
     
@@ -791,45 +1178,16 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
     if (ogCaptured) {
       currentABV = calculateABV(originalGravity, receivedData.density);
     }
+
+    updateFermentationAssistant(receivedData, receivedEpoch);
     
     // Add data to display buffer
-    addDataPoint(receivedData);
+    addDataPoint(receivedData, receivedEpoch);
     
     // Buffer sensor data for SD writing (time-based approach)
-    bufferSensorData(receivedData);
+    bufferSensorData(receivedData, receivedEpoch);
     
-    // Set region-based dirty flags for LIVE view
-    if (currentMode == LIVE_VIEW) {
-      // Force complete screen redraw if this is the first data point
-      static bool lastHadData = false;
-      bool hasData = displayDataCount > 0;
-      if (!lastHadData && hasData) {
-        screenDirty = true;  // Force complete redraw
-      }
-      lastHadData = hasData;
-      
-      heroDirty = true;
-      tileTempDirty = true;
-      tileAngleDirty = true;
-      tileAbvDirty = true;
-      topbarDirty = true;  // Update battery in topbar
-    }
-    // Also update GRAPH_VIEW if active - auto-update graph with new data
-    if (currentMode == GRAPH_VIEW) {
-      screenDirty = true;  // Trigger full graph redraw
-    }
-    // Also update LIVE_DETAILS_VIEW if active
-    if (currentMode == LIVE_DETAILS_VIEW) {
-      detailsDirty = true;
-    }
-    // Also update BATTERY_VIEW if active
-    if (currentMode == BATTERY_VIEW) {
-      screenDirty = true;  // Trigger full battery view redraw
-    }
-    // Also update new graph views if active - auto-update with new data
-    if (currentMode == TEMP_GRAPH_VIEW || currentMode == ANGLE_GRAPH_VIEW || currentMode == ABV_GRAPH_VIEW) {
-      screenDirty = true;  // Trigger full graph redraw
-    }
+    markScreenDirtyForFloatData();
     
     lastUpdate = millis();
     
@@ -849,27 +1207,139 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
     // Set calibration mode flag when receiving calibration responses
     calibrationModeActive = true;
   } else {
-    Serial.printf("Unknown data format received: %d bytes\n", len);
+    LOG_ERROR("Unknown data format received: %d bytes\n", len);
   }
 }
 
-void addDataPoint(payload_t data) {
+void addDataPoint(payload_t data, uint32_t epoch_s) {
   displayDataBuffer[displayDataIndex] = data;
+  displayTimestampBuffer[displayDataIndex] = epoch_s;
   displayDataIndex = (displayDataIndex + 1) % MAX_DATA_POINTS;
   
   if (displayDataCount < MAX_DATA_POINTS) {
     displayDataCount++;
   }
+  
+  if (dischargeRateBufferCount < 25) {
+    dischargeRateBuffer[dischargeRateBufferCount] = data;
+    dischargeRateTimestampBuffer[dischargeRateBufferCount] = epoch_s;
+    dischargeRateBufferCount++;
+  } else {
+    for (int i = 1; i < 25; i++) {
+      dischargeRateBuffer[i - 1] = dischargeRateBuffer[i];
+      dischargeRateTimestampBuffer[i - 1] = dischargeRateTimestampBuffer[i];
+    }
+    dischargeRateBuffer[24] = data;
+    dischargeRateTimestampBuffer[24] = epoch_s;
+  }
+}
+
+void clearHistoricalDisplayData() {
+  displayDataIndex = 0;
+  displayDataCount = 0;
+  totalCSVDataLines = 0;
+  lastHistoricalLoadedLines = 0;
+  lastHistoricalSkippedLines = 0;
+  lastHistoricalParseErrors = 0;
+  dischargeRateBufferCount = 0;
+  memset(displayDataBuffer, 0, sizeof(displayDataBuffer));
+  memset(displayTimestampBuffer, 0, sizeof(displayTimestampBuffer));
+  memset(dischargeRateBuffer, 0, sizeof(dischargeRateBuffer));
+  memset(dischargeRateTimestampBuffer, 0, sizeof(dischargeRateTimestampBuffer));
+  previousAnalyticsSG = 0.0f;
+  previousAnalyticsEpoch = 0;
+}
+
+void finalizeHistoricalDataLoad() {
+  if (displayDataCount > 0) {
+    cursorPosition = 1.0f;
+    cursorIndex = displayDataCount - 1;
+    refreshFermentationAssistantFromProfile();
+    lastUpdate = millis();
+  }
+
+  staticElementsDrawn = false;
+  heroDirty = true;
+  tileTempDirty = true;
+  tileAngleDirty = true;
+  tileAbvDirty = true;
+  topbarDirty = true;
+  detailsDirty = true;
+  screenDirty = true;
+}
+
+void markScreenDirtyForFloatData() {
+  static bool lastHadData = false;
+  bool hasData = displayDataCount > 0;
+
+  heroDirty = true;
+  tileTempDirty = true;
+  tileAngleDirty = true;
+  tileAbvDirty = true;
+  topbarDirty = true;
+  detailsDirty = true;
+
+  if (!lastHadData && hasData) {
+    staticElementsDrawn = false;
+  }
+  lastHadData = hasData;
+
+  screenDirty = true;
+}
+
+int displayBufferIndexForPoint(int pointIndex) {
+  return (displayDataIndex - displayDataCount + pointIndex + MAX_DATA_POINTS) % MAX_DATA_POINTS;
+}
+
+uint32_t timestampForPoint(int pointIndex) {
+  if (pointIndex < 0 || pointIndex >= displayDataCount) {
+    return 0;
+  }
+  return displayTimestampBuffer[displayBufferIndexForPoint(pointIndex)];
+}
+
+bool timestampsAvailableForGraph() {
+  if (displayDataCount < 2) return false;
+  uint32_t firstEpoch = timestampForPoint(0);
+  uint32_t lastEpoch = timestampForPoint(displayDataCount - 1);
+  return isEpochValid(firstEpoch) && isEpochValid(lastEpoch) && lastEpoch > firstEpoch;
+}
+
+int graphXForPoint(int pointIndex, int graphX, int graphW) {
+  if (displayDataCount < 2) return graphX;
+  
+  if (timestampsAvailableForGraph()) {
+    uint32_t firstEpoch = timestampForPoint(0);
+    uint32_t lastEpoch = timestampForPoint(displayDataCount - 1);
+    uint32_t pointEpoch = timestampForPoint(pointIndex);
+    if (isEpochValid(pointEpoch)) {
+      return graphX + (int)(((double)(pointEpoch - firstEpoch) * graphW) / (double)(lastEpoch - firstEpoch));
+    }
+  }
+  
+  return graphX + (pointIndex * graphW / (displayDataCount - 1));
+}
+
+bool calculateTimestampTrend(float latestDensity, uint32_t latestEpoch, float* trendOut) {
+  if (!isEpochValid(latestEpoch) || displayDataCount < 2) return false;
+  
+  const uint32_t TREND_WINDOW_S = 5 * 60;
+  for (int i = displayDataCount - 2; i >= 0; i--) {
+    uint32_t pointEpoch = timestampForPoint(i);
+    if (isEpochValid(pointEpoch) && latestEpoch >= pointEpoch &&
+        latestEpoch - pointEpoch >= TREND_WINDOW_S) {
+      int idx = displayBufferIndexForPoint(i);
+      *trendOut = latestDensity - displayDataBuffer[idx].density;
+      return true;
+    }
+  }
+  
+  return false;
 }
 
 void drawLiveViewStatic() {
   // Draw top bar
-  uint8_t battPercent = 0;
-  if (displayDataCount > 0) {
-    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-    battPercent = calculateBatteryPercentage(latest.battery_voltage);
-  }
-  uiDrawTopbar("Live", true, fermentationFileOpen, battPercent);
+  drawViewTopbar("Live");
   
   // Draw calibration warning if active (compact)
   if (calibrationModeActive) {
@@ -881,7 +1351,7 @@ void drawLiveViewStatic() {
     tft.print("CALIB MODE");
   }
   
-  int contentY = calibrationModeActive ? TOPBAR_H + 14 : TOPBAR_H;
+  int contentY = calibrationModeActive ? TOPBAR_H + MARGIN + 14 : TOPBAR_H + MARGIN;
   int contentH = UI_H - contentY - NAV_H;
   
   // No data state
@@ -920,7 +1390,7 @@ void drawLiveViewStatic() {
   int tileW = (UI_W - MARGIN * 2 - GAP * 2) / 3;  // 3 tiles with gaps
   int tileH = contentH - heroH - GAP;
   
-  uiTile(MARGIN, tileY, tileW, tileH, 0, "Temp", "--", "°C", false);
+  uiTile(MARGIN, tileY, tileW, tileH, 0, "Temp", "--", "C", false);
   uiTile(MARGIN + tileW + GAP, tileY, tileW, tileH, 0, "Angle", "--", "deg", false);
   uiTile(MARGIN + tileW * 2 + GAP * 2, tileY, tileW, tileH, 0, "ABV", "Set OG", "%", true);
   
@@ -944,7 +1414,7 @@ void updateLiveViewDynamic() {
   payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
   uint8_t batteryPercent = calculateBatteryPercentage(latest.battery_voltage);
   
-  int contentY = calibrationModeActive ? TOPBAR_H + 14 : TOPBAR_H;
+  int contentY = calibrationModeActive ? TOPBAR_H + MARGIN + 14 : TOPBAR_H + MARGIN;
   int contentH = UI_H - contentY - NAV_H;
   int heroH = contentH / 2;
   int tileY = contentY + heroH + GAP - 6;  // Lifted by 6px
@@ -955,11 +1425,17 @@ void updateLiveViewDynamic() {
   
   // Update hero SG value with trend and sparkline
   if (heroDirty) {
-    // Calculate trend (compare latest with ~5 min ago, assuming ~30s intervals = 10 points back)
+    // Calculate trend against the reading closest to at least 5 real minutes ago.
     char trendBuf[16] = "";
-    if (displayDataCount >= 10) {
+    float trend = 0.0;
+    uint32_t latestEpoch = displayTimestampBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+    bool hasTrend = calculateTimestampTrend(latest.density, latestEpoch, &trend);
+    if (!hasTrend && displayDataCount >= 10) {
       int oldIdx = (displayDataIndex - 10 + MAX_DATA_POINTS) % MAX_DATA_POINTS;
-      float trend = latest.density - displayDataBuffer[oldIdx].density;
+        trend = latest.density - displayDataBuffer[oldIdx].density;
+      hasTrend = true;
+    }
+    if (hasTrend) {
       if (abs(trend) >= 0.001) {
         snprintf(trendBuf, sizeof(trendBuf), "%+.3f", trend);
       }
@@ -983,7 +1459,7 @@ void updateLiveViewDynamic() {
   // Update temp tile
   if (tileTempDirty) {
     snprintf(buffer, sizeof(buffer), "%.1f", latest.temperature);
-    uiTile(MARGIN, tileY, tileW, tileH, 0, "Temp", buffer, "°C", false);
+    uiTile(MARGIN, tileY, tileW, tileH, 0, "Temp", buffer, "C", false);
     tileTempDirty = false;
   }
   
@@ -1036,25 +1512,17 @@ void drawLiveView() {
 void drawGraphView() {
   tft.fillScreen(uiColorBackground);
   
-  uint8_t battPercent = 0;
-  if (displayDataCount > 0) {
-    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-    battPercent = calculateBatteryPercentage(latest.battery_voltage);
-  }
-  uiDrawTopbar("Graph", true, fermentationFileOpen, battPercent);
+  drawViewTopbar("Graph");
   
   // Define button area
   #define GRAPH_BUTTON_H 40
   #define GRAPH_BUTTON_Y (UI_H - NAV_H - GRAPH_BUTTON_H - GAP)
   
-  int contentY = TOPBAR_H;
+  int contentY = TOPBAR_H + MARGIN;
   int contentH = GRAPH_BUTTON_Y - contentY - GAP;
   
   if (displayDataCount < 3) {
-    uiCard(MARGIN, contentY + contentH / 2 - 40, UI_W - MARGIN * 2, 80, CARD_RADIUS);
-    uiTextCenter(MARGIN, contentY + contentH / 2 - 10, UI_W - MARGIN * 2, 20, "No graph data", FONT_SIZE_MD, uiColorTextMuted);
-    uiTextCenter(MARGIN, contentY + contentH / 2 + 10, UI_W - MARGIN * 2, 20, "Collect a few points first", FONT_SIZE_SM, uiColorTextMuted);
-    uiDrawBottomNav(TAB_GRAPH);
+    drawNoDataCard("No graph data", "Collect a few points first", TAB_GRAPH);
     return;
   }
   
@@ -1094,8 +1562,928 @@ void drawGraphView() {
   uiDrawBottomNav(TAB_GRAPH);
 }
 
+void drawRecommendationPanel(int x, int y, int w, int h) {
+  uiCard(x, y, w, h, CARD_RADIUS);
+  tft.setTextColor(uiColorAccent);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(x + 10, y + 22);
+  tft.print("Next action");
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  char message[64];
+  uiEllipsize(currentRecommendation.message, w - 20, message, sizeof(message));
+  tft.setCursor(x + 10, y + 50);
+  tft.print(message);
+}
+
+void drawDashboardScreen() {
+  tft.fillScreen(uiColorBackground);
+  drawViewTopbar("Dashboard");
+  topbarDirty = false;
+  heroDirty = false;
+  tileTempDirty = false;
+  tileAngleDirty = false;
+  tileAbvDirty = false;
+
+  int contentY = TOPBAR_H + MARGIN;
+  int contentW = UI_W - MARGIN * 2;
+
+  if (!brewProfileLoaded) {
+    uiCard(MARGIN, contentY + 34, contentW, 112, CARD_RADIUS);
+    uiTextCenter(MARGIN, contentY + 56, contentW, 24, "No active batch", FONT_SIZE_MD, uiColorTextPrimary);
+    uiTextCenter(MARGIN, contentY + 90, contentW, 24, "More > New Brew", FONT_SIZE_SM, uiColorTextMuted);
+    uiDrawBottomNav(TAB_DASHBOARD);
+    return;
+  }
+
+  payload_t latest = {0};
+  bool hasData = displayDataCount > 0;
+  if (hasData) {
+    latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+  }
+
+  uiCard(MARGIN, contentY, contentW, 48, CARD_RADIUS);
+  char text[64];
+  uiEllipsize(activeBrewProfile.batchName, contentW - 24, text, sizeof(text));
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(MARGIN + 12, contentY + 20);
+  tft.print(text);
+
+  char phaseText[64];
+  snprintf(phaseText, sizeof(phaseText), "%s | %s", activeBrewProfile.beerStyle, fermentationStateMachine.phaseName());
+  uiEllipsize(phaseText, contentW - 24, text, sizeof(text));
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(MARGIN + 12, contentY + 40);
+  tft.print(text);
+
+  int tileY = contentY + 56;
+  int tileW = (contentW - GAP * 2) / 3;
+  int tileH = 54;
+  char value[24];
+
+  uiCard(MARGIN, tileY, tileW, tileH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(MARGIN + 10, tileY + 18);
+  tft.print("Atten");
+  snprintf(value, sizeof(value), "%.0f", fermentationMetrics.currentAttenuation);
+  tft.setTextColor(hasData ? uiColorTextPrimary : uiColorTextMuted);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(MARGIN + 10, tileY + 44);
+  tft.printf("%s%%", hasData ? value : "--");
+
+  int abvX = MARGIN + tileW + GAP;
+  uiCard(abvX, tileY, tileW, tileH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(abvX + 10, tileY + 18);
+  tft.print("ABV");
+  snprintf(value, sizeof(value), "%.1f", fermentationMetrics.estimatedABV);
+  tft.setTextColor(hasData ? uiColorTextPrimary : uiColorTextMuted);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(abvX + 10, tileY + 44);
+  tft.printf("%s%%", hasData ? value : "--");
+
+  int fgX = MARGIN + (tileW + GAP) * 2;
+  uiCard(fgX, tileY, tileW, tileH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(fgX + 10, tileY + 18);
+  tft.print("Exp FG");
+  snprintf(value, sizeof(value), "%.3f", activeBrewProfile.expectedFinalGravity);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(fgX + 10, tileY + 44);
+  tft.print(value);
+
+  int lowerY = tileY + tileH + 8;
+  int halfW = (contentW - GAP) / 2;
+  int lowerH = 50;
+  uiCard(MARGIN, lowerY, halfW, lowerH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(MARGIN + 10, lowerY + 17);
+  tft.print("ETA");
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  char eta[16];
+  if (currentETA.valid) formatDurationShort(currentETA.secondsToPackaging, eta, sizeof(eta));
+  else strcpy(eta, "--");
+  tft.setCursor(MARGIN + 10, lowerY + 42);
+  tft.print(eta);
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(MARGIN + 92, lowerY + 42);
+  tft.printf("%d%%", currentETA.confidencePercent);
+
+  int yeastX = MARGIN + halfW + GAP;
+  uiCard(yeastX, lowerY, halfW, lowerH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(yeastX + 10, lowerY + 17);
+  tft.print(activeBrewProfile.autoModeEnabled ? "Yeast" : "OG");
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  if (activeBrewProfile.autoModeEnabled) {
+    snprintf(text, sizeof(text), "%s %d-%d%% %.0f-%.0fC",
+             activeBrewProfile.selectedYeastPresetName,
+             activeBrewProfile.yeastAttenuationMin,
+             activeBrewProfile.yeastAttenuationMax,
+             activeBrewProfile.recommendedTempMinC,
+             activeBrewProfile.recommendedTempMaxC);
+  } else if (activeBrewProfile.ogNeedsChoice) {
+    snprintf(text, sizeof(text), "Needs choice");
+  } else if (activeBrewProfile.ogVerified) {
+    snprintf(text, sizeof(text), "OK %.3f", activeBrewProfile.effectiveOG);
+  } else {
+    snprintf(text, sizeof(text), "Measuring");
+  }
+  uiEllipsize(text, halfW - 20, value, sizeof(value));
+  tft.setCursor(yeastX + 10, lowerY + 40);
+  tft.print(value);
+
+  int recY = lowerY + lowerH + 8;
+  uiCard(MARGIN, recY, contentW, 44, CARD_RADIUS);
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(MARGIN + 10, recY + 17);
+  tft.print("Next");
+  drawWrappedText(MARGIN + 62, recY + 17, contentW - 76, currentRecommendation.message, uiColorTextPrimary);
+  uiDrawBottomNav(TAB_DASHBOARD);
+}
+
+static const char* YEAST_SPEED_OPTIONS[] = {"slow", "medium", "medium-fast", "fast", "very_fast"};
+static const char* YEAST_FLOC_OPTIONS[] = {"low", "medium", "high"};
+static const char* YEAST_CURVE_OPTIONS[] = {"clean_ale", "fast_ale", "very_fast_ale", "slow_clean_ale", "lager", "high_attenuation_saison"};
+
+void copyPresetToDraft(const YeastPreset* preset) {
+  memset(&yeastDraft, 0, sizeof(yeastDraft));
+  if (!preset) {
+    strcpy(yeastDraft.id, "");
+    strcpy(yeastDraft.displayName, "New Yeast");
+    strcpy(yeastDraft.category, "Custom");
+    yeastDraft.typicalAttenuationMin = 74;
+    yeastDraft.typicalAttenuationMax = 80;
+    yeastDraft.defaultAttenuation = 77;
+    strcpy(yeastDraft.fermentationSpeed, "medium");
+    yeastDraft.lagPhaseHours = 9.0f;
+    yeastDraft.typicalDurationHours = 132.0f;
+    yeastDraft.recommendedTempMinC = 18.0f;
+    yeastDraft.recommendedTempMaxC = 22.0f;
+    strcpy(yeastDraft.flocculation, "medium");
+    strcpy(yeastDraft.curveTemplate, "clean_ale");
+    yeastDraft.diacetylRestRecommended = false;
+    strcpy(yeastDraft.notes, "Custom yeast");
+    return;
+  }
+  strncpy(yeastDraft.id, preset->id, sizeof(yeastDraft.id) - 1);
+  strncpy(yeastDraft.displayName, preset->displayName, sizeof(yeastDraft.displayName) - 1);
+  strncpy(yeastDraft.category, preset->category, sizeof(yeastDraft.category) - 1);
+  yeastDraft.typicalAttenuationMin = preset->typicalAttenuationMin;
+  yeastDraft.typicalAttenuationMax = preset->typicalAttenuationMax;
+  yeastDraft.defaultAttenuation = preset->defaultAttenuation;
+  strncpy(yeastDraft.fermentationSpeed, preset->fermentationSpeed, sizeof(yeastDraft.fermentationSpeed) - 1);
+  yeastDraft.lagPhaseHours = preset->lagPhaseHours;
+  yeastDraft.typicalDurationHours = preset->typicalDurationHours;
+  yeastDraft.recommendedTempMinC = preset->recommendedTempMinC;
+  yeastDraft.recommendedTempMaxC = preset->recommendedTempMaxC;
+  strncpy(yeastDraft.flocculation, preset->flocculation, sizeof(yeastDraft.flocculation) - 1);
+  strncpy(yeastDraft.curveTemplate, preset->curveTemplate, sizeof(yeastDraft.curveTemplate) - 1);
+  yeastDraft.diacetylRestRecommended = preset->diacetylRestRecommended;
+  strncpy(yeastDraft.notes, preset->notes, sizeof(yeastDraft.notes) - 1);
+}
+
+int optionIndex(const char* value, const char* const* options, int count) {
+  for (int i = 0; i < count; i++) {
+    if (strcmp(value, options[i]) == 0) return i;
+  }
+  return 0;
+}
+
+void selectOptionOffset(char* target, size_t targetSize, const char* const* options, int count, int offset) {
+  int idx = optionIndex(target, options, count) + offset;
+  if (idx < 0) idx = count - 1;
+  if (idx >= count) idx = 0;
+  strncpy(target, options[idx], targetSize - 1);
+  target[targetSize - 1] = '\0';
+}
+
+void beginNewYeastWizard(const char* presetId) {
+  if (mountSDTemporarily()) {
+    YeastPresetRepository::reloadCustom();
+    const YeastPreset* preset = presetId ? YeastPresetRepository::findById(presetId) : NULL;
+    editingExistingYeast = presetId && YeastPresetRepository::isCustom(presetId);
+    copyPresetToDraft(editingExistingYeast ? preset : NULL);
+    dismountSD();
+  } else {
+    editingExistingYeast = false;
+    copyPresetToDraft(NULL);
+  }
+  newYeastStep = NY_NAME;
+  loadYeastStepBuffer();
+  currentMode = NEW_YEAST_VIEW;
+  screenDirty = true;
+}
+
+void loadYeastStepBuffer() {
+  yeastEditPristine = false;
+  switch (newYeastStep) {
+    case NY_NAME:
+      strncpy(yeastEditBuffer, yeastDraft.displayName, sizeof(yeastEditBuffer) - 1);
+      yeastEditPristine = true;
+      break;
+    case NY_CATEGORY:
+      strncpy(yeastEditBuffer, yeastDraft.category, sizeof(yeastEditBuffer) - 1);
+      yeastEditPristine = true;
+      break;
+    case NY_ATT_MIN:
+      snprintf(yeastEditBuffer, sizeof(yeastEditBuffer), "%d", yeastDraft.typicalAttenuationMin);
+      yeastEditPristine = true;
+      break;
+    case NY_ATT_MAX:
+      snprintf(yeastEditBuffer, sizeof(yeastEditBuffer), "%d", yeastDraft.typicalAttenuationMax);
+      yeastEditPristine = true;
+      break;
+    case NY_ATT_DEFAULT:
+      snprintf(yeastEditBuffer, sizeof(yeastEditBuffer), "%d", yeastDraft.defaultAttenuation);
+      yeastEditPristine = true;
+      break;
+    case NY_LAG:
+      snprintf(yeastEditBuffer, sizeof(yeastEditBuffer), "%.1f", yeastDraft.lagPhaseHours);
+      yeastEditPristine = true;
+      break;
+    case NY_DURATION:
+      snprintf(yeastEditBuffer, sizeof(yeastEditBuffer), "%.1f", yeastDraft.typicalDurationHours);
+      yeastEditPristine = true;
+      break;
+    case NY_TEMP_MIN:
+      snprintf(yeastEditBuffer, sizeof(yeastEditBuffer), "%.1f", yeastDraft.recommendedTempMinC);
+      yeastEditPristine = true;
+      break;
+    case NY_TEMP_MAX:
+      snprintf(yeastEditBuffer, sizeof(yeastEditBuffer), "%.1f", yeastDraft.recommendedTempMaxC);
+      yeastEditPristine = true;
+      break;
+    case NY_NOTES:
+      strncpy(yeastEditBuffer, yeastDraft.notes, sizeof(yeastEditBuffer) - 1);
+      yeastEditPristine = true;
+      break;
+    default:
+      yeastEditBuffer[0] = '\0';
+      break;
+  }
+  yeastEditBuffer[sizeof(yeastEditBuffer) - 1] = '\0';
+}
+
+void commitYeastStepBuffer() {
+  switch (newYeastStep) {
+    case NY_NAME:
+      if (yeastEditBuffer[0]) strncpy(yeastDraft.displayName, yeastEditBuffer, sizeof(yeastDraft.displayName) - 1);
+      break;
+    case NY_CATEGORY:
+      if (yeastEditBuffer[0]) strncpy(yeastDraft.category, yeastEditBuffer, sizeof(yeastDraft.category) - 1);
+      break;
+    case NY_ATT_MIN:
+      yeastDraft.typicalAttenuationMin = atoi(yeastEditBuffer);
+      break;
+    case NY_ATT_MAX:
+      yeastDraft.typicalAttenuationMax = atoi(yeastEditBuffer);
+      break;
+    case NY_ATT_DEFAULT:
+      yeastDraft.defaultAttenuation = atoi(yeastEditBuffer);
+      break;
+    case NY_LAG:
+      yeastDraft.lagPhaseHours = atof(yeastEditBuffer);
+      break;
+    case NY_DURATION:
+      yeastDraft.typicalDurationHours = atof(yeastEditBuffer);
+      break;
+    case NY_TEMP_MIN:
+      yeastDraft.recommendedTempMinC = atof(yeastEditBuffer);
+      break;
+    case NY_TEMP_MAX:
+      yeastDraft.recommendedTempMaxC = atof(yeastEditBuffer);
+      break;
+    case NY_NOTES:
+      if (yeastEditBuffer[0]) strncpy(yeastDraft.notes, yeastEditBuffer, sizeof(yeastDraft.notes) - 1);
+      break;
+    default:
+      break;
+  }
+  yeastDraft.displayName[sizeof(yeastDraft.displayName) - 1] = '\0';
+  yeastDraft.category[sizeof(yeastDraft.category) - 1] = '\0';
+  yeastDraft.notes[sizeof(yeastDraft.notes) - 1] = '\0';
+  if (yeastDraft.typicalAttenuationMin < 40) yeastDraft.typicalAttenuationMin = 40;
+  if (yeastDraft.typicalAttenuationMax < yeastDraft.typicalAttenuationMin) yeastDraft.typicalAttenuationMax = yeastDraft.typicalAttenuationMin;
+  if (yeastDraft.defaultAttenuation < yeastDraft.typicalAttenuationMin) yeastDraft.defaultAttenuation = yeastDraft.typicalAttenuationMin;
+  if (yeastDraft.defaultAttenuation > yeastDraft.typicalAttenuationMax) yeastDraft.defaultAttenuation = yeastDraft.typicalAttenuationMax;
+}
+
+void drawNewYeastNav(const char* nextLabel) {
+  drawButton(MARGIN, 276, 120, 36, "BACK", false);
+  drawButton(UI_W - MARGIN - 140, 276, 140, 36, nextLabel, true);
+}
+
+void drawYeastDropdown(const char* label, const char* value) {
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(MARGIN, 102);
+  tft.print(label);
+  drawButton(MARGIN, 126, 58, 54, "<", false);
+  uiCard(MARGIN + 68, 126, UI_W - MARGIN * 2 - 136, 54, CARD_RADIUS);
+  uiTextCenter(MARGIN + 68, 126, UI_W - MARGIN * 2 - 136, 54, value, FONT_SIZE_SM_BOLD, uiColorTextPrimary);
+  drawButton(UI_W - MARGIN - 58, 126, 58, 54, ">", false);
+}
+
+void drawNewYeastScreen() {
+  tft.fillScreen(uiColorBackground);
+  drawViewTopbar(editingExistingYeast ? "Edit Yeast" : "New Yeast");
+  char stepText[20];
+  snprintf(stepText, sizeof(stepText), "%d/15", (int)newYeastStep + 1);
+  uiTextRight(UI_W - 80, TOPBAR_H + 8, 66, 18, stepText, FONT_SIZE_XS, uiColorTextMuted);
+  const char* title = "";
+  switch (newYeastStep) {
+    case NY_NAME: title = "Display Name"; break;
+    case NY_CATEGORY: title = "Category"; break;
+    case NY_ATT_MIN: title = "Attenuation Min"; break;
+    case NY_ATT_MAX: title = "Attenuation Max"; break;
+    case NY_ATT_DEFAULT: title = "Default Attenuation"; break;
+    case NY_SPEED: title = "Fermentation Speed"; break;
+    case NY_LAG: title = "Lag Phase Hours"; break;
+    case NY_DURATION: title = "Duration Hours"; break;
+    case NY_TEMP_MIN: title = "Temp Min C"; break;
+    case NY_TEMP_MAX: title = "Temp Max C"; break;
+    case NY_FLOC: title = "Flocculation"; break;
+    case NY_CURVE: title = "Curve Template"; break;
+    case NY_DREST: title = "Diacetyl Rest"; break;
+    case NY_NOTES: title = "Notes"; break;
+    case NY_REVIEW: title = "Review Yeast"; break;
+  }
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(MARGIN, TOPBAR_H + 28);
+  tft.print(title);
+
+  if (newYeastStep == NY_NAME || newYeastStep == NY_CATEGORY || newYeastStep == NY_NOTES) {
+    VirtualKeyboardInput::drawText(tft, yeastEditBuffer);
+  } else if (newYeastStep == NY_ATT_MIN || newYeastStep == NY_ATT_MAX || newYeastStep == NY_ATT_DEFAULT ||
+             newYeastStep == NY_LAG || newYeastStep == NY_DURATION || newYeastStep == NY_TEMP_MIN || newYeastStep == NY_TEMP_MAX) {
+    VirtualKeyboardInput::drawNumber(tft, yeastEditBuffer);
+  } else if (newYeastStep == NY_SPEED) {
+    drawYeastDropdown("Speed", yeastDraft.fermentationSpeed);
+  } else if (newYeastStep == NY_FLOC) {
+    drawYeastDropdown("Flocculation", yeastDraft.flocculation);
+  } else if (newYeastStep == NY_CURVE) {
+    drawYeastDropdown("Curve", yeastDraft.curveTemplate);
+  } else if (newYeastStep == NY_DREST) {
+    tft.setTextColor(uiColorTextSecondary);
+    tft.setFreeFont(FONT_SIZE_SM);
+    tft.setCursor(MARGIN, 130);
+    tft.print("Usually benefits from rest");
+    drawThemeToggle(UI_W - MARGIN - 70, 110, yeastDraft.diacetylRestRecommended);
+  } else if (newYeastStep == NY_REVIEW) {
+    uiCard(MARGIN, 82, UI_W - MARGIN * 2, 172, CARD_RADIUS);
+    tft.setTextColor(uiColorTextPrimary);
+    tft.setFreeFont(FONT_SIZE_SM_BOLD);
+    tft.setCursor(MARGIN + 12, 108);
+    tft.print(yeastDraft.displayName);
+    tft.setTextColor(uiColorTextSecondary);
+    tft.setFreeFont(FONT_SIZE_XS);
+    tft.setCursor(MARGIN + 12, 134);
+    tft.printf("%s  %d-%d%% default %d%%", yeastDraft.category, yeastDraft.typicalAttenuationMin, yeastDraft.typicalAttenuationMax, yeastDraft.defaultAttenuation);
+    tft.setCursor(MARGIN + 12, 158);
+    tft.printf("%s  lag %.1fh  duration %.0fh", yeastDraft.fermentationSpeed, yeastDraft.lagPhaseHours, yeastDraft.typicalDurationHours);
+    tft.setCursor(MARGIN + 12, 182);
+    tft.printf("Temp %.0f-%.0fC  floc %s", yeastDraft.recommendedTempMinC, yeastDraft.recommendedTempMaxC, yeastDraft.flocculation);
+    tft.setCursor(MARGIN + 12, 206);
+    tft.printf("%s  D-rest %s", yeastDraft.curveTemplate, yeastDraft.diacetylRestRecommended ? "yes" : "no");
+    char note[48];
+    uiEllipsize(yeastDraft.notes, UI_W - MARGIN * 2 - 24, note, sizeof(note));
+    tft.setCursor(MARGIN + 12, 230);
+    tft.print(note);
+  }
+  drawNewYeastNav(newYeastStep == NY_REVIEW ? "SAVE" : "NEXT");
+}
+
+void saveNewYeastWizard() {
+  YeastPreset preset = {
+    yeastDraft.id, yeastDraft.displayName, yeastDraft.category,
+    yeastDraft.typicalAttenuationMin, yeastDraft.typicalAttenuationMax, yeastDraft.defaultAttenuation,
+    yeastDraft.fermentationSpeed, yeastDraft.lagPhaseHours, yeastDraft.typicalDurationHours,
+    yeastDraft.recommendedTempMinC, yeastDraft.recommendedTempMaxC,
+    yeastDraft.flocculation, yeastDraft.curveTemplate, yeastDraft.diacetylRestRecommended, yeastDraft.notes
+  };
+  if (mountSDTemporarily()) {
+    YeastPresetRepository::saveCustom(preset);
+    YeastPresetRepository::reloadCustom();
+    dismountSD();
+  }
+  loadManagedYeasts();
+  currentMode = MANAGE_YEAST_VIEW;
+  screenDirty = true;
+}
+
+bool handleNewYeastTouch(int x, int y) {
+  if (x >= MARGIN - 6 && x <= MARGIN + 130 && y >= 268 && y <= 318) {
+    if (newYeastStep == NY_NAME) {
+      currentMode = MORE_VIEW;
+    } else {
+      commitYeastStepBuffer();
+      newYeastStep = (NewYeastStep)((int)newYeastStep - 1);
+      loadYeastStepBuffer();
+    }
+    screenDirty = true;
+    return true;
+  }
+  if (x >= UI_W - MARGIN - 146 && x <= UI_W - MARGIN && y >= 268 && y <= 318) {
+    commitYeastStepBuffer();
+    if (newYeastStep == NY_REVIEW) {
+      saveNewYeastWizard();
+    } else {
+      newYeastStep = (NewYeastStep)((int)newYeastStep + 1);
+      loadYeastStepBuffer();
+      screenDirty = true;
+    }
+    return true;
+  }
+  if (newYeastStep == NY_NAME || newYeastStep == NY_CATEGORY || newYeastStep == NY_NOTES) {
+    if (VirtualKeyboardInput::handleTextTouch(x, y, yeastEditBuffer, sizeof(yeastEditBuffer), &yeastEditPristine)) {
+      screenDirty = true;
+      return true;
+    }
+  } else if (newYeastStep == NY_ATT_MIN || newYeastStep == NY_ATT_MAX || newYeastStep == NY_ATT_DEFAULT ||
+             newYeastStep == NY_LAG || newYeastStep == NY_DURATION || newYeastStep == NY_TEMP_MIN || newYeastStep == NY_TEMP_MAX) {
+    if (VirtualKeyboardInput::handleNumberTouch(x, y, yeastEditBuffer, sizeof(yeastEditBuffer), &yeastEditPristine)) {
+      screenDirty = true;
+      return true;
+    }
+  } else if (newYeastStep == NY_SPEED || newYeastStep == NY_FLOC || newYeastStep == NY_CURVE) {
+    int offset = 0;
+    if (x >= MARGIN && x <= MARGIN + 58 && y >= 126 && y <= 180) offset = -1;
+    if (x >= UI_W - MARGIN - 58 && x <= UI_W - MARGIN && y >= 126 && y <= 180) offset = 1;
+    if (offset != 0) {
+      if (newYeastStep == NY_SPEED) selectOptionOffset(yeastDraft.fermentationSpeed, sizeof(yeastDraft.fermentationSpeed), YEAST_SPEED_OPTIONS, 5, offset);
+      else if (newYeastStep == NY_FLOC) selectOptionOffset(yeastDraft.flocculation, sizeof(yeastDraft.flocculation), YEAST_FLOC_OPTIONS, 3, offset);
+      else selectOptionOffset(yeastDraft.curveTemplate, sizeof(yeastDraft.curveTemplate), YEAST_CURVE_OPTIONS, 6, offset);
+      screenDirty = true;
+      return true;
+    }
+  } else if (newYeastStep == NY_DREST) {
+    if (x >= UI_W - MARGIN - 86 && x <= UI_W - MARGIN && y >= 100 && y <= 150) {
+      yeastDraft.diacetylRestRecommended = !yeastDraft.diacetylRestRecommended;
+      screenDirty = true;
+      return true;
+    }
+  }
+  return false;
+}
+
+void loadManagedYeasts() {
+  managedYeastCount = 0;
+  if (mountSDTemporarily()) {
+    YeastPresetRepository::reloadCustom();
+    for (int i = 0; i < YeastPresetRepository::count() && managedYeastCount < 12; i++) {
+      const YeastPreset* preset = YeastPresetRepository::at(i);
+      if (YeastPresetRepository::isCustom(preset->id)) {
+        strncpy(managedYeastIds[managedYeastCount], preset->id, 23);
+        managedYeastIds[managedYeastCount][23] = '\0';
+        strncpy(managedYeastNames[managedYeastCount], preset->displayName, 31);
+        managedYeastNames[managedYeastCount][31] = '\0';
+        managedYeastCount++;
+      }
+    }
+    dismountSD();
+  }
+  if (manageYeastIndex >= managedYeastCount) manageYeastIndex = max(0, managedYeastCount - 1);
+}
+
+void drawManageYeastScreen() {
+  tft.fillScreen(uiColorBackground);
+  drawViewTopbar("Manage Yeast");
+  int y = TOPBAR_H + MARGIN;
+  if (managedYeastCount == 0) {
+    uiCard(MARGIN, y + 44, UI_W - MARGIN * 2, 110, CARD_RADIUS);
+    uiTextCenter(MARGIN, y + 68, UI_W - MARGIN * 2, 24, "No custom yeast", FONT_SIZE_MD, uiColorTextPrimary);
+    uiTextCenter(MARGIN, y + 102, UI_W - MARGIN * 2, 20, "Use New Yeast first", FONT_SIZE_SM, uiColorTextMuted);
+    drawButton(MARGIN, 276, 120, 36, "BACK", false);
+    return;
+  }
+  const YeastPreset* preset = NULL;
+  if (mountSDTemporarily()) {
+    YeastPresetRepository::reloadCustom();
+    preset = YeastPresetRepository::findById(managedYeastIds[manageYeastIndex]);
+    dismountSD();
+  }
+  if (!preset) return;
+  uiCard(MARGIN, y, UI_W - MARGIN * 2, 156, CARD_RADIUS);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(MARGIN + 12, y + 28);
+  tft.print(preset->displayName);
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(MARGIN + 12, y + 54);
+  tft.printf("%s  %d-%d%% default %d%%", preset->category, preset->typicalAttenuationMin, preset->typicalAttenuationMax, preset->defaultAttenuation);
+  tft.setCursor(MARGIN + 12, y + 78);
+  tft.printf("%s  %.0f-%.0fC  %.0fh", preset->fermentationSpeed, preset->recommendedTempMinC, preset->recommendedTempMaxC, preset->typicalDurationHours);
+  tft.setCursor(MARGIN + 12, y + 102);
+  tft.printf("%s  %s  D-rest %s", preset->curveTemplate, preset->flocculation, preset->diacetylRestRecommended ? "yes" : "no");
+  char countText[20];
+  snprintf(countText, sizeof(countText), "%d/%d", manageYeastIndex + 1, managedYeastCount);
+  uiTextRight(MARGIN, y + 122, UI_W - MARGIN * 2 - 12, 20, countText, FONT_SIZE_XS, uiColorTextMuted);
+  drawButton(MARGIN, 214, 72, 36, "<", false);
+  drawButton(MARGIN + 84, 214, 110, 36, "EDIT", false);
+  drawButton(MARGIN + 206, 214, 110, 36, "DELETE", false);
+  drawButton(UI_W - MARGIN - 72, 214, 72, 36, ">", false);
+  drawButton(MARGIN, 276, 120, 36, "BACK", false);
+}
+
+bool handleManageYeastTouch(int x, int y) {
+  if (x >= MARGIN && x <= MARGIN + 120 && y >= 276 && y <= 312) {
+    currentMode = MORE_VIEW;
+    screenDirty = true;
+    return true;
+  }
+  if (managedYeastCount <= 0) return false;
+  if (x >= MARGIN && x <= MARGIN + 72 && y >= 214 && y <= 250) {
+    manageYeastIndex = manageYeastIndex <= 0 ? managedYeastCount - 1 : manageYeastIndex - 1;
+    screenDirty = true;
+    return true;
+  }
+  if (x >= UI_W - MARGIN - 72 && x <= UI_W - MARGIN && y >= 214 && y <= 250) {
+    manageYeastIndex = (manageYeastIndex + 1) % managedYeastCount;
+    screenDirty = true;
+    return true;
+  }
+  if (x >= MARGIN + 84 && x <= MARGIN + 194 && y >= 214 && y <= 250) {
+    beginNewYeastWizard(managedYeastIds[manageYeastIndex]);
+    return true;
+  }
+  if (x >= MARGIN + 206 && x <= MARGIN + 316 && y >= 214 && y <= 250) {
+    if (mountSDTemporarily()) {
+      YeastPresetRepository::deleteCustom(managedYeastIds[manageYeastIndex]);
+      dismountSD();
+    }
+    loadManagedYeasts();
+    screenDirty = true;
+    return true;
+  }
+  return false;
+}
+
+int batchNumberFromId(const char* id) {
+  int n = 0;
+  if (sscanf(id, "batch_%d", &n) == 1) return n;
+  return 0;
+}
+
+void loadManagedBatches() {
+  managedBatchCount = 0;
+  if (!mountSDTemporarily()) return;
+  if (!SD.exists("/data/batches")) {
+    dismountSD();
+    return;
+  }
+  File dir = SD.open("/data/batches");
+  if (!dir) {
+    dismountSD();
+    return;
+  }
+  File entry = dir.openNextFile();
+  while (entry && managedBatchCount < 16) {
+    if (entry.isDirectory()) {
+      const char* name = entry.name();
+      const char* slash = strrchr(name, '/');
+      const char* id = slash ? slash + 1 : name;
+      BrewProfile p;
+      if (BrewProfileStore::load(id, &p)) {
+        strncpy(managedBatchIds[managedBatchCount], p.batchId, 23);
+        managedBatchIds[managedBatchCount][23] = '\0';
+        strncpy(managedBatchNames[managedBatchCount], p.batchName, 39);
+        managedBatchNames[managedBatchCount][39] = '\0';
+        managedBatchCount++;
+      }
+    }
+    entry.close();
+    entry = dir.openNextFile();
+  }
+  dir.close();
+  dismountSD();
+  if (manageBatchIndex >= managedBatchCount) manageBatchIndex = max(0, managedBatchCount - 1);
+}
+
+int nextBatchNumberOnSD() {
+  int highest = 0;
+  if (!SD.exists("/data/batches")) return 1;
+  File dir = SD.open("/data/batches");
+  if (!dir) return 1;
+  File entry = dir.openNextFile();
+  while (entry) {
+    if (entry.isDirectory()) {
+      const char* name = entry.name();
+      const char* slash = strrchr(name, '/');
+      const char* id = slash ? slash + 1 : name;
+      int n = batchNumberFromId(id);
+      if (n > highest) highest = n;
+    }
+    entry.close();
+    entry = dir.openNextFile();
+  }
+  dir.close();
+  return highest + 1;
+}
+
+void continueManagedBatch(const char* batchId) {
+  if (!mountSDTemporarily()) return;
+  if (BrewProfileStore::load(batchId, &activeBrewProfile)) {
+    bool logReady = ensureFermentationLogFile(activeBrewProfile.batchId);
+    BrewProfileStore::logPath(activeBrewProfile.batchId, currentFermentationFile, sizeof(currentFermentationFile));
+    fermentationFileOpen = logReady;
+    brewProfileLoaded = true;
+    targetCurveAvailable = SD.exists("/data") && TargetCurveGenerator::generateAndSave(activeBrewProfile);
+    if (logReady) loadHistoricalDataFromCSV(currentFermentationFile, currentLoadMode, MAX_DATA_POINTS, 1);
+    refreshFermentationAssistantFromProfile();
+  }
+  dismountSD();
+  currentMode = DASHBOARD_VIEW;
+  screenDirty = true;
+}
+
+void copyManagedBatch(const char* batchId) {
+  if (!mountSDTemporarily()) return;
+  BrewProfile p;
+  if (BrewProfileStore::load(batchId, &p)) {
+    BrewProfileStore::buildBatchId(nextBatchNumberOnSD(), p.batchId, sizeof(p.batchId));
+    char copiedName[40];
+    snprintf(copiedName, sizeof(copiedName), "%s Copy", p.batchName);
+    strncpy(p.batchName, copiedName, sizeof(p.batchName) - 1);
+    p.batchName[sizeof(p.batchName) - 1] = '\0';
+    p.createdAt = getCurrentEpoch();
+    p.measuredOG = 0.0f;
+    p.ogDifference = 0.0f;
+    p.ogVerified = false;
+    p.ogNeedsChoice = false;
+    BrewProfileStore::save(p);
+    TargetCurveGenerator::generateAndSave(p);
+    activeBrewProfile = p;
+    bool logReady = ensureFermentationLogFile(activeBrewProfile.batchId);
+    BrewProfileStore::logPath(activeBrewProfile.batchId, currentFermentationFile, sizeof(currentFermentationFile));
+    fermentationFileOpen = logReady;
+    brewProfileLoaded = true;
+    clearHistoricalDisplayData();
+    refreshFermentationAssistantFromProfile();
+  }
+  dismountSD();
+  loadManagedBatches();
+  currentMode = DASHBOARD_VIEW;
+  screenDirty = true;
+}
+
+void deleteManagedBatch(const char* batchId) {
+  if (!mountSDTemporarily()) return;
+  char path[80];
+  BrewProfileStore::profilePath(batchId, path, sizeof(path));
+  if (SD.exists(path)) SD.remove(path);
+  BrewProfileStore::targetPath(batchId, path, sizeof(path));
+  if (SD.exists(path)) SD.remove(path);
+  BrewProfileStore::logPath(batchId, path, sizeof(path));
+  if (SD.exists(path)) SD.remove(path);
+  if (strcmp(activeBrewProfile.batchId, batchId) == 0) {
+    brewProfileLoaded = false;
+    fermentationFileOpen = false;
+    currentFermentationFile[0] = '\0';
+  }
+  dismountSD();
+  loadManagedBatches();
+  screenDirty = true;
+}
+
+void drawManageBrewScreen() {
+  tft.fillScreen(uiColorBackground);
+  drawViewTopbar("Manage Brew");
+  int y = TOPBAR_H + MARGIN;
+  if (managedBatchCount == 0) {
+    uiCard(MARGIN, y + 44, UI_W - MARGIN * 2, 110, CARD_RADIUS);
+    uiTextCenter(MARGIN, y + 68, UI_W - MARGIN * 2, 24, "No batches stored", FONT_SIZE_MD, uiColorTextPrimary);
+    uiTextCenter(MARGIN, y + 102, UI_W - MARGIN * 2, 20, "Run New Brew first", FONT_SIZE_SM, uiColorTextMuted);
+    drawButton(MARGIN, 276, 120, 36, "BACK", false);
+    return;
+  }
+  uiCard(MARGIN, y, UI_W - MARGIN * 2, 126, CARD_RADIUS);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM_BOLD);
+  char label[44];
+  uiEllipsize(managedBatchNames[manageBatchIndex], UI_W - MARGIN * 2 - 24, label, sizeof(label));
+  tft.setCursor(MARGIN + 12, y + 30);
+  tft.print(label);
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(MARGIN + 12, y + 58);
+  tft.print(managedBatchIds[manageBatchIndex]);
+  snprintf(label, sizeof(label), "%d/%d", manageBatchIndex + 1, managedBatchCount);
+  uiTextRight(MARGIN, y + 86, UI_W - MARGIN * 2 - 12, 20, label, FONT_SIZE_XS, uiColorTextMuted);
+
+  drawButton(MARGIN, 190, 72, 36, "<", false);
+  drawButton(UI_W - MARGIN - 72, 190, 72, 36, ">", false);
+  drawButton(MARGIN + 84, 190, 104, 36, "CONT", false);
+  drawButton(MARGIN + 200, 190, 104, 36, "COPY", false);
+  drawButton(MARGIN + 316, 190, 104, 36, "DELETE", false);
+  drawButton(MARGIN, 276, 120, 36, "BACK", false);
+}
+
+bool handleManageBrewTouch(int x, int y) {
+  if (x >= MARGIN && x <= MARGIN + 120 && y >= 276 && y <= 312) {
+    currentMode = MORE_VIEW;
+    screenDirty = true;
+    return true;
+  }
+  if (managedBatchCount <= 0) return false;
+  if (x >= MARGIN && x <= MARGIN + 72 && y >= 190 && y <= 226) {
+    manageBatchIndex = manageBatchIndex <= 0 ? managedBatchCount - 1 : manageBatchIndex - 1;
+    screenDirty = true;
+    return true;
+  }
+  if (x >= UI_W - MARGIN - 72 && x <= UI_W - MARGIN && y >= 190 && y <= 226) {
+    manageBatchIndex = (manageBatchIndex + 1) % managedBatchCount;
+    screenDirty = true;
+    return true;
+  }
+  if (x >= MARGIN + 84 && x <= MARGIN + 188 && y >= 190 && y <= 226) {
+    continueManagedBatch(managedBatchIds[manageBatchIndex]);
+    return true;
+  }
+  if (x >= MARGIN + 200 && x <= MARGIN + 304 && y >= 190 && y <= 226) {
+    copyManagedBatch(managedBatchIds[manageBatchIndex]);
+    return true;
+  }
+  if (x >= MARGIN + 316 && x <= MARGIN + 420 && y >= 190 && y <= 226) {
+    deleteManagedBatch(managedBatchIds[manageBatchIndex]);
+    return true;
+  }
+  return false;
+}
+
+void drawBrewWizardScreen() {
+  brewWizard.draw(tft);
+}
+
+void drawOGVerificationScreen() {
+  tft.fillScreen(uiColorBackground);
+  drawViewTopbar("OG Verify");
+  int y = TOPBAR_H + MARGIN;
+  uiCard(MARGIN, y, UI_W - MARGIN * 2, 170, CARD_RADIUS);
+  tft.setTextColor(uiColorWarning);
+  tft.setFreeFont(FONT_SIZE_MD);
+  tft.setCursor(MARGIN + 12, y + 30);
+  tft.print("OG difference");
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(MARGIN + 12, y + 68);
+  tft.printf("Recipe OG:  %.3f", activeBrewProfile.recipeOG);
+  tft.setCursor(MARGIN + 12, y + 98);
+  tft.printf("Measured OG: %.3f", activeBrewProfile.measuredOG);
+  tft.setCursor(MARGIN + 12, y + 128);
+  tft.printf("Delta:      %+.3f", activeBrewProfile.ogDifference);
+
+  drawButton(MARGIN, 242, 200, 44, "USE RECIPE", false);
+  drawButton(UI_W - MARGIN - 200, 242, 200, 44, "USE MEASURED", false);
+}
+
+void drawTargetVsActualChart() {
+  tft.fillScreen(uiColorBackground);
+  drawViewTopbar("Target");
+
+  int x = MARGIN;
+  int y = TOPBAR_H + MARGIN;
+  int w = UI_W - MARGIN * 2;
+  int h = UI_H - TOPBAR_H - NAV_H - MARGIN * 2;
+  uiCard(x, y, w, h, CARD_RADIUS);
+
+  if (!brewProfileLoaded || displayDataCount < 2) {
+    uiTextCenter(x, y + 70, w, 24, "No chart data yet", FONT_SIZE_SM, uiColorTextMuted);
+    uiDrawBottomNav(TAB_LIVE);
+    return;
+  }
+
+  int gx = x + 38;
+  int gy = y + 28;
+  int gw = w - 54;
+  int gh = h - 54;
+  tft.drawRect(gx, gy, gw, gh, uiColorBorder);
+
+  float chartHours = activeBrewProfile.autoModeEnabled && activeBrewProfile.typicalDurationHours > 0.0f
+    ? activeBrewProfile.typicalDurationHours + 48.0f
+    : 240.0f;
+  if (chartHours < 96.0f) chartHours = 96.0f;
+  if (chartHours > 384.0f) chartHours = 384.0f;
+
+  float minSG = 2.0f;
+  float maxSG = 0.0f;
+  for (int i = 0; i <= 40; i++) {
+    float hour = chartHours * (float)i / 40.0f;
+    float sg = TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, hour);
+    if (sg < minSG) minSG = sg;
+    if (sg > maxSG) maxSG = sg;
+  }
+  for (int i = 0; i < displayDataCount; i++) {
+    int idx = (displayDataIndex - displayDataCount + i + MAX_DATA_POINTS) % MAX_DATA_POINTS;
+    float sg = displayDataBuffer[idx].density;
+    if (sg > 0.900f && sg < 1.300f) {
+      if (sg < minSG) minSG = sg;
+      if (sg > maxSG) maxSG = sg;
+    }
+  }
+  minSG -= 0.010f;
+  maxSG += 0.010f;
+  if (minSG < 0.990f) minSG = 0.990f;
+  if (maxSG <= minSG) maxSG = minSG + 0.050f;
+
+  char label[16];
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  snprintf(label, sizeof(label), "%.3f", maxSG);
+  tft.setCursor(x + 6, gy + 8);
+  tft.print(label);
+  snprintf(label, sizeof(label), "%.3f", minSG);
+  tft.setCursor(x + 6, gy + gh);
+  tft.print(label);
+
+  int prevX = -1;
+  int prevY = -1;
+  for (int i = 0; i <= 40; i++) {
+    float hour = chartHours * (float)i / 40.0f;
+    float sg = TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, hour);
+    int px = gx + (i * gw / 40);
+    int py = gy + gh - (int)((sg - minSG) * gh / (maxSG - minSG));
+    if (prevX >= 0) tft.drawLine(prevX, prevY, px, py, uiColorGold);
+    prevX = px;
+    prevY = py;
+  }
+
+  prevX = -1;
+  prevY = -1;
+  uint32_t firstEpoch = timestampForPoint(0);
+  payload_t firstData = displayDataBuffer[(displayDataIndex - displayDataCount + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+  bool useBatchEpoch = isEpochValid(activeBrewProfile.createdAt);
+  bool usePointEpochs = isEpochValid(firstEpoch);
+  for (int i = 0; i < displayDataCount; i++) {
+    int idx = (displayDataIndex - displayDataCount + i + MAX_DATA_POINTS) % MAX_DATA_POINTS;
+    payload_t data = displayDataBuffer[idx];
+    uint32_t pointEpoch = timestampForPoint(i);
+    float hour = 0.0f;
+    if (useBatchEpoch && isEpochValid(pointEpoch) && pointEpoch >= activeBrewProfile.createdAt) {
+      hour = (pointEpoch - activeBrewProfile.createdAt) / 3600.0f;
+    } else if (usePointEpochs && isEpochValid(pointEpoch) && pointEpoch >= firstEpoch) {
+      hour = (pointEpoch - firstEpoch) / 3600.0f;
+    } else if (data.uptime_s >= firstData.uptime_s) {
+      hour = (data.uptime_s - firstData.uptime_s) / 3600.0f;
+    }
+    if (hour > chartHours) hour = chartHours;
+    float sg = data.density;
+    int px = gx + (int)((hour / chartHours) * gw);
+    int py = gy + gh - (int)((sg - minSG) * gh / (maxSG - minSG));
+    if (py < gy) py = gy;
+    if (py > gy + gh) py = gy + gh;
+    if (prevX >= 0) tft.drawLine(prevX, prevY, px, py, uiColorInfo);
+    tft.fillCircle(px, py, 2, uiColorInfo);
+    prevX = px;
+    prevY = py;
+  }
+
+  tft.setTextColor(uiColorGold);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(gx + 6, gy + 14);
+  tft.print("target");
+  tft.setTextColor(uiColorInfo);
+  tft.setCursor(gx + 64, gy + 14);
+  tft.print("actual");
+
+  uiDrawBottomNav(TAB_LIVE);
+}
+
 void drawGrid(int graphX, int graphY, int graphW, int graphH, float minDensity, float maxDensity) {
   // Grid and Y-axis labels removed as requested
+}
+
+void drawGraphLine(int x0, int y0, int x1, int y1, uint16_t color) {
+  tft.drawLine(x0, y0, x1, y1, color);
+  tft.drawLine(x0, y0 + 1, x1, y1 + 1, color);
+}
+
+float angleForTargetSG(float targetSG) {
+  float bestAngle = 0.0f;
+  float bestError = 999.0f;
+  for (float angle = 0.0f; angle <= 90.0f; angle += 0.5f) {
+    float sg = calculateGravity(angle);
+    float error = fabs(sg - targetSG);
+    if (error < bestError) {
+      bestError = error;
+      bestAngle = angle;
+    }
+  }
+  return bestAngle;
 }
 
 void drawGraph() {
@@ -1105,7 +2493,7 @@ void drawGraph() {
   int axisMarginLeft = 10;
   int axisMarginBottom = 10;
   int graphX = MARGIN + 10 + axisMarginLeft;
-  int graphY = TOPBAR_H + 10;
+  int graphY = TOPBAR_H + MARGIN + 10;
   int graphW = UI_W - MARGIN * 2 - 20 - axisMarginLeft;
   int graphH = GRAPH_BUTTON_Y - graphY - GAP - axisMarginBottom;
   
@@ -1138,12 +2526,16 @@ void drawGraph() {
   // Draw grid with axis labels (use SG as primary Y-axis)
   drawGrid(graphX, graphY, graphW, graphH, minDensity, maxDensity);
   
-  // Calculate time range for X-axis labels based on total CSV data points (600s interval)
-  // For LOAD_ALL mode, use totalCSVDataLines from CSV, not loaded points (capped at MAX_DATA_POINTS)
+  // Calculate time range for X-axis labels from RTC timestamps when available.
   int totalPointsForTime = (currentLoadMode == LOAD_ALL) ? totalCSVDataLines : displayDataCount;
   
   if (totalPointsForTime >= 2) {
-    uint32_t timeSpan = (totalPointsForTime - 1) * 600;
+    uint32_t timeSpan = 0;
+    if (timestampsAvailableForGraph()) {
+      timeSpan = timestampForPoint(displayDataCount - 1) - timestampForPoint(0);
+    } else {
+      timeSpan = (totalPointsForTime - 1) * 600;
+    }
     
     // Draw X-axis label
     tft.setTextColor(uiColorTextSecondary);
@@ -1196,12 +2588,12 @@ void drawGraph() {
   for (int i = 0; i < displayDataCount; i++) {
     payload_t data = displayDataBuffer[(displayDataIndex - displayDataCount + i + MAX_DATA_POINTS) % MAX_DATA_POINTS];
 
-    int x = graphX + (i * graphW / (displayDataCount - 1));
+    int x = graphXForPoint(i, graphX, graphW);
     
     // SG line (blue)
     int y_SG = graphY + graphH - ((data.density - minDensity) / densityRange * graphH);
     if (prevX_SG >= 0 && prevY_SG >= 0) {
-      tft.drawLine(prevX_SG, prevY_SG, x, y_SG, currentTheme->graphBlue);
+      drawGraphLine(prevX_SG, prevY_SG, x, y_SG, currentTheme->graphBlue);
     }
     prevX_SG = x;
     prevY_SG = y_SG;
@@ -1209,7 +2601,7 @@ void drawGraph() {
     // Temperature line (green)
     int y_Temp = graphY + graphH - ((data.temperature - minTemp) / tempRange * graphH);
     if (prevX_Temp >= 0 && prevY_Temp >= 0) {
-      tft.drawLine(prevX_Temp, prevY_Temp, x, y_Temp, currentTheme->graphGreen);
+      drawGraphLine(prevX_Temp, prevY_Temp, x, y_Temp, currentTheme->graphGreen);
     }
     prevX_Temp = x;
     prevY_Temp = y_Temp;
@@ -1219,7 +2611,7 @@ void drawGraph() {
       float abv = calculateABV(originalGravity, data.density);
       int y_Abv = graphY + graphH - ((abv - minAbv) / abvRange * graphH);
       if (prevX_Abv >= 0 && prevY_Abv >= 0) {
-        tft.drawLine(prevX_Abv, prevY_Abv, x, y_Abv, currentTheme->graphPurple);
+        drawGraphLine(prevX_Abv, prevY_Abv, x, y_Abv, currentTheme->graphPurple);
       }
       prevX_Abv = x;
       prevY_Abv = y_Abv;
@@ -1228,7 +2620,7 @@ void drawGraph() {
   
   // Draw cursor
   updateCursorPosition();
-  int cursorX = graphX + (int)(cursorPosition * graphW);
+  int cursorX = graphXForPoint(cursorIndex, graphX, graphW);
   
   // Get data at cursor position
   if (cursorIndex >= 0 && cursorIndex < displayDataCount) {
@@ -1260,7 +2652,7 @@ void drawGraph() {
   tft.fillTriangle(cursorX, cursorIndicatorY, cursorX - 5, cursorIndicatorY - 5, cursorX + 5, cursorIndicatorY - 5, currentTheme->accent);
   
   // Draw cursor value display
-  bool showRight = cursorPosition < 0.44;
+  bool showRight = cursorPosition < 0.50;
   int valueDisplayY = graphY + graphH / 2 - 30;
   drawCursorValueDisplay(cursorX, valueDisplayY, showRight);
 }
@@ -1273,9 +2665,9 @@ void drawGraphForMetric(GraphMetric metric) {
   int axisMarginLeft = 45;
   int axisMarginBottom = 25;
   int graphX = MARGIN + 10 + axisMarginLeft;
-  int graphY = TOPBAR_H + 10;
+  int graphY = TOPBAR_H + MARGIN + 10;
   int graphW = UI_W - MARGIN * 2 - 20 - axisMarginLeft;
-  int graphH = UI_H - TOPBAR_H - NAV_H - 20 - axisMarginBottom;
+  int graphH = UI_H - graphY - NAV_H - MARGIN - axisMarginBottom;
   
   // Find min/max values for the specific metric
   float minValue = 0, maxValue = 0;
@@ -1285,9 +2677,9 @@ void drawGraphForMetric(GraphMetric metric) {
   // Initialize based on metric type
   switch (metric) {
     case METRIC_TEMPERATURE:
-      minValue = 10.0, maxValue = 20.0;
-      yAxisLabel = "°C";
-      padding = 1.0;
+      minValue = 0.0, maxValue = 30.0;
+      yAxisLabel = "C";
+      padding = 0.0;
       break;
     case METRIC_ANGLE:
       minValue = 0.0, maxValue = 45.0;
@@ -1330,8 +2722,30 @@ void drawGraphForMetric(GraphMetric metric) {
         break;
     }
     
-    if (value < minValue) minValue = value;
-    if (value > maxValue) maxValue = value;
+    if (metric != METRIC_TEMPERATURE) {
+      if (value < minValue) minValue = value;
+      if (value > maxValue) maxValue = value;
+    }
+  }
+
+  if (metric == METRIC_ABV && brewProfileLoaded) {
+    float expectedAbv = DerivedCalculations::abv(activeBrewProfile.effectiveOG, activeBrewProfile.expectedFinalGravity);
+    if (expectedAbv > maxValue) maxValue = expectedAbv;
+  } else if (metric == METRIC_ANGLE && brewProfileLoaded && displayDataCount > 0) {
+    bool useRtcTime = timestampsAvailableForGraph();
+    uint32_t firstTime = useRtcTime
+      ? timestampForPoint(0)
+      : displayDataBuffer[(displayDataIndex - displayDataCount + MAX_DATA_POINTS) % MAX_DATA_POINTS].uptime_s;
+    for (int i = 0; i < displayDataCount; i++) {
+      int idx = (displayDataIndex - displayDataCount + i + MAX_DATA_POINTS) % MAX_DATA_POINTS;
+      payload_t data = displayDataBuffer[idx];
+      uint32_t pointTime = useRtcTime ? timestampForPoint(i) : data.uptime_s;
+      float hour = pointTime >= firstTime ? (pointTime - firstTime) / 3600.0f : 0.0f;
+      float targetSG = TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, hour);
+      float targetAngle = angleForTargetSG(targetSG);
+      if (targetAngle < minValue) minValue = targetAngle;
+      if (targetAngle > maxValue) maxValue = targetAngle;
+    }
   }
   
   // Add padding
@@ -1342,7 +2756,7 @@ void drawGraphForMetric(GraphMetric metric) {
   drawGrid(graphX, graphY, graphW, graphH, minValue, maxValue);
   
   // Update Y-axis label
-  tft.setTextColor(uiColorTextMuted);
+  tft.setTextColor(uiColorTextSecondary);
   tft.setFreeFont(FONT_SIZE_XS);
   tft.setCursor(graphX - 25, graphY + 10);
   tft.print(yAxisLabel);
@@ -1361,10 +2775,12 @@ void drawGraphForMetric(GraphMetric metric) {
   if (displayDataCount >= 2) {
     payload_t firstData = displayDataBuffer[(displayDataIndex - displayDataCount + MAX_DATA_POINTS) % MAX_DATA_POINTS];
     payload_t lastData = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-    uint32_t timeSpan = lastData.uptime_s - firstData.uptime_s;
+    uint32_t firstTime = timestampsAvailableForGraph() ? timestampForPoint(0) : firstData.uptime_s;
+    uint32_t lastTime = timestampsAvailableForGraph() ? timestampForPoint(displayDataCount - 1) : lastData.uptime_s;
+    uint32_t timeSpan = lastTime >= firstTime ? lastTime - firstTime : 0;
     
     // Draw X-axis label
-    tft.setTextColor(uiColorTextMuted);
+    tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_XS);
     tft.setCursor(graphX + graphW / 2 - 15, graphY + graphH + axisMarginBottom - 5);
     tft.print("Time");
@@ -1373,18 +2789,16 @@ void drawGraphForMetric(GraphMetric metric) {
     char timeBuf[16];
     if (timeSpan < 3600) {
       // Show minutes
-      snprintf(timeBuf, sizeof(timeBuf), "%dmin", (int)(firstData.uptime_s / 60));
       tft.setCursor(graphX - 5, graphY + graphH + 15);
-      tft.print(timeBuf);
-      snprintf(timeBuf, sizeof(timeBuf), "%dmin", (int)(lastData.uptime_s / 60));
+      tft.print("0min");
+      snprintf(timeBuf, sizeof(timeBuf), "%dmin", (int)(timeSpan / 60));
       tft.setCursor(graphX + graphW - 30, graphY + graphH + 15);
       tft.print(timeBuf);
     } else {
       // Show hours
-      snprintf(timeBuf, sizeof(timeBuf), "%.1fh", firstData.uptime_s / 3600.0);
       tft.setCursor(graphX - 5, graphY + graphH + 15);
-      tft.print(timeBuf);
-      snprintf(timeBuf, sizeof(timeBuf), "%.1fh", lastData.uptime_s / 3600.0);
+      tft.print("0h");
+      snprintf(timeBuf, sizeof(timeBuf), "%.1fh", timeSpan / 3600.0);
       tft.setCursor(graphX + graphW - 30, graphY + graphH + 15);
       tft.print(timeBuf);
     }
@@ -1393,6 +2807,108 @@ void drawGraphForMetric(GraphMetric metric) {
   // Prevent division by zero
   float valueRange = maxValue - minValue;
   if (valueRange == 0) valueRange = 0.001;
+  uint32_t firstMetricTime = 0;
+  bool useMetricRtcTime = timestampsAvailableForGraph();
+  if (displayDataCount > 0) {
+    if (useMetricRtcTime) {
+      firstMetricTime = timestampForPoint(0);
+    } else {
+      payload_t firstData = displayDataBuffer[(displayDataIndex - displayDataCount + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+      firstMetricTime = firstData.uptime_s;
+    }
+  }
+
+  if (metric == METRIC_TEMPERATURE && brewProfileLoaded) {
+    int yMin = graphY + graphH - ((activeBrewProfile.recommendedTempMinC - minValue) / valueRange * graphH);
+    int yMax = graphY + graphH - ((activeBrewProfile.recommendedTempMaxC - minValue) / valueRange * graphH);
+    tft.drawFastHLine(graphX, yMin, graphW, currentTheme->graphPurple);
+    tft.drawFastHLine(graphX, yMin + 1, graphW, currentTheme->graphPurple);
+    tft.drawFastHLine(graphX, yMax, graphW, currentTheme->graphPurple);
+    tft.drawFastHLine(graphX, yMax + 1, graphW, currentTheme->graphPurple);
+    tft.setTextColor(currentTheme->graphPurple);
+    tft.setFreeFont(FONT_SIZE_XS);
+    tft.setCursor(graphX + 4, yMax + 14);
+    tft.print("Yeast range");
+    snprintf(buf, sizeof(buf), "%.0f", activeBrewProfile.recommendedTempMaxC);
+    tft.setCursor(graphX - 35, yMax + 4);
+    tft.print(buf);
+    snprintf(buf, sizeof(buf), "%.0f", activeBrewProfile.recommendedTempMinC);
+    tft.setCursor(graphX - 35, yMin + 4);
+    tft.print(buf);
+
+    if (activeBrewProfile.diacetylRestEnabled || activeBrewProfile.diacetylRestRecommendedByYeast) {
+      float diacetylTarget = activeBrewProfile.recommendedTempMaxC + 2.0f;
+      int yRest = graphY + graphH - ((diacetylTarget - minValue) / valueRange * graphH);
+      tft.drawFastHLine(graphX, yRest, graphW, uiColorWarning);
+      tft.drawFastHLine(graphX, yRest + 1, graphW, uiColorWarning);
+      tft.setTextColor(uiColorWarning);
+      tft.setCursor(graphX + 4, yRest + 14);
+      tft.print("D-rest");
+      snprintf(buf, sizeof(buf), "%.0f", diacetylTarget);
+      tft.setCursor(graphX - 35, yRest + 4);
+      tft.print(buf);
+    }
+
+    int yCold = graphY + graphH - ((2.0f - minValue) / valueRange * graphH);
+    tft.drawFastHLine(graphX, yCold, graphW, currentTheme->graphBlue);
+    tft.drawFastHLine(graphX, yCold + 1, graphW, currentTheme->graphBlue);
+    tft.setTextColor(currentTheme->graphBlue);
+    tft.setCursor(graphX + 4, yCold - 3);
+    tft.print("Cold crush");
+    snprintf(buf, sizeof(buf), "2");
+    tft.setCursor(graphX - 35, yCold + 4);
+    tft.print(buf);
+  } else if (metric == METRIC_ANGLE && brewProfileLoaded) {
+    int prevTargetX = -1;
+    int prevTargetY = -1;
+    float latestTargetAngle = 0.0f;
+    for (int i = 0; i < displayDataCount; i++) {
+      int idx = (displayDataIndex - displayDataCount + i + MAX_DATA_POINTS) % MAX_DATA_POINTS;
+      payload_t data = displayDataBuffer[idx];
+      uint32_t pointTime = useMetricRtcTime ? timestampForPoint(i) : data.uptime_s;
+      float hour = pointTime >= firstMetricTime ? (pointTime - firstMetricTime) / 3600.0f : 0.0f;
+      float targetSG = TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, hour);
+      float targetAngle = angleForTargetSG(targetSG);
+      int x = graphXForPoint(i, graphX, graphW);
+      int y = graphY + graphH - ((targetAngle - minValue) / valueRange * graphH);
+      if (y < graphY) y = graphY;
+      if (y > graphY + graphH) y = graphY + graphH;
+      if (prevTargetX >= 0) drawGraphLine(prevTargetX, prevTargetY, x, y, currentTheme->graphPurple);
+      prevTargetX = x;
+      prevTargetY = y;
+      latestTargetAngle = targetAngle;
+    }
+    tft.setTextColor(currentTheme->graphPurple);
+    tft.setFreeFont(FONT_SIZE_XS);
+    tft.setCursor(graphX + 4, graphY + 14);
+    tft.print("Target angle");
+    int yTarget = graphY + graphH - ((latestTargetAngle - minValue) / valueRange * graphH);
+    if (yTarget < graphY) yTarget = graphY;
+    if (yTarget > graphY + graphH) yTarget = graphY + graphH;
+    snprintf(buf, sizeof(buf), "%.1f", latestTargetAngle);
+    tft.setCursor(graphX - 35, yTarget + 4);
+    tft.print(buf);
+  } else if (metric == METRIC_ABV && brewProfileLoaded) {
+    int prevTargetX = -1;
+    int prevTargetY = -1;
+    for (int i = 0; i < displayDataCount; i++) {
+      int idx = (displayDataIndex - displayDataCount + i + MAX_DATA_POINTS) % MAX_DATA_POINTS;
+      payload_t data = displayDataBuffer[idx];
+      uint32_t pointTime = useMetricRtcTime ? timestampForPoint(i) : data.uptime_s;
+      float hour = pointTime >= firstMetricTime ? (pointTime - firstMetricTime) / 3600.0f : 0.0f;
+      float targetSG = TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, hour);
+      float targetAbv = DerivedCalculations::abv(activeBrewProfile.effectiveOG, targetSG);
+      int x = graphXForPoint(i, graphX, graphW);
+      int y = graphY + graphH - ((targetAbv - minValue) / valueRange * graphH);
+      if (prevTargetX >= 0) drawGraphLine(prevTargetX, prevTargetY, x, y, uiColorInfo);
+      prevTargetX = x;
+      prevTargetY = y;
+    }
+    tft.setTextColor(uiColorInfo);
+    tft.setFreeFont(FONT_SIZE_XS);
+    tft.setCursor(graphX + 4, graphY + 14);
+    tft.print("Expected ABV");
+  }
 
   // Draw gold polyline
   int prevX = -1, prevY = -1;
@@ -1421,11 +2937,11 @@ void drawGraphForMetric(GraphMetric metric) {
         break;
     }
 
-    int x = graphX + (i * graphW / (displayDataCount - 1));
+    int x = graphXForPoint(i, graphX, graphW);
     int y = graphY + graphH - ((value - minValue) / valueRange * graphH);
 
     if (prevX >= 0 && prevY >= 0) {
-      tft.drawLine(prevX, prevY, x, y, uiColorGold);
+      drawGraphLine(prevX, prevY, x, y, uiColorGold);
     }
     
     prevX = x;
@@ -1435,24 +2951,36 @@ void drawGraphForMetric(GraphMetric metric) {
   // Draw last point dot
   if (displayDataCount > 0 && prevX >= 0 && prevY >= 0) {
     tft.fillCircle(prevX, prevY, 4, uiColorGold);
+    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+    tft.setTextColor(uiColorGold);
+    tft.setFreeFont(FONT_SIZE_XS);
+    if (metric == METRIC_TEMPERATURE) {
+      snprintf(buf, sizeof(buf), "%.1f C", latest.temperature);
+    } else if (metric == METRIC_ANGLE) {
+      snprintf(buf, sizeof(buf), "%.1f deg", latest.angle);
+    } else if (metric == METRIC_ABV && ogCaptured) {
+      snprintf(buf, sizeof(buf), "%.1f%%", calculateABV(originalGravity, latest.density));
+    } else {
+      snprintf(buf, sizeof(buf), "%.3f", latest.density);
+    }
+    int labelX = prevX + 8;
+    if (labelX + tft.textWidth(buf) > graphX + graphW) labelX = graphX + graphW - tft.textWidth(buf);
+    int labelY = prevY - 4;
+    if (labelY < graphY + 10) labelY = graphY + 10;
+    if (labelY > graphY + graphH - 4) labelY = graphY + graphH - 4;
+    tft.setCursor(labelX, labelY);
+    tft.print(buf);
   }
+
 }
 
 void drawCalibrationView() {
   tft.fillScreen(uiColorBackground);
   
-  uint8_t battPercent = 0;
-  if (displayDataCount > 0) {
-    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-    battPercent = calculateBatteryPercentage(latest.battery_voltage);
-  }
-  uiDrawTopbar("Calib", true, fermentationFileOpen, battPercent);
+  drawViewTopbar("Calib");
   
-  int contentY = TOPBAR_H;
+  int contentY = TOPBAR_H + MARGIN;
   int contentH = UI_H - TOPBAR_H - NAV_H;
-  
-  // Calibration warning (compact)
-  contentY += 14;
   
   // Main content card
   uiCard(MARGIN, contentY, UI_W - MARGIN * 2, contentH - 50, CARD_RADIUS);
@@ -1466,7 +2994,7 @@ void drawCalibrationView() {
     tft.setTextColor(uiColorAccent);
     tft.setFreeFont(FONT_SIZE_MD);
     int titleY = contentY + 10;
-    uiTextCenter(MARGIN, titleY, UI_W - MARGIN * 2, 24, "Calibration Steps", FONT_SIZE_SM_BOLD, COLOR_BLUE);
+    uiTextCenter(MARGIN, titleY, UI_W - MARGIN * 2, 24, "Calibration Steps", FONT_SIZE_SM_BOLD, uiColorInfo);
     
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
@@ -1483,7 +3011,7 @@ void drawCalibrationView() {
     drawButton(BUTTON_CALIB_NEXT_X, BUTTON_CALIB_NEXT_Y, BUTTON_CALIB_NEXT_W, BUTTON_CALIB_NEXT_H, "NEXT", false);
     
   } else if (calibMode == CALIB_OFFSET) {
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, "Step 1/5 - Sensor Offset Calibration", FONT_SIZE_SM_BOLD, COLOR_BLUE);
+    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, "Step 1/5 - Sensor Offset Calibration", FONT_SIZE_SM_BOLD, uiColorInfo);
     
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
@@ -1493,11 +3021,11 @@ void drawCalibrationView() {
     int bullet3Y = bullet2Y + lineHeight;
     
     tft.setCursor(MARGIN + 10, bullet1Y);
-    tft.print("• Place float on flat, level surface");
+    tft.print("- Place float on flat, level surface");
     tft.setCursor(MARGIN + 10, bullet2Y);
-    tft.print("• Ensure device is completely still");
+    tft.print("- Ensure device is completely still");
     tft.setCursor(MARGIN + 10, bullet3Y);
-    tft.print("• Press Calibrate Offset");
+    tft.print("- Press Calibrate Offset");
     drawButton(BUTTON_CALIB_OFFSET_X, BUTTON_CALIB_OFFSET_Y, BUTTON_CALIB_OFFSET_W, BUTTON_CALIB_OFFSET_H, "Calibrate", offsetCalibrated);
     
   } else if (calibMode == CALIB_SKIP_WARNING) {
@@ -1520,7 +3048,7 @@ void drawCalibrationView() {
   } else if (calibMode == CALIB_POINT1) {
     char buf[32];
     snprintf(buf, sizeof(buf), "Step 2/5 - Calibration Point 1 (SG 1.000)");
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, buf, FONT_SIZE_SM_BOLD, COLOR_BLUE);
+    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, buf, FONT_SIZE_SM_BOLD, uiColorInfo);
     
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
@@ -1530,18 +3058,18 @@ void drawCalibrationView() {
     int bullet3Y = bullet2Y + lineHeight;
     
     tft.setCursor(MARGIN + 10, bullet1Y);
-    tft.print("• Use bowl with 3L+ capacity");
+    tft.print("- Use bowl with 3L+ capacity");
     tft.setCursor(MARGIN + 10, bullet2Y);
-    tft.print("• Fill with 2.0L water");
+    tft.print("- Fill with 2.0L water");
     tft.setCursor(MARGIN + 10, bullet3Y);
-    tft.print("• Wait, then Record");
+    tft.print("- Wait, then Record");
     drawButton(BUTTON_CALIB_SKIP_X, BUTTON_CALIB_SKIP_Y, BUTTON_CALIB_SKIP_W, BUTTON_CALIB_SKIP_H, "Skip SG", false);
     drawButton(BUTTON_CALIB_RECORD_X, BUTTON_CALIB_RECORD_Y, BUTTON_CALIB_RECORD_W, BUTTON_CALIB_RECORD_H, "Record", calibAngles[0] > 0);
     
   } else if (calibMode == CALIB_POINT2) {
     char buf[32];
     snprintf(buf, sizeof(buf), "Step 3/5 - Calibration Point 2 (SG 1.040)");
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, buf, FONT_SIZE_SM_BOLD, COLOR_BLUE);
+    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, buf, FONT_SIZE_SM_BOLD, uiColorInfo);
     
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
@@ -1551,17 +3079,17 @@ void drawCalibrationView() {
     int bullet3Y = bullet2Y + lineHeight;
     
     tft.setCursor(MARGIN + 10, bullet1Y);
-    tft.printf("• Add %dg sugar", sugarAmounts[1]);
+    tft.printf("- Add %dg sugar", sugarAmounts[1]);
     tft.setCursor(MARGIN + 10, bullet2Y);
-    tft.print("• Stir until fully dissolved");
+    tft.print("- Stir until fully dissolved");
     tft.setCursor(MARGIN + 10, bullet3Y);
-    tft.print("• Wait, then Record");
+    tft.print("- Wait, then Record");
     drawButton(BUTTON_CALIB_RECORD_X, BUTTON_CALIB_RECORD_Y, BUTTON_CALIB_RECORD_W, BUTTON_CALIB_RECORD_H, "Record", calibAngles[1] > 0);
     
   } else if (calibMode == CALIB_POINT3) {
     char buf[32];
     snprintf(buf, sizeof(buf), "Step 4/5 - Calibration Point 3 (SG 1.080)");
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, buf, FONT_SIZE_SM_BOLD, COLOR_BLUE);
+    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, buf, FONT_SIZE_SM_BOLD, uiColorInfo);
     
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
@@ -1571,17 +3099,17 @@ void drawCalibrationView() {
     int bullet3Y = bullet2Y + lineHeight;
     
     tft.setCursor(MARGIN + 10, bullet1Y);
-    tft.printf("• Add %dg sugar", sugarAmounts[2]);
+    tft.printf("- Add %dg sugar", sugarAmounts[2]);
     tft.setCursor(MARGIN + 10, bullet2Y);
-    tft.print("• Stir until fully dissolved");
+    tft.print("- Stir until fully dissolved");
     tft.setCursor(MARGIN + 10, bullet3Y);
-    tft.print("• Wait, then Record");
+    tft.print("- Wait, then Record");
     drawButton(BUTTON_CALIB_RECORD_X, BUTTON_CALIB_RECORD_Y, BUTTON_CALIB_RECORD_W, BUTTON_CALIB_RECORD_H, "Record", calibAngles[2] > 0);
     
   } else if (calibMode == CALIB_POINT4) {
     char buf[32];
     snprintf(buf, sizeof(buf), "Step 5/5 - Calibration Point 4 (SG 1.120)");
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, buf, FONT_SIZE_SM_BOLD, COLOR_BLUE);
+    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, buf, FONT_SIZE_SM_BOLD, uiColorInfo);
     
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
@@ -1591,11 +3119,11 @@ void drawCalibrationView() {
     int bullet3Y = bullet2Y + lineHeight;
     
     tft.setCursor(MARGIN + 10, bullet1Y);
-    tft.printf("• Add %dg sugar", sugarAmounts[3]);
+    tft.printf("- Add %dg sugar", sugarAmounts[3]);
     tft.setCursor(MARGIN + 10, bullet2Y);
-    tft.print("• Stir until fully dissolved");
+    tft.print("- Stir until fully dissolved");
     tft.setCursor(MARGIN + 10, bullet3Y);
-    tft.print("• Wait, then Record");
+    tft.print("- Wait, then Record");
     drawButton(BUTTON_CALIB_RECORD_X, BUTTON_CALIB_RECORD_Y, BUTTON_CALIB_RECORD_W, BUTTON_CALIB_RECORD_H, "Record", calibAngles[3] > 0);
     
   } else if (calibMode == CALIB_COMPLETE) {
@@ -1611,22 +3139,22 @@ void drawCalibrationView() {
     tft.print("Summary:");
     summaryY += lineHeight;
     
-    snprintf(buf, sizeof(buf), "P1 (SG 1.000): %.1f°", calibAngles[0]);
+    snprintf(buf, sizeof(buf), "P1 (SG 1.000): %.1f deg", calibAngles[0]);
     tft.setCursor(MARGIN + 10, summaryY);
     tft.print(buf);
     summaryY += lineHeight;
     
-    snprintf(buf, sizeof(buf), "P2 (SG 1.040): %.1f°", calibAngles[1]);
+    snprintf(buf, sizeof(buf), "P2 (SG 1.040): %.1f deg", calibAngles[1]);
     tft.setCursor(MARGIN + 10, summaryY);
     tft.print(buf);
     summaryY += lineHeight;
     
-    snprintf(buf, sizeof(buf), "P3 (SG 1.080): %.1f°", calibAngles[2]);
+    snprintf(buf, sizeof(buf), "P3 (SG 1.080): %.1f deg", calibAngles[2]);
     tft.setCursor(MARGIN + 10, summaryY);
     tft.print(buf);
     summaryY += lineHeight;
     
-    snprintf(buf, sizeof(buf), "P4 (SG 1.120): %.1f°", calibAngles[3]);
+    snprintf(buf, sizeof(buf), "P4 (SG 1.120): %.1f deg", calibAngles[3]);
     tft.setCursor(MARGIN + 10, summaryY);
     tft.print(buf);
     
@@ -1655,7 +3183,7 @@ void drawCalibrationView() {
     drawButton(80, 194, BUTTON_CALIB_OFFSET_W, BUTTON_CALIB_OFFSET_H, "EXIT", false);
   }
   
-  uiDrawBottomNav(TAB_BATTERY);
+  uiDrawBottomNav(TAB_MORE);
   
   // Draw wait notification overlay if active
   if (waitActive) {
@@ -1683,21 +3211,13 @@ void drawCalibrationView() {
 void drawBatteryView() {
   tft.fillScreen(uiColorBackground);
   
-  uint8_t battPercent = 0;
-  if (displayDataCount > 0) {
-    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-    battPercent = calculateBatteryPercentage(latest.battery_voltage);
-  }
-  uiDrawTopbar("Battery", true, fermentationFileOpen, battPercent);
+  drawViewTopbar("Battery");
   
-  int contentY = TOPBAR_H;
-  int contentH = UI_H - TOPBAR_H - NAV_H;
+  int contentY = TOPBAR_H + MARGIN;
+  int contentH = UI_H - contentY - NAV_H - MARGIN;
   
   if (displayDataCount < 3) {
-    uiCard(MARGIN, contentY + contentH / 2 - 40, UI_W - MARGIN * 2, 80, CARD_RADIUS);
-    uiTextCenter(MARGIN, contentY + contentH / 2 - 10, UI_W - MARGIN * 2, 20, "No battery data", FONT_SIZE_MD, uiColorTextMuted);
-    uiTextCenter(MARGIN, contentY + contentH / 2 + 10, UI_W - MARGIN * 2, 20, "Collect a few points first", FONT_SIZE_SM, uiColorTextMuted);
-    uiDrawBottomNav(TAB_BATTERY);
+    drawNoDataCard("No battery data", "Collect a few points first", TAB_DASHBOARD);
     return;
   }
   
@@ -1705,11 +3225,7 @@ void drawBatteryView() {
   int graphW = (UI_W - MARGIN * 2 - GAP) * 2 / 3;
   int graphX = MARGIN;
   int graphH = contentH;
-  int graphY = contentY - 8;
-  
-  // Define button area for battery view
-  #define BATTERY_BUTTON_H 40
-  #define BATTERY_BUTTON_Y (UI_H - NAV_H - BATTERY_BUTTON_H - GAP)
+  int graphY = contentY;
   
   // Adjust graph height to accommodate buttons
   int graphContentH = BATTERY_BUTTON_Y - graphY - GAP;
@@ -1720,18 +3236,10 @@ void drawBatteryView() {
   // Load historical battery data from CSV based on batteryLoadMode (similar to graph view)
   if (fermentationFileOpen && strlen(currentFermentationFile) > 0) {
     // Load battery voltage data from CSV based on time range
-    int loadMultiplier = 1;
-    if (batteryLoadMode == LOAD_6H) {
-      loadMultiplier = 1;
-    } else if (batteryLoadMode == LOAD_24H) {
-      loadMultiplier = 2;
-    } else {
-      loadMultiplier = 1;
-    }
-    
-    // Load data with appropriate time range (use same logic as graph view)
+    // Load every available row for the selected time range. Sampling is only
+    // useful once the file is larger than the display buffer.
     if (mountSDTemporarily()) {
-      loadHistoricalDataFromCSV(currentFermentationFile, batteryLoadMode, MAX_DATA_POINTS, loadMultiplier);
+      loadHistoricalDataFromCSV(currentFermentationFile, batteryLoadMode, MAX_DATA_POINTS, 1);
       dismountSD();
     }
   }
@@ -1809,10 +3317,10 @@ void drawBatteryView() {
   int cardH = (contentH - GAP * 2) / 3;
   
   // Voltage card
-  uiCard(cardX, graphY - 4, cardW, cardH, CARD_RADIUS);
+  uiCard(cardX, graphY, cardW, cardH, CARD_RADIUS);
   tft.setTextColor(uiColorTextSecondary);
   tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(cardX + 15, graphY - 4 + 20);
+  tft.setCursor(cardX + 15, graphY + 20);
   tft.print("Voltage");
   
   if (displayDataCount > 0) {
@@ -1826,10 +3334,10 @@ void drawBatteryView() {
   }
   
   // Percentage card
-  uiCard(cardX, graphY + cardH + GAP - 4, cardW, cardH, CARD_RADIUS);
+  uiCard(cardX, graphY + cardH + GAP, cardW, cardH, CARD_RADIUS);
   tft.setTextColor(uiColorTextSecondary);
   tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(cardX + 15, graphY + cardH + GAP - 4 + 20);
+  tft.setCursor(cardX + 15, graphY + cardH + GAP + 20);
   tft.print("Percentage");
   
   if (displayDataCount > 0) {
@@ -1839,7 +3347,7 @@ void drawBatteryView() {
     tft.setFreeFont(FONT_SIZE_MD);
     char percentBuf[16];
     snprintf(percentBuf, sizeof(percentBuf), "%d%%", percent);
-    tft.setCursor(cardX + 15, graphY + cardH + GAP - 4 + cardH / 2 + 14);
+    tft.setCursor(cardX + 15, graphY + cardH + GAP + cardH / 2 + 14);
     tft.print(percentBuf);
   }
   
@@ -1854,13 +3362,13 @@ void drawBatteryView() {
   if (chargingState == CHARGING) {
     tft.setTextColor(uiColorSuccess);
     tft.setFreeFont(FONT_SIZE_MD);
-    tft.setCursor(cardX + 15, graphY + (cardH + GAP) * 2 - 4 + cardH / 2 + 14);
+    tft.setCursor(cardX + 15, graphY + (cardH + GAP) * 2 + cardH / 2 + 14);
     tft.print("Charging");
   } else if (chargingState == DISCHARGING && displayDataCount >= 20) {
     // Calculate discharge rate using linear regression over last 20 readings
     float dischargeRate = calculateDischargeRateLinearRegression(); // Volts per second
     
-    Serial.printf("Battery view: dischargeRate=%.6f, threshold=0.00000004\n", dischargeRate);
+    LOG_VERBOSE("Battery view: dischargeRate=%.6f, threshold=0.00000004\n", dischargeRate);
     
     if (dischargeRate >= 0.00000004) { // Only estimate if discharging significantly (adjusted for 30-day operation)
       payload_t lastReading = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
@@ -1882,14 +3390,14 @@ void drawBatteryView() {
     } else {
       tft.setTextColor(uiColorTextPrimary);
       tft.setFreeFont(FONT_SIZE_MD);
-      tft.setCursor(cardX + 15, graphY + (cardH + GAP) * 2 - 4 + cardH / 2 + 14);
+      tft.setCursor(cardX + 15, graphY + (cardH + GAP) * 2 + cardH / 2 + 14);
       tft.print("Stable");
     }
   } else {
     // Unknown charging state or not enough data
     tft.setTextColor(uiColorTextMuted);
     tft.setFreeFont(FONT_SIZE_SM);
-    tft.setCursor(cardX + 15, graphY + (cardH + GAP) * 2 - 4 + cardH / 2 + 14);
+    tft.setCursor(cardX + 15, graphY + (cardH + GAP) * 2 + cardH / 2 + 14);
     if (chargingState == CHARGING_UNKNOWN) {
       tft.print("Detecting...");
     } else {
@@ -1897,27 +3405,19 @@ void drawBatteryView() {
     }
   }
   
-  uiDrawBottomNav(TAB_BATTERY);
+  uiDrawBottomNav(TAB_DASHBOARD);
 }
 
 void drawTempGraphView() {
   tft.fillScreen(uiColorBackground);
   
-  uint8_t battPercent = 0;
-  if (displayDataCount > 0) {
-    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-    battPercent = calculateBatteryPercentage(latest.battery_voltage);
-  }
-  uiDrawTopbar("Temp", true, fermentationFileOpen, battPercent);
+  drawViewTopbar("Temp Target");
   
-  int contentY = TOPBAR_H;
-  int contentH = UI_H - contentY - NAV_H;
+  int contentY = TOPBAR_H + MARGIN;
+  int contentH = UI_H - contentY - NAV_H - MARGIN;
   
   if (displayDataCount < 3) {
-    uiCard(MARGIN, contentY + contentH / 2 - 40, UI_W - MARGIN * 2, 80, CARD_RADIUS);
-    uiTextCenter(MARGIN, contentY + contentH / 2 - 10, UI_W - MARGIN * 2, 20, "No graph data", FONT_SIZE_MD, uiColorTextMuted);
-    uiTextCenter(MARGIN, contentY + contentH / 2 + 10, UI_W - MARGIN * 2, 20, "Collect a few points first", FONT_SIZE_SM, uiColorTextMuted);
-    uiDrawBottomNav(TAB_LIVE);
+    drawNoDataCard("No graph data", "Collect a few points first", TAB_LIVE);
     return;
   }
   
@@ -1931,21 +3431,13 @@ void drawTempGraphView() {
 void drawAngleGraphView() {
   tft.fillScreen(uiColorBackground);
   
-  uint8_t battPercent = 0;
-  if (displayDataCount > 0) {
-    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-    battPercent = calculateBatteryPercentage(latest.battery_voltage);
-  }
-  uiDrawTopbar("Angle", true, fermentationFileOpen, battPercent);
+  drawViewTopbar("Angle");
   
-  int contentY = TOPBAR_H;
-  int contentH = UI_H - contentY - NAV_H;
+  int contentY = TOPBAR_H + MARGIN;
+  int contentH = UI_H - contentY - NAV_H - MARGIN;
   
   if (displayDataCount < 3) {
-    uiCard(MARGIN, contentY + contentH / 2 - 40, UI_W - MARGIN * 2, 80, CARD_RADIUS);
-    uiTextCenter(MARGIN, contentY + contentH / 2 - 10, UI_W - MARGIN * 2, 20, "No graph data", FONT_SIZE_MD, uiColorTextMuted);
-    uiTextCenter(MARGIN, contentY + contentH / 2 + 10, UI_W - MARGIN * 2, 20, "Collect a few points first", FONT_SIZE_SM, uiColorTextMuted);
-    uiDrawBottomNav(TAB_LIVE);
+    drawNoDataCard("No graph data", "Collect a few points first", TAB_LIVE);
     return;
   }
   
@@ -1959,29 +3451,18 @@ void drawAngleGraphView() {
 void drawAbvGraphView() {
   tft.fillScreen(uiColorBackground);
   
-  uint8_t battPercent = 0;
-  if (displayDataCount > 0) {
-    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-    battPercent = calculateBatteryPercentage(latest.battery_voltage);
-  }
-  uiDrawTopbar("ABV", true, fermentationFileOpen, battPercent);
+  drawViewTopbar("ABV Target");
   
-  int contentY = TOPBAR_H;
-  int contentH = UI_H - contentY - NAV_H;
+  int contentY = TOPBAR_H + MARGIN;
+  int contentH = UI_H - contentY - NAV_H - MARGIN;
   
   if (!ogCaptured) {
-    uiCard(MARGIN, contentY + contentH / 2 - 40, UI_W - MARGIN * 2, 80, CARD_RADIUS);
-    uiTextCenter(MARGIN, contentY + contentH / 2 - 10, UI_W - MARGIN * 2, 20, "OG not set", FONT_SIZE_MD, uiColorTextMuted);
-    uiTextCenter(MARGIN, contentY + contentH / 2 + 10, UI_W - MARGIN * 2, 20, "Set OG first", FONT_SIZE_SM, uiColorTextMuted);
-    uiDrawBottomNav(TAB_LIVE);
+    drawNoDataCard("OG not set", "Set OG first", TAB_LIVE);
     return;
   }
   
   if (displayDataCount < 3) {
-    uiCard(MARGIN, contentY + contentH / 2 - 40, UI_W - MARGIN * 2, 80, CARD_RADIUS);
-    uiTextCenter(MARGIN, contentY + contentH / 2 - 10, UI_W - MARGIN * 2, 20, "No graph data", FONT_SIZE_MD, uiColorTextMuted);
-    uiTextCenter(MARGIN, contentY + contentH / 2 + 10, UI_W - MARGIN * 2, 20, "Collect a few points first", FONT_SIZE_SM, uiColorTextMuted);
-    uiDrawBottomNav(TAB_LIVE);
+    drawNoDataCard("No graph data", "Collect a few points first", TAB_LIVE);
     return;
   }
   
@@ -1993,54 +3474,6 @@ void drawAbvGraphView() {
 }
 
 // UI Design System Helper Functions Implementation
-
-void drawHeader(const char* title) {
-  // Draw header background
-  tft.fillRect(0, 0, SCREEN_W, 40, currentTheme->primary);
-  
-  // Draw SGNode branding
-  tft.setTextColor(currentTheme->primaryText);
-  tft.setFreeFont(FONT_SIZE_MD);
-  tft.setCursor(10, 16);  // Adjust for FreeFont baseline
-  tft.println("SGNode");
-  
-  // Draw navigation buttons on the right
-  int buttonWidth = 60;
-  int buttonHeight = 30;
-  int buttonY = 5;
-  int spacing = 5;
-  
-  // Calculate button positions from right side
-  int calibX = SCREEN_W - buttonWidth - 10;
-  int graphX = calibX - buttonWidth - spacing;
-  int liveX = graphX - buttonWidth - spacing;
-  
-  // LIVE button
-  drawButton(liveX, buttonY, buttonWidth, buttonHeight, "LIVE", currentMode == LIVE_VIEW);
-  
-  // GRAPH button
-  drawButton(graphX, buttonY, buttonWidth, buttonHeight, "GRAPH", currentMode == GRAPH_VIEW);
-  
-  // CALIB button
-  drawButton(calibX, buttonY, buttonWidth, buttonHeight, "CALIB", currentMode == CALIBRATION_VIEW);
-}
-
-void drawFooter(const char* status) {
-  // Draw footer background
-  tft.fillRect(0, SCREEN_H - 30, SCREEN_W, 30, currentTheme->cardBackground);
-  
-  // Draw status text
-  tft.setTextColor(currentTheme->textSecondary);
-  tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(10, SCREEN_H - 16);  // Adjust for FreeFont baseline
-  tft.println(status);
-}
-
-void drawCard(int x, int y, int w, int h) {
-  // Draw card background with rounded corners simulation
-  tft.fillRect(x + 2, y + 2, w - 4, h - 4, currentTheme->cardBackground);
-  tft.drawRect(x, y, w, h, currentTheme->border);
-}
 
 void drawButton(int x, int y, int w, int h, const char* label, bool active) {
   if (active) {
@@ -2060,29 +3493,71 @@ void drawButton(int x, int y, int w, int h, const char* label, bool active) {
   tft.print(label); // Changed from println to print
 }
 
+void drawThemeToggle(int x, int y, bool enabled) {
+  uint16_t bg = enabled ? uiColorSuccess : uiColorBorder;
+  tft.fillRoundRect(x, y, 52, 28, 14, bg);
+  tft.fillCircle(enabled ? x + 38 : x + 14, y + 14, 11, TFT_WHITE);
+}
+
+void loadThemePreference() {
+  EEPROM.begin(128);
+  uint32_t magic = 0;
+  EEPROM.get(EEPROM_THEME_MAGIC, magic);
+  if (magic == THEME_MAGIC) {
+    uint8_t savedTheme = EEPROM.read(EEPROM_THEME_VALUE);
+    darkMode = savedTheme != 0;
+  } else {
+    darkMode = true;
+  }
+  currentTheme = darkMode ? &darkTheme : &lightTheme;
+  LOG_INFO("Theme loaded: %s\n", darkMode ? "dark" : "light");
+}
+
+void saveThemePreference() {
+  EEPROM.begin(128);
+  EEPROM.put(EEPROM_THEME_MAGIC, THEME_MAGIC);
+  EEPROM.write(EEPROM_THEME_VALUE, darkMode ? 1 : 0);
+  if (EEPROM.commit()) {
+    LOG_INFO("Theme saved: %s\n", darkMode ? "dark" : "light");
+  } else {
+    LOG_ERRORLN("ERROR: Failed to save theme");
+  }
+}
+
 void toggleTheme() {
   darkMode = !darkMode;
   currentTheme = darkMode ? &darkTheme : &lightTheme;
+  uiInitColors();
+  saveThemePreference();
   
   // Redraw entire screen with new theme
   tft.fillScreen(currentTheme->background);
   screenDirty = true;
+  staticElementsDrawn = false;
+}
+
+bool isLogoBackgroundPixel(uint16_t color) {
+  uint8_t r = ((color >> 11) & 0x1F) * 255 / 31;
+  uint8_t g = ((color >> 5) & 0x3F) * 255 / 63;
+  uint8_t b = (color & 0x1F) * 255 / 31;
+  return r >= 238 && g >= 238 && b >= 238;
 }
 
 void drawBootScreen() {
-  tft.fillScreen(currentTheme->background);
+  tft.fillScreen(lightTheme.background);
   
   // Center logo on screen
   int logoX = (SCREEN_W - logo2_width) / 2;
   int logoY = (SCREEN_H - logo2_height) / 2 - 20; // Move up to make room for text
   
-  // Draw logo from optimized pixel data (only non-white pixels stored)
-  // Count pixels in the array (calculated from array size)
+  // Draw logo from optimized pixel data. Near-white source pixels are
+  // treated as transparent to avoid halos on the dark boot background.
   int numPixels = sizeof(logo2_pixels) / sizeof(Pixel);
   for (int i = 0; i < numPixels; i++) {
     int x = logoX + logo2_pixels[i].x;
     int y = logoY + logo2_pixels[i].y;
     uint16_t color = logo2_pixels[i].color;
+    if (isLogoBackgroundPixel(color)) continue;
     tft.drawPixel(x, y, color);
   }
   
@@ -2090,7 +3565,7 @@ void drawBootScreen() {
   tft.setTextColor(currentTheme->textSecondary);
   tft.setFreeFont(FONT_SIZE_SM);
   tft.setCursor(logoX + 60, logoY + logo2_height + 14);  // Adjust for FreeFont baseline
-  tft.println("SGNode Base Station");
+  tft.println("alpha 0.4.0");
   
   delay(2000); // Show boot screen for 2 seconds
 }
@@ -2107,16 +3582,83 @@ void checkTouch() {
     
     touchX = x;
     touchY = y;
+
+    // Top bar battery icon/percentage opens the dedicated Battery view.
+    if (touchY <= TOPBAR_H && touchX >= UI_W - 95) {
+      currentMode = BATTERY_VIEW;
+      screenDirty = true;
+      staticElementsDrawn = false;
+      LOG_VERBOSELN("Switched to Battery View from topbar");
+      delay(50);
+      return;
+    }
+
+    if (currentMode == BREW_WIZARD_VIEW) {
+      if (brewWizard.handleTouch(touchX, touchY)) {
+        if (brewWizard.completed()) {
+          brewWizard.clearResultFlags();
+          completeBrewWizard();
+        } else if (brewWizard.cancelled()) {
+          brewWizard.clearResultFlags();
+          currentMode = LIVE_VIEW;
+          screenDirty = true;
+        } else {
+          screenDirty = true;
+        }
+      }
+      delay(50);
+      return;
+    }
+
+    if (currentMode == NEW_YEAST_VIEW) {
+      handleNewYeastTouch(touchX, touchY);
+      delay(50);
+      return;
+    }
+
+    if (currentMode == MANAGE_YEAST_VIEW) {
+      handleManageYeastTouch(touchX, touchY);
+      delay(50);
+      return;
+    }
+
+    if (currentMode == MANAGE_BREW_VIEW) {
+      handleManageBrewTouch(touchX, touchY);
+      delay(50);
+      return;
+    }
+
+    if (currentMode == OG_VERIFICATION_VIEW) {
+      if (touchX >= MARGIN && touchX <= MARGIN + 200 &&
+          touchY >= 242 && touchY <= 286) {
+        handleOGChoice(false);
+        delay(50);
+        return;
+      }
+      if (touchX >= UI_W - MARGIN - 200 && touchX <= UI_W - MARGIN &&
+          touchY >= 242 && touchY <= 286) {
+        handleOGChoice(true);
+        delay(50);
+        return;
+      }
+    }
+
+    if (currentMode == TARGET_CHART_VIEW && touchY < UI_H - NAV_H) {
+      currentMode = LIVE_VIEW;
+      screenDirty = true;
+      delay(50);
+      return;
+    }
     
     // Handle Create New Fermentation dialog touches (highest priority)
     if (showingCreateNewDialog) {
       // Yes button
       if (touchX >= BUTTON_DIALOG_YES_X && touchX <= BUTTON_DIALOG_YES_X + BUTTON_DIALOG_YES_W &&
           touchY >= BUTTON_DIALOG_YES_Y && touchY <= BUTTON_DIALOG_YES_Y + BUTTON_DIALOG_YES_H) {
-        createNewFermentationFile();
+        beginBrewWizard();
         showingCreateNewDialog = false;
         screenDirty = true;
-        Serial.println("Created new fermentation from dialog");
+        LOG_VERBOSELN("Opened Brew Wizard from dialog");
       }
       
       // Back button
@@ -2124,7 +3666,7 @@ void checkTouch() {
           touchY >= BUTTON_DIALOG_BACK_Y && touchY <= BUTTON_DIALOG_BACK_Y + BUTTON_DIALOG_BACK_H) {
         showingCreateNewDialog = false;
         screenDirty = true;
-        Serial.println("Cancelled new fermentation from dialog");
+        LOG_VERBOSELN("Cancelled new fermentation from dialog");
       }
       
       delay(50);
@@ -2143,8 +3685,8 @@ void checkTouch() {
         case TAB_GRAPH:
           tabMode = GRAPH_VIEW;
           break;
-        case TAB_BATTERY:
-          tabMode = BATTERY_VIEW;
+        case TAB_DASHBOARD:
+          tabMode = DASHBOARD_VIEW;
           break;
         case TAB_MORE:
           tabMode = MORE_VIEW;
@@ -2157,7 +3699,7 @@ void checkTouch() {
             currentMode = LIVE_VIEW;
             staticElementsDrawn = false;  // Force full redraw
             screenDirty = true;
-            Serial.println("Switched to Live View");
+            LOG_VERBOSELN("Switched to Live View");
             break;
           case TAB_GRAPH:
             currentMode = GRAPH_VIEW;
@@ -2168,17 +3710,17 @@ void checkTouch() {
               cursorIndex = displayDataCount - 1;
             }
             screenDirty = true;
-            Serial.println("Switched to Graph View");
+            LOG_VERBOSELN("Switched to Graph View");
             break;
-          case TAB_BATTERY:
-            currentMode = BATTERY_VIEW;
+          case TAB_DASHBOARD:
+            currentMode = DASHBOARD_VIEW;
             screenDirty = true;
-            Serial.println("Switched to Battery View");
+            LOG_VERBOSELN("Switched to Dashboard");
             break;
           case TAB_MORE:
             currentMode = MORE_VIEW;
             screenDirty = true;
-            Serial.println("Switched to More View");
+            LOG_VERBOSELN("Switched to More View");
             break;
         }
       }
@@ -2240,13 +3782,10 @@ void checkTouch() {
     
     // Handle Battery view button touches
     if (currentMode == BATTERY_VIEW) {
-      int contentY = TOPBAR_H;
+      int contentY = TOPBAR_H + MARGIN;
       int contentH = UI_H - TOPBAR_H - NAV_H;
       int graphW = (UI_W - MARGIN * 2 - GAP) * 2 / 3;
       int graphX = MARGIN;
-      
-      #define BATTERY_BUTTON_H 40
-      #define BATTERY_BUTTON_Y (UI_H - NAV_H - BATTERY_BUTTON_H - GAP)
       
       int buttonW = (graphW - MARGIN * 2 - GAP * 2) / 3;
       int buttonX = graphX + MARGIN;
@@ -2258,7 +3797,7 @@ void checkTouch() {
           touchY >= buttonY && touchY <= buttonY + buttonH) {
         batteryLoadMode = LOAD_6H;
         screenDirty = true;
-        Serial.println("Battery view: 6h selected");
+        LOG_VERBOSELN("Battery view: 6h selected");
         delay(50);
         return;
       }
@@ -2269,7 +3808,7 @@ void checkTouch() {
           touchY >= buttonY && touchY <= buttonY + buttonH) {
         batteryLoadMode = LOAD_24H;
         screenDirty = true;
-        Serial.println("Battery view: 24h selected");
+        LOG_VERBOSELN("Battery view: 24h selected");
         delay(50);
         return;
       }
@@ -2280,7 +3819,7 @@ void checkTouch() {
           touchY >= buttonY && touchY <= buttonY + buttonH) {
         batteryLoadMode = LOAD_ALL;
         screenDirty = true;
-        Serial.println("Battery view: All selected");
+        LOG_VERBOSELN("Battery view: All selected");
         delay(50);
         return;
       }
@@ -2290,51 +3829,104 @@ void checkTouch() {
     if (currentMode == MORE_VIEW) {
       int contentY = TOPBAR_H + MARGIN;
       int cardH = (UI_H - TOPBAR_H - NAV_H - MARGIN * 2 - GAP * 3) / 4;
-      int cardW = UI_W - MARGIN * 2;
+      int contentW = UI_W - MARGIN * 2;
+      int cardW = (contentW - GAP) / 2;
+      int leftX = MARGIN;
+      int rightX = MARGIN + cardW + GAP;
       
       // System card (goes to LIVE_DETAILS)
-      if (touchX >= MARGIN && touchX <= MARGIN + cardW &&
+      if (touchX >= leftX && touchX <= leftX + cardW &&
           touchY >= contentY && touchY <= contentY + cardH) {
         currentMode = LIVE_DETAILS_VIEW;
         screenDirty = true;
-        Serial.println("Switched to Live Details");
+        LOG_VERBOSELN("Switched to Live Details");
+      }
+
+      // Theme switch
+      if (touchX >= rightX && touchX <= rightX + cardW &&
+          touchY >= contentY && touchY <= contentY + cardH) {
+        toggleTheme();
+        screenDirty = true;
+        LOG_VERBOSELN("Theme toggled");
+        delay(50);
+        return;
       }
       
       // Calibration card - opens Polynomial Graph
       contentY += cardH + GAP;
-      if (touchX >= MARGIN && touchX <= MARGIN + cardW &&
+      if (touchX >= leftX && touchX <= leftX + cardW &&
           touchY >= contentY && touchY <= contentY + cardH) {
         currentMode = POLY_GRAPH_VIEW;
         screenDirty = true;
-        Serial.println("Switched to Polynomial Graph");
+        LOG_VERBOSELN("Switched to Polynomial Graph");
+      }
+
+      // New Yeast entry point
+      if (touchX >= rightX && touchX <= rightX + cardW &&
+          touchY >= contentY && touchY <= contentY + cardH) {
+        beginNewYeastWizard();
+        LOG_VERBOSELN("Opened New Yeast wizard");
+        delay(50);
+        return;
       }
       
       // Create New Fermentation card
       contentY += cardH + GAP;
-      if (touchX >= MARGIN && touchX <= MARGIN + cardW &&
+      if (touchX >= leftX && touchX <= leftX + cardW &&
           touchY >= contentY && touchY <= contentY + cardH) {
-        showingCreateNewDialog = true;
+        beginBrewWizard();
         screenDirty = true;
-        Serial.println("Opened Create New Fermentation dialog");
+        LOG_VERBOSELN("Opened Brew Wizard");
       }
       
-      // Reboot card
-      contentY += cardH + GAP;
-      if (touchX >= MARGIN && touchX <= MARGIN + cardW &&
+      // Manage Yeast card
+      if (touchX >= rightX && touchX <= rightX + cardW &&
           touchY >= contentY && touchY <= contentY + cardH) {
-        Serial.println("Rebooting...");
+        loadManagedYeasts();
+        currentMode = MANAGE_YEAST_VIEW;
+        screenDirty = true;
+        LOG_VERBOSELN("Switched to Manage Yeast");
+        delay(50);
+        return;
+      }
+
+      // Manage Brew / Reboot row
+      contentY += cardH + GAP;
+      if (touchX >= leftX && touchX <= leftX + cardW &&
+          touchY >= contentY && touchY <= contentY + cardH) {
+        loadManagedBatches();
+        currentMode = MANAGE_BREW_VIEW;
+        screenDirty = true;
+        LOG_VERBOSELN("Switched to Manage Brew");
+        delay(50);
+        return;
+      }
+      if (touchX >= rightX && touchX <= rightX + cardW &&
+          touchY >= contentY && touchY <= contentY + cardH) {
+        LOG_INFOLN("Rebooting...");
         ESP.restart();
       }
     }
     
     // Handle Live view tile touches for graph views
     if (currentMode == LIVE_VIEW && displayDataCount > 0) {
-      int contentY = calibrationModeActive ? TOPBAR_H + 14 : TOPBAR_H;
+      int contentY = calibrationModeActive ? TOPBAR_H + MARGIN + 14 : TOPBAR_H + MARGIN;
       int contentH = UI_H - contentY - NAV_H;
       int heroH = contentH / 2;
       int tileY = contentY + heroH + GAP - 6;  // Lifted by 6px
       int tileW = (UI_W - MARGIN * 2 - GAP * 2) / 3;  // 3 tiles
       int tileH = contentH - heroH - GAP;
+
+      // SG hero opens gravity target vs actual.
+      if (touchX >= MARGIN && touchX <= UI_W - MARGIN &&
+          touchY >= contentY && touchY <= contentY + heroH) {
+        currentMode = TARGET_CHART_VIEW;
+        screenDirty = true;
+        staticElementsDrawn = false;
+        LOG_VERBOSELN("Switched to Target vs Actual View");
+        delay(50);
+        return;
+      }
       
       // Temp tile (first tile)
       int tempTileX = MARGIN;
@@ -2343,7 +3935,7 @@ void checkTouch() {
         currentMode = TEMP_GRAPH_VIEW;
         screenDirty = true;
         staticElementsDrawn = false;
-        Serial.println("Switched to Temp Graph View");
+        LOG_VERBOSELN("Switched to Temp Graph View");
         delay(50);
         return;
       }
@@ -2355,7 +3947,7 @@ void checkTouch() {
         currentMode = ANGLE_GRAPH_VIEW;
         screenDirty = true;
         staticElementsDrawn = false;
-        Serial.println("Switched to Angle Graph View");
+        LOG_VERBOSELN("Switched to Angle Graph View");
         delay(50);
         return;
       }
@@ -2369,7 +3961,7 @@ void checkTouch() {
           currentMode = ABV_GRAPH_VIEW;
           screenDirty = true;
           staticElementsDrawn = false;
-          Serial.println("Switched to ABV Graph View");
+          LOG_VERBOSELN("Switched to ABV Graph View");
           delay(50);
           return;
         } else {
@@ -2379,7 +3971,7 @@ void checkTouch() {
           ogCaptured = true;
           currentABV = calculateABV(originalGravity, latest.density);
           screenDirty = true;
-          Serial.printf("Set OG to: %.3f\n", originalGravity);
+          LOG_INFO("Set OG to: %.3f\n", originalGravity);
           delay(50);
           return;
         }
@@ -2392,29 +3984,9 @@ void checkTouch() {
       currentMode = LIVE_VIEW;
       screenDirty = true;
       staticElementsDrawn = false;
-      Serial.println("Returned to Live View");
+      LOG_VERBOSELN("Returned to Live View");
       delay(50);
       return;
-    }
-    
-    // Handle Live Details SET OG button
-    if (currentMode == LIVE_DETAILS_VIEW && !ogCaptured && displayDataCount > 0) {
-      int contentY = TOPBAR_H + MARGIN;
-      int contentW = UI_W - MARGIN * 2;
-      int headerH = 50;
-      int cardH = 80;
-      int logH = 70;
-      int btnY = contentY + headerH + GAP + cardH + GAP + logH + GAP;
-      
-      if (touchX >= MARGIN && touchX <= MARGIN + contentW &&
-          touchY >= btnY && touchY <= btnY + 40) {
-        payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-        originalGravity = latest.density;
-        ogCaptured = true;
-        currentABV = calculateABV(originalGravity, latest.density);
-        screenDirty = true;
-        Serial.printf("Set OG to: %.3f\n", originalGravity);
-      }
     }
     
     // Handle calibration screen buttons
@@ -2425,7 +3997,7 @@ void checkTouch() {
           touchY >= BUTTON_CALIB_START_Y && touchY <= BUTTON_CALIB_START_Y + BUTTON_CALIB_START_H) {
         calibMode = CALIB_INSTRUCTIONS;
         screenDirty = true;
-        Serial.println("Started calibration wizard");
+        LOG_INFOLN("Started calibration wizard");
       }
       
       // Next button (instructions to offset calibration)
@@ -2434,7 +4006,7 @@ void checkTouch() {
           touchY >= BUTTON_CALIB_NEXT_Y && touchY <= BUTTON_CALIB_NEXT_Y + BUTTON_CALIB_NEXT_H) {
         calibMode = CALIB_OFFSET;
         screenDirty = true;
-        Serial.println("Moved to Offset Calibration");
+        LOG_VERBOSELN("Moved to Offset Calibration");
       }
       
       // Calibrate Offset button
@@ -2443,7 +4015,7 @@ void checkTouch() {
           touchY >= BUTTON_CALIB_OFFSET_Y && touchY <= BUTTON_CALIB_OFFSET_Y + BUTTON_CALIB_OFFSET_H) {
         sendCalibrationCommand(5, 0.0); // Command 5 for offset calibration
         startWait(2000); // 2 second wait for offset calibration
-        Serial.println("CALIBRATE OFFSET - started 2s wait");
+        LOG_VERBOSELN("CALIBRATE OFFSET - started 2s wait");
       }
       
       // Skip SG Calibration button (only in Point 1)
@@ -2452,7 +4024,7 @@ void checkTouch() {
           touchY >= BUTTON_CALIB_SKIP_Y && touchY <= BUTTON_CALIB_SKIP_Y + BUTTON_CALIB_SKIP_H) {
         calibMode = CALIB_SKIP_WARNING;
         screenDirty = true;
-        Serial.println("Show skip SG calibration warning");
+        LOG_VERBOSELN("Show skip SG calibration warning");
       }
       
       // Skip confirmation buttons
@@ -2469,7 +4041,7 @@ void checkTouch() {
           esp_err_t result;
           if (floatMacKnown) {
             result = esp_now_send(floatMac, (uint8_t*)&exitCmd, sizeof(exitCmd));
-            Serial.printf("Sent exit calibration command to float: %d\n", result);
+            LOG_VERBOSE("Sent exit calibration command to float: %d\n", result);
           }
           
           // Save offset only and exit to Live View
@@ -2479,7 +4051,7 @@ void checkTouch() {
           stopWait(); // Stop any active wait
           screenDirty = true;
           staticElementsDrawn = false; // Force complete redraw to clear artifacts
-          Serial.println("SKIP SG CALIBRATION - saved offset only, returned to Live View");
+          LOG_INFOLN("SKIP SG CALIBRATION - saved offset only, returned to Live View");
         }
         
         // No button - continue with SG calibration
@@ -2487,7 +4059,7 @@ void checkTouch() {
             touchY >= BUTTON_CALIB_SKIP_NO_Y && touchY <= BUTTON_CALIB_SKIP_NO_Y + BUTTON_CALIB_SKIP_NO_H) {
           calibMode = CALIB_POINT1;
           screenDirty = true;
-          Serial.println("Continue with SG calibration");
+          LOG_VERBOSELN("Continue with SG calibration");
         }
       }
       
@@ -2497,7 +4069,7 @@ void checkTouch() {
           touchY >= BUTTON_CALIB_RECORD_Y && touchY <= BUTTON_CALIB_RECORD_Y + BUTTON_CALIB_RECORD_H) {
         sendCalibrationCommand(0, 1.000);
         startWait(2000); // 2 second wait for RECORD
-        Serial.println("RECORD Point 1 - started 2s wait");
+        LOG_VERBOSELN("RECORD Point 1 - started 2s wait");
       }
       
       if (calibMode == CALIB_POINT2 &&
@@ -2505,7 +4077,7 @@ void checkTouch() {
           touchY >= BUTTON_CALIB_RECORD_Y && touchY <= BUTTON_CALIB_RECORD_Y + BUTTON_CALIB_RECORD_H) {
         sendCalibrationCommand(1, 1.040);
         startWait(2000); // 2 second wait for RECORD
-        Serial.println("RECORD Point 2 - started 2s wait");
+        LOG_VERBOSELN("RECORD Point 2 - started 2s wait");
       }
       
       if (calibMode == CALIB_POINT3 &&
@@ -2513,7 +4085,7 @@ void checkTouch() {
           touchY >= BUTTON_CALIB_RECORD_Y && touchY <= BUTTON_CALIB_RECORD_Y + BUTTON_CALIB_RECORD_H) {
         sendCalibrationCommand(2, 1.080);
         startWait(2000); // 2 second wait for RECORD
-        Serial.println("RECORD Point 3 - started 2s wait");
+        LOG_VERBOSELN("RECORD Point 3 - started 2s wait");
       }
       
       if (calibMode == CALIB_POINT4 &&
@@ -2521,7 +4093,7 @@ void checkTouch() {
           touchY >= BUTTON_CALIB_RECORD_Y && touchY <= BUTTON_CALIB_RECORD_Y + BUTTON_CALIB_RECORD_H) {
         sendCalibrationCommand(3, 1.120);
         startWait(2000); // 2 second wait for RECORD
-        Serial.println("RECORD Point 4 - started 2s wait");
+        LOG_VERBOSELN("RECORD Point 4 - started 2s wait");
       }
       
       // Apply button - new workflow with 3s wait and failure handling
@@ -2532,7 +4104,7 @@ void checkTouch() {
         applyCalibration();
         startWait(3000); // 3 second wait for APPLY
         screenDirty = true;
-        Serial.println("APPLY - started 3s wait for confirmation");
+        LOG_VERBOSELN("APPLY - started 3s wait for confirmation");
       }
       
       // Exit button - only available in Step 1/5 (CALIB_OFFSET)
@@ -2548,7 +4120,7 @@ void checkTouch() {
         esp_err_t result;
         if (floatMacKnown) {
           result = esp_now_send(floatMac, (uint8_t*)&exitCmd, sizeof(exitCmd));
-          Serial.printf("Sent exit calibration command to float: %d\n", result);
+          LOG_VERBOSE("Sent exit calibration command to float: %d\n", result);
         }
         
         currentMode = LIVE_VIEW;
@@ -2559,8 +4131,8 @@ void checkTouch() {
         for (int i = 0; i < 4; i++) calibAngles[i] = 0.0;
         screenDirty = true;
         staticElementsDrawn = false; // Force complete redraw to clear artifacts
-        Serial.println("EXIT calibration - returned to Live view");
-        Serial.println("Exited calibration mode");
+        LOG_INFOLN("EXIT calibration - returned to Live view");
+        LOG_INFOLN("Exited calibration mode");
       }
     }
     
@@ -2583,13 +4155,13 @@ void sendCalibrationCommand(uint8_t command, float target_sg) {
     if (floatMacKnown) {
       result = esp_now_send(floatMac, (uint8_t*)&calibCmd, sizeof(calibCmd));
       if (retry == 0) {
-        Serial.printf("Sent calibration command %d directly to float (MAC: %02X:%02X:%02X:%02X:%02X:%02X)\n", 
+        LOG_VERBOSE("Sent calibration command %d directly to float (MAC: %02X:%02X:%02X:%02X:%02X:%02X)\n", 
                       command, floatMac[0], floatMac[1], floatMac[2], floatMac[3], floatMac[4], floatMac[5]);
       }
     } else {
       result = esp_now_send(NULL, (uint8_t*)&calibCmd, sizeof(calibCmd));
       if (retry == 0) {
-        Serial.printf("Sent calibration command %d via broadcast (float MAC unknown)\n", command);
+        LOG_VERBOSE("Sent calibration command %d via broadcast (float MAC unknown)\n", command);
       }
     }
     
@@ -2597,10 +4169,10 @@ void sendCalibrationCommand(uint8_t command, float target_sg) {
       break; // Success, no need to retry
     } else {
       if (retry < maxRetries - 1) {
-        Serial.printf("Calibration command send failed (attempt %d/%d): %d\n", retry + 1, maxRetries, result);
+        LOG_ERROR("Calibration command send failed (attempt %d/%d): %d\n", retry + 1, maxRetries, result);
         delay(100); // Wait before retry
       } else {
-        Serial.printf("Failed to send calibration command after %d attempts: %d\n", maxRetries, result);
+        LOG_ERROR("Failed to send calibration command after %d attempts: %d\n", maxRetries, result);
       }
     }
   }
@@ -2617,15 +4189,15 @@ void applyCalibration() {
   esp_err_t result;
   if (floatMacKnown) {
     result = esp_now_send(floatMac, (uint8_t*)&calibCmd, sizeof(calibCmd));
-    Serial.printf("Sent apply calibration command directly to float (MAC: %02X:%02X:%02X:%02X:%02X:%02X)\n", 
+    LOG_VERBOSE("Sent apply calibration command directly to float (MAC: %02X:%02X:%02X:%02X:%02X:%02X)\n", 
                   floatMac[0], floatMac[1], floatMac[2], floatMac[3], floatMac[4], floatMac[5]);
   } else {
     result = esp_now_send(NULL, (uint8_t*)&calibCmd, sizeof(calibCmd));
-    Serial.println("Sent apply calibration command via broadcast (float MAC unknown)");
+    LOG_VERBOSELN("Sent apply calibration command via broadcast (float MAC unknown)");
   }
   
   if (result != ESP_OK) {
-    Serial.printf("Error sending apply calibration command: %d\n", result);
+    LOG_ERROR("Error sending apply calibration command: %d\n", result);
   }
 }
 
@@ -2633,7 +4205,7 @@ void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int 
   // Flood protection: Check rate limiting
   unsigned long currentTime = millis();
   if (currentTime - lastCalibrationResponse < CALIBRATION_RESPONSE_RATE_LIMIT) {
-    Serial.printf("Calibration response rate limited (dropped)\n");
+    LOG_VERBOSE("Calibration response rate limited (dropped)\n");
     return;
   }
   
@@ -2650,37 +4222,37 @@ void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int 
   
   // Block if too many responses in one minute
   if (calibrationResponseCount > MAX_CALIBRATION_RESPONSES_PER_MINUTE) {
-    Serial.printf("Calibration response flood detected - blocking responses\n");
+    LOG_ERROR("Calibration response flood detected - blocking responses\n");
     return;
   }
   
   // Handle calibration response from float unit
   if (len != sizeof(calib_response_t)) {
-    Serial.printf("Invalid calibration response size: %d bytes (expected %d)\n", len, sizeof(calib_response_t));
+    LOG_ERROR("Invalid calibration response size: %d bytes (expected %d)\n", len, sizeof(calib_response_t));
     return;
   }
   
   calib_response_t calibResp;
   memcpy(&calibResp, incomingData, len);
   
-  Serial.printf("Calibration response: angle=%.2f°, sg=%.3f, request_id=%d\n", 
+  LOG_VERBOSE("Calibration response: angle=%.2f°, sg=%.3f, request_id=%d\n", 
                 calibResp.angle, calibResp.sg, calibResp.request_id);
   
   if (calibResp.response_type == 0) {
     // Simplified response handling for new workflow
     // Handle offset calibration response (request_id=5)
     if (calibResp.request_id == 5 && calibMode == CALIB_OFFSET) {
-      Serial.println("Offset calibration completed");
+      LOG_INFOLN("Offset calibration completed");
       stopWait(); // Stop the 2s wait
       calibOffset = calibResp.angle; // Store offset angle
       offsetCalibrated = true;
       calibMode = CALIB_POINT1; // Move to first SG calibration point
       screenDirty = true;
-      Serial.printf("Stored offset angle: %.2f°, moved to Point 1\n", calibOffset);
+      LOG_INFO("Stored offset angle: %.2f°, moved to Point 1\n", calibOffset);
     }
     // Handle apply response (request_id=4) - polynomial calculation complete
     else if (calibResp.request_id == 4 && calibMode == CALIB_APPLYING) {
-      Serial.println("Calibration apply completed - coefficients calculated on float unit");
+      LOG_INFOLN("Calibration apply completed - coefficients calculated on float unit");
       
       stopWait(); // Stop the 3s wait
       calibMode = CALIB_IDLE;
@@ -2688,11 +4260,11 @@ void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int 
       calibrationModeActive = false;
       screenDirty = true;
       staticElementsDrawn = false; // Force full redraw
-      Serial.println("Switched to Live View after calibration completion");
+      LOG_VERBOSELN("Switched to Live View after calibration completion");
     }
     // Handle exit calibration response (request_id=254) - float unit exiting calibration
     else if (calibResp.request_id == 254) {
-      Serial.println("Float unit confirmed exit from calibration mode");
+      LOG_INFOLN("Float unit confirmed exit from calibration mode");
       // Ensure screen is clean if we're already in live view
       if (currentMode == LIVE_VIEW) {
         screenDirty = true;
@@ -2704,22 +4276,22 @@ void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int 
       if (calibResp.sg >= 0.995 && calibResp.sg <= 1.005) {
         // Point 1 - Water (SG=1.000)
         calibAngles[0] = calibResp.angle;
-        Serial.printf("Stored Point 1 angle: %.2f°\n", calibAngles[0]);
+        LOG_INFO("Stored Point 1 angle: %.2f°\n", calibAngles[0]);
         // Note: State advancement is now handled by wait timeout, not response
       } else if (calibResp.sg >= 1.035 && calibResp.sg <= 1.045) {
         // Point 2 - Light Sugar (SG=1.040)
         calibAngles[1] = calibResp.angle;
-        Serial.printf("Stored Point 2 angle: %.2f°\n", calibAngles[1]);
+        LOG_INFO("Stored Point 2 angle: %.2f°\n", calibAngles[1]);
         // Note: State advancement is now handled by wait timeout, not response
       } else if (calibResp.sg >= 1.075 && calibResp.sg <= 1.085) {
         // Point 3 - Medium Sugar (SG=1.080)
         calibAngles[2] = calibResp.angle;
-        Serial.printf("Stored Point 3 angle: %.2f°\n", calibAngles[2]);
+        LOG_INFO("Stored Point 3 angle: %.2f°\n", calibAngles[2]);
         // Note: State advancement is now handled by wait timeout, not response
       } else if (calibResp.sg >= 1.115 && calibResp.sg <= 1.125) {
         // Point 4 - Heavy Sugar (SG=1.120)
         calibAngles[3] = calibResp.angle;
-        Serial.printf("Stored Point 4 angle: %.2f°\n", calibAngles[3]);
+        LOG_INFO("Stored Point 4 angle: %.2f°\n", calibAngles[3]);
         // Note: State advancement is now handled by wait timeout, not response
       }
     }
@@ -2729,7 +4301,7 @@ void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int 
 // Handle calibration commands from float unit (triggers)
 void onCalibrationCoefficients(const uint8_t *mac, const uint8_t *incomingData, int len) {
   if (len != sizeof(calib_coeffs_t)) {
-    Serial.printf("Invalid coefficients packet size: %d bytes (expected %d)\n", len, sizeof(calib_coeffs_t));
+    LOG_ERROR("Invalid coefficients packet size: %d bytes (expected %d)\n", len, sizeof(calib_coeffs_t));
     return;
   }
   
@@ -2749,11 +4321,11 @@ void onCalibrationCoefficients(const uint8_t *mac, const uint8_t *incomingData, 
   // Save to EEPROM for persistence
   saveCalibrationCoefficients();
   
-  Serial.println("Received calibration coefficients from float unit:");
-  Serial.printf("GRAVITY = %.12e * norm(Tilt)^3 + %.12e * norm(Tilt)^2 + %.12e * norm(Tilt) + %.12e\n",
+  LOG_INFOLN("Received calibration coefficients from float unit:");
+  LOG_INFO("GRAVITY = %.12e * norm(Tilt)^3 + %.12e * norm(Tilt)^2 + %.12e * norm(Tilt) + %.12e\n",
                 calibCoeffs.coeff3, calibCoeffs.coeff2, calibCoeffs.coeff1, calibCoeffs.coeff0);
-  Serial.printf("Normalization: norm(Tilt) = (Tilt - %.2f) / %.2f\n", normOffset, normScale);
-  Serial.println("Coefficients saved to EEPROM for polynomial graph");
+  LOG_INFO("Normalization: norm(Tilt) = (Tilt - %.2f) / %.2f\n", normOffset, normScale);
+  LOG_INFOLN("Coefficients saved to EEPROM for polynomial graph");
   
   // Test polynomial behavior to detect non-monotonic issues
   testPolynomialRange();
@@ -2761,25 +4333,25 @@ void onCalibrationCoefficients(const uint8_t *mac, const uint8_t *incomingData, 
 
 void onCalibrationCommandFromFloat(const uint8_t *mac, const uint8_t *incomingData, int len) {
   if (len != sizeof(calib_command_t)) {
-    Serial.printf("Invalid calibration command size from float: %d bytes (expected %d)\n", len, sizeof(calib_command_t));
+    LOG_ERROR("Invalid calibration command size from float: %d bytes (expected %d)\n", len, sizeof(calib_command_t));
     return;
   }
   
   calib_command_t cmd;
   memcpy(&cmd, incomingData, len);
   
-  Serial.printf("Received calibration command from float: %d, target_sg=%.3f, request_id=%d\n", 
+  LOG_VERBOSE("Received calibration command from float: %d, target_sg=%.3f, request_id=%d\n", 
                 cmd.command, cmd.target_sg, cmd.request_id);
   
   if (cmd.command == 6 && cmd.request_id == 255) {
     // CALIBRATION_TRIGGER - float entered calibration mode
-    Serial.println("Float entered calibration mode - starting calibration sequence");
+    LOG_INFOLN("Float entered calibration mode - starting calibration sequence");
     
     // Capture float MAC if not known yet (trigger might come before data)
     if (!floatMacKnown) {
       memcpy(floatMac, mac, 6);
       floatMacKnown = true;
-      Serial.printf("Float MAC captured from trigger: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+      LOG_INFO("Float MAC captured from trigger: %02X:%02X:%02X:%02X:%02X:%02X\n", 
                     floatMac[0], floatMac[1], floatMac[2], floatMac[3], floatMac[4], floatMac[5]);
       
       // Save to EEPROM for permanent pairing
@@ -2794,11 +4366,11 @@ void onCalibrationCommandFromFloat(const uint8_t *mac, const uint8_t *incomingDa
       
       esp_err_t addResult = esp_now_add_peer(&peerInfo);
       if (addResult == ESP_OK) {
-        Serial.println("Float unit registered as ESP-NOW peer (from trigger)");
+        LOG_INFOLN("Float unit registered as ESP-NOW peer (from trigger)");
       } else if (addResult == ESP_ERR_ESPNOW_EXIST) {
-        Serial.println("Float unit already registered as peer");
+        LOG_INFOLN("Float unit already registered as peer");
       } else {
-        Serial.printf("Failed to register float as peer: %d\n", addResult);
+        LOG_ERROR("Failed to register float as peer: %d\n", addResult);
       }
     }
     
@@ -2811,34 +4383,47 @@ void onCalibrationCommandFromFloat(const uint8_t *mac, const uint8_t *incomingDa
   }
 }
 
-void initSDCard() {
-  #if SD_ENABLED
-    Serial.println("Initializing SD card (shares SPI with TFT)...");
-    
-    // SD shares SPI with TFT - TFT_eSPI already initialized SPI
-    // Just set SD_CS high initially to prevent conflicts
-    pinMode(SD_CS, OUTPUT);
-    digitalWrite(SD_CS, HIGH);
-    
-    if (!SD.begin(SD_CS)) {
-      Serial.println("SD card initialization failed!");
-      tft.setTextColor(currentTheme->error);
-      tft.setFreeFont(FONT_SIZE_SM);
-      tft.setCursor(10, 104);  // Adjust for FreeFont baseline
-      tft.println("SD Card Failed!");
-      return;
+bool parseCSVDataLine(const char* line, payload_t* data, uint32_t* epoch_s, uint8_t* battery_percent) {
+  char timestampText[24] = {0};
+  unsigned long parsedEpoch = 0;
+  unsigned long parsedUptime = 0;
+  memset(data, 0, sizeof(payload_t));
+  *epoch_s = 0;
+  *battery_percent = 0;
+  
+  int parsed = sscanf(line, "%23[^,],%lu,%lu,%f,%f,%f,%f,%hhu",
+                      timestampText,
+                      &parsedEpoch,
+                      &parsedUptime,
+                      &data->angle,
+                      &data->density,
+                      &data->temperature,
+                      &data->battery_voltage,
+                      battery_percent);
+  
+  if (parsed == 8) {
+    *epoch_s = (uint32_t)parsedEpoch;
+    data->uptime_s = (uint32_t)parsedUptime;
+    if (!isEpochValid(*epoch_s)) {
+      *epoch_s = parseDateTimeToEpoch(timestampText);
     }
-    
-    Serial.println("SD card initialized successfully");
-    
-    // Check if fermentation directory exists
-    if (!SD.exists("/fermentation")) {
-      SD.mkdir("/fermentation");
-      Serial.println("Created fermentation directory");
-    }
-  #else
-    Serial.println("SD card support compiled out (SD_ENABLED=false)");
-  #endif
+    return true;
+  }
+  
+  parsed = sscanf(line, "%lu,%f,%f,%f,%f,%hhu",
+                  &parsedUptime,
+                  &data->angle,
+                  &data->density,
+                  &data->temperature,
+                  &data->battery_voltage,
+                  battery_percent);
+  
+  if (parsed == 6) {
+    data->uptime_s = (uint32_t)parsedUptime;
+    return true;
+  }
+  
+  return false;
 }
 
 bool loadHistoricalDataFromCSV(const char* filename, 
@@ -2851,16 +4436,17 @@ bool loadHistoricalDataFromCSV(const char* filename,
   
   File file = SD.open(filename, FILE_READ);
   if (!file) {
-    Serial.printf("Failed to open CSV file for reading: %s\n", filename);
+    LOG_VERBOSE("Historical CSV not readable yet: %s\n", filename);
     return false;
   }
   
-  Serial.printf("Loading historical data from: %s (mode=%d, maxPoints=%d, step=%d)\n", 
+  LOG_VERBOSE("Loading historical data from: %s (mode=%d, maxPoints=%d, step=%d)\n", 
                 filename, mode, maxPoints, samplingStep);
   
   // First pass: count total data lines
   int totalDataLines = 0;
-  char line[128];
+  uint32_t newestEpoch = 0;
+  char line[160];
   
   file.seek(0);
   
@@ -2875,32 +4461,53 @@ bool loadHistoricalDataFromCSV(const char* filename,
     
     if (strlen(line) > 0) {
       totalDataLines++;
+      payload_t data = {0};
+      uint32_t epoch_s = 0;
+      uint8_t battery_percent = 0;
+      if (parseCSVDataLine(line, &data, &epoch_s, &battery_percent) && isEpochValid(epoch_s)) {
+        newestEpoch = epoch_s;
+      }
     }
   }
   
-  Serial.printf("Found %d total data lines in CSV\n", totalDataLines);
+  LOG_VERBOSE("Found %d total data lines in CSV\n", totalDataLines);
   totalCSVDataLines = totalDataLines;
   
   // Calculate loading parameters based on mode using data point count (600s interval)
   int linesToSkip = 0;
   int linesToLoad = maxPoints;
   int actualSamplingStep = samplingStep;
+  uint32_t cutoffEpoch = 0;
   
   switch (mode) {
     case LOAD_6H:
-      // Load last 6 hours (6 hours * 3600s / 600s = 36 points)
+      if (isEpochValid(newestEpoch)) {
+        cutoffEpoch = newestEpoch - 6UL * 3600UL;
+        linesToLoad = totalDataLines;
+        linesToSkip = 0;
+        LOG_VERBOSE("LOAD_6H: Loading points since RTC epoch %lu\n", (unsigned long)cutoffEpoch);
+        break;
+      }
+      // Fallback for old files without RTC timestamps (10 minute interval)
       linesToLoad = min(36, totalDataLines);
       linesToSkip = max(0, totalDataLines - linesToLoad);
       actualSamplingStep = 1;
-      Serial.printf("LOAD_6H: Loading last %d points (6 hours at 600s interval)\n", linesToLoad);
+      LOG_VERBOSE("LOAD_6H: Loading last %d points (6 hours at 600s interval)\n", linesToLoad);
       break;
       
     case LOAD_24H:
-      // Load last 24 hours (24 hours * 3600s / 600s = 144 points)
+      if (isEpochValid(newestEpoch)) {
+        cutoffEpoch = newestEpoch - 24UL * 3600UL;
+        linesToLoad = totalDataLines;
+        linesToSkip = 0;
+        LOG_VERBOSE("LOAD_24H: Loading points since RTC epoch %lu\n", (unsigned long)cutoffEpoch);
+        break;
+      }
+      // Fallback for old files without RTC timestamps (10 minute interval)
       linesToLoad = min(144, totalDataLines);
       linesToSkip = max(0, totalDataLines - linesToLoad);
       actualSamplingStep = 1;
-      Serial.printf("LOAD_24H: Loading last %d points (24 hours at 600s interval)\n", linesToLoad);
+      LOG_VERBOSE("LOAD_24H: Loading last %d points (24 hours at 600s interval)\n", linesToLoad);
       break;
       
     case LOAD_ALL:
@@ -2908,20 +4515,23 @@ bool loadHistoricalDataFromCSV(const char* filename,
       linesToSkip = 0;
       actualSamplingStep = max(1, totalDataLines / maxPoints);
       linesToLoad = totalDataLines;
-      Serial.printf("LOAD_ALL: Loading all %d points with step=%d\n", linesToLoad, actualSamplingStep);
+      LOG_VERBOSE("LOAD_ALL: Loading all %d points with step=%d\n", linesToLoad, actualSamplingStep);
       break;
   }
   
   // Reset display data buffer
-  displayDataIndex = 0;
-  displayDataCount = 0;
+  clearHistoricalDisplayData();
+  totalCSVDataLines = totalDataLines;
   
   // Second pass: load data with line skipping and sampling
   file.seek(0);
   int lineNum = 0;
   int loadedCount = 0;
   int skippedCount = 0;
+  int timeFilteredCount = 0;
+  int parseErrorCount = 0;
   int sampleCounter = 0;
+  uint32_t batchStartEpoch = brewProfileLoaded ? activeBrewProfile.createdAt : 0;
   
   while (file.available() && loadedCount < linesToLoad) {
     int bytesRead = file.readBytesUntil('\n', line, sizeof(line) - 1);
@@ -2946,23 +4556,23 @@ bool loadHistoricalDataFromCSV(const char* filename,
     }
     sampleCounter++;
     
-    // Parse CSV line: uptime_s,angle,density,temperature,battery_voltage,battery_percent
     payload_t data = {0};
+    uint32_t epoch_s = 0;
     uint8_t battery_percent = 0;
-    int parsed = sscanf(line, "%lu,%f,%f,%f,%f,%hhu",
-                       &data.uptime_s,
-                       &data.angle,
-                       &data.density,
-                       &data.temperature,
-                       &data.battery_voltage,
-                       &battery_percent);
+    bool parsed = parseCSVDataLine(line, &data, &epoch_s, &battery_percent);
     
-    if (parsed == 6) {
-      displayDataBuffer[displayDataIndex] = data;
-      displayDataIndex = (displayDataIndex + 1) % MAX_DATA_POINTS;
-      if (displayDataCount < MAX_DATA_POINTS) {
-        displayDataCount++;
+    if (parsed) {
+      if (isEpochValid(batchStartEpoch) && isEpochValid(epoch_s) && epoch_s < batchStartEpoch) {
+        timeFilteredCount++;
+        continue;
       }
+
+      if (isEpochValid(cutoffEpoch) && (!isEpochValid(epoch_s) || epoch_s < cutoffEpoch)) {
+        timeFilteredCount++;
+        continue;
+      }
+      
+      addDataPoint(data, epoch_s);
       loadedCount++;
       
       uint8_t battPercent = calculateBatteryPercentage(data.battery_voltage);
@@ -2970,21 +4580,28 @@ bool loadHistoricalDataFromCSV(const char* filename,
       if (!ogCaptured && data.density > 1.000) {
         originalGravity = data.density;
         ogCaptured = true;
-        Serial.printf("Loaded OG from CSV: %.4f\n", originalGravity);
+        LOG_INFO("Loaded OG from CSV: %.4f\n", originalGravity);
       }
       
       if (loadedCount <= 3 || loadedCount > linesToLoad - 3) {
-        Serial.printf("Loaded point %d: SG=%.4f, Temp=%.1f°C, Batt=%.2fV (%d%%)\n",
+        LOG_VERBOSE("Loaded point %d: SG=%.4f, Temp=%.1f°C, Batt=%.2fV (%d%%)\n",
                      loadedCount, data.density, data.temperature, data.battery_voltage, battPercent);
       }
     } else if (strlen(line) > 0) {
-      Serial.printf("Warning: Failed to parse line %d: %s\n", lineNum, line);
+      parseErrorCount++;
+      LOG_VERBOSE("Warning: Failed to parse line %d: %s\n", lineNum, line);
     }
   }
   
   file.close();
   
-  Serial.printf("Loaded %d data points from CSV\n", loadedCount);
+  lastHistoricalLoadedLines = loadedCount;
+  lastHistoricalSkippedLines = timeFilteredCount;
+  lastHistoricalParseErrors = parseErrorCount;
+  LOG_VERBOSE("Loaded %d data points from CSV\n", loadedCount);
+  LOG_INFO("CSV history: loaded=%d total=%d skipped=%d parseErrors=%d\n",
+           loadedCount, totalDataLines, timeFilteredCount, parseErrorCount);
+  finalizeHistoricalDataLoad();
   
   // Initialize charging state based on historical data
   if (loadedCount >= 2) {
@@ -2995,44 +4612,374 @@ bool loadHistoricalDataFromCSV(const char* filename,
     
     if (voltageChange > 0.02) {
       chargingState = CHARGING;
-      Serial.printf("Initial charging state: CHARGING (voltage increased by %.3fV)\n", voltageChange);
+      LOG_VERBOSE("Initial charging state: CHARGING (voltage increased by %.3fV)\n", voltageChange);
     } else if (voltageChange < -0.02) {
       chargingState = DISCHARGING;
-      Serial.printf("Initial charging state: DISCHARGING (voltage decreased by %.3fV)\n", voltageChange);
+      LOG_VERBOSE("Initial charging state: DISCHARGING (voltage decreased by %.3fV)\n", voltageChange);
     } else {
       chargingState = DISCHARGING;
-      Serial.printf("Initial charging state: DISCHARGING (voltage stable, change: %.3fV)\n", voltageChange);
+      LOG_VERBOSE("Initial charging state: DISCHARGING (voltage stable, change: %.3fV)\n", voltageChange);
     }
     
     lastBatteryVoltage = lastReading.battery_voltage;
     lastBatteryCheck = millis();
   } else {
-    Serial.println("Not enough data to determine initial charging state");
+    LOG_VERBOSELN("Not enough data to determine initial charging state");
   }
   
   return loadedCount > 0;
 }
 
+void formatDurationShort(unsigned long seconds, char* buffer, size_t bufferSize) {
+  if (seconds == 0) {
+    snprintf(buffer, bufferSize, "now");
+    return;
+  }
+  unsigned long days = seconds / 86400UL;
+  unsigned long hours = (seconds % 86400UL) / 3600UL;
+  if (days > 0) snprintf(buffer, bufferSize, "%lud %luh", days, hours);
+  else snprintf(buffer, bufferSize, "%luh", hours);
+}
+
+void startNewBatchStorage(const char* batchId) {
+  char logPath[80];
+  BrewProfileStore::logPath(batchId, logPath, sizeof(logPath));
+  strncpy(currentFermentationFile, logPath, sizeof(currentFermentationFile) - 1);
+  currentFermentationFile[sizeof(currentFermentationFile) - 1] = '\0';
+  fermentationFileOpen = true;
+}
+
+bool ensureFermentationLogFile(const char* batchId) {
+  #if !SD_ENABLED
+    return false;
+  #endif
+
+  char logPath[80];
+  BrewProfileStore::logPath(batchId, logPath, sizeof(logPath));
+  if (SD.exists(logPath)) {
+    File existing = SD.open(logPath, FILE_READ);
+    if (existing && !existing.isDirectory()) {
+      existing.close();
+      return true;
+    }
+    if (existing) existing.close();
+    LOG_ERROR("Batch log exists but is not readable as a file: %s\n", logPath);
+    return false;
+  }
+
+  BrewProfileStore::ensureBatchDirectory(batchId);
+  File file = SD.open(logPath, FILE_WRITE);
+  if (!file) {
+    LOG_ERROR("Failed to create batch log file: %s\n", logPath);
+    return false;
+  }
+
+  file.println("timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code");
+  file.flush();
+  file.close();
+  LOG_INFO("Created missing batch log file: %s\n", logPath);
+  return true;
+}
+
+void persistActiveBrewProfile() {
+  #if !SD_ENABLED
+    return;
+  #endif
+
+  if (!brewProfileLoaded) return;
+  if (mountSDTemporarily()) {
+    activeBrewProfile.expectedFinalGravity = DerivedCalculations::expectedFG(
+      activeBrewProfile.effectiveOG,
+      activeBrewProfile.expectedApparentAttenuation);
+    activeBrewProfile.estimatedABV = fermentationMetrics.estimatedABV;
+    BrewProfileStore::save(activeBrewProfile);
+    dismountSD();
+  }
+}
+
+void beginBrewWizard() {
+  BrewProfileStore::setDefaults(&activeBrewProfile);
+  bool wizardInitialized = false;
+  if (mountSDTemporarily()) {
+    if (!SD.exists("/data")) SD.mkdir("/data");
+    if (!SD.exists("/data/batches")) SD.mkdir("/data/batches");
+    int number = 1;
+    char batchId[24];
+    char profilePath[80];
+    char logPath[80];
+    char batchDir[64];
+    do {
+      BrewProfileStore::buildBatchId(number++, batchId, sizeof(batchId));
+      BrewProfileStore::profilePath(batchId, profilePath, sizeof(profilePath));
+      BrewProfileStore::logPath(batchId, logPath, sizeof(logPath));
+      snprintf(batchDir, sizeof(batchDir), "/data/batches/%s", batchId);
+    } while (SD.exists(profilePath) || SD.exists(logPath) || SD.exists(batchDir));
+    strncpy(activeBrewProfile.batchId, batchId, sizeof(activeBrewProfile.batchId) - 1);
+    activeBrewProfile.batchId[sizeof(activeBrewProfile.batchId) - 1] = '\0';
+    activeBrewProfile.createdAt = getCurrentEpoch();
+    brewWizard.begin(&activeBrewProfile);
+    wizardInitialized = true;
+    dismountSD();
+  }
+  if (!wizardInitialized) {
+    activeBrewProfile.createdAt = getCurrentEpoch();
+    brewWizard.begin(&activeBrewProfile);
+  }
+  currentMode = BREW_WIZARD_VIEW;
+  screenDirty = true;
+}
+
+void completeBrewWizard() {
+  activeBrewProfile.recipeOG = BrixConverter::brixToSG(activeBrewProfile.recipeBrix);
+  activeBrewProfile.effectiveOG = activeBrewProfile.recipeOG;
+  activeBrewProfile.expectedFinalGravity = DerivedCalculations::expectedFG(
+    activeBrewProfile.effectiveOG,
+    activeBrewProfile.expectedApparentAttenuation);
+  activeBrewProfile.estimatedABV = 0.0f;
+  activeBrewProfile.ogVerified = false;
+  activeBrewProfile.ogNeedsChoice = false;
+  brewProfileLoaded = true;
+  ogVerificationPending = false;
+  targetCurveAvailable = false;
+  yeastPerformanceSaved = false;
+  ogVerifier.reset();
+  fermentationStateMachine.reset();
+  previousAnalyticsSG = 0.0f;
+  previousAnalyticsEpoch = 0;
+  originalGravity = activeBrewProfile.effectiveOG;
+  currentABV = 0.0f;
+  ogCaptured = true;
+
+  if (mountSDTemporarily()) {
+    BrewProfileStore::ensureBatchDirectory(activeBrewProfile.batchId);
+    BrewProfileStore::save(activeBrewProfile);
+    BrewProfileStore::saveYeastHistory(activeBrewProfile.yeastName);
+    TargetCurveGenerator::generateAndSave(activeBrewProfile);
+    targetCurveAvailable = true;
+
+    char logPath[80];
+    BrewProfileStore::logPath(activeBrewProfile.batchId, logPath, sizeof(logPath));
+    if (SD.exists(logPath)) {
+      SD.remove(logPath);
+    }
+    File file = SD.open(logPath, FILE_WRITE);
+    if (file) {
+      file.println("timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code");
+      file.close();
+    }
+    startNewBatchStorage(activeBrewProfile.batchId);
+    dismountSD();
+  }
+
+  clearHistoricalDisplayData();
+  refreshFermentationAssistantFromProfile();
+  currentMode = LIVE_VIEW;
+  staticElementsDrawn = false;
+  screenDirty = true;
+}
+
+void handleOGChoice(bool useMeasuredOG) {
+  if (!brewProfileLoaded) return;
+  if (useMeasuredOG) activeBrewProfile.effectiveOG = activeBrewProfile.measuredOG;
+  else activeBrewProfile.effectiveOG = activeBrewProfile.recipeOG;
+
+  activeBrewProfile.ogVerified = true;
+  activeBrewProfile.ogNeedsChoice = false;
+  ogVerificationPending = false;
+  ogVerifier.reset();
+  originalGravity = activeBrewProfile.effectiveOG;
+  activeBrewProfile.expectedFinalGravity = DerivedCalculations::expectedFG(
+    activeBrewProfile.effectiveOG,
+    activeBrewProfile.expectedApparentAttenuation);
+
+  if (mountSDTemporarily()) {
+    BrewProfileStore::save(activeBrewProfile);
+    TargetCurveGenerator::generateAndSave(activeBrewProfile);
+    dismountSD();
+  }
+  refreshFermentationAssistantFromProfile();
+  currentMode = LIVE_VIEW;
+  staticElementsDrawn = false;
+  screenDirty = true;
+}
+
+void saveYeastPerformanceSummary(float finalGravity, uint32_t completedAt) {
+  if (!brewProfileLoaded || yeastPerformanceSaved) return;
+
+  YeastPerformanceSummary summary;
+  memset(&summary, 0, sizeof(summary));
+  strncpy(summary.yeastPresetId, activeBrewProfile.selectedYeastPresetId, sizeof(summary.yeastPresetId) - 1);
+  strncpy(summary.yeastName, activeBrewProfile.yeastName, sizeof(summary.yeastName) - 1);
+  strncpy(summary.batchId, activeBrewProfile.batchId, sizeof(summary.batchId) - 1);
+  summary.effectiveOG = activeBrewProfile.effectiveOG;
+  summary.finalGravity = finalGravity;
+  summary.actualAttenuation = fermentationMetrics.currentAttenuation;
+  summary.completedAt = completedAt;
+  if (isEpochValid(completedAt) && isEpochValid(activeBrewProfile.createdAt) && completedAt > activeBrewProfile.createdAt) {
+    summary.fermentationDurationHours = (completedAt - activeBrewProfile.createdAt) / 3600.0f;
+  }
+
+  float tempSum = 0.0f;
+  int tempCount = 0;
+  for (int i = 0; i < displayDataCount; i++) {
+    int idx = (displayDataIndex - displayDataCount + i + MAX_DATA_POINTS) % MAX_DATA_POINTS;
+    tempSum += displayDataBuffer[idx].temperature;
+    tempCount++;
+  }
+  summary.averageTemperature = tempCount > 0 ? tempSum / tempCount : 0.0f;
+
+  if (mountSDTemporarily()) {
+    yeastPerformanceSaved = BrewProfileStore::appendYeastPerformance(summary);
+    dismountSD();
+  }
+}
+
+void updateFermentationAssistant(payload_t data, uint32_t epoch_s) {
+  if (!brewProfileLoaded) return;
+
+  if (!activeBrewProfile.ogVerified && !activeBrewProfile.ogNeedsChoice) {
+    OGVerificationResult result = ogVerifier.addReading(data.density);
+    if (result.ready) {
+      activeBrewProfile.measuredOG = result.measuredOG;
+      activeBrewProfile.ogDifference = activeBrewProfile.measuredOG - activeBrewProfile.recipeOG;
+      if (OGVerifier::exceedsThreshold(activeBrewProfile.ogDifference)) {
+        activeBrewProfile.ogNeedsChoice = true;
+        ogVerificationPending = true;
+        currentMode = OG_VERIFICATION_VIEW;
+        screenDirty = true;
+      } else {
+        activeBrewProfile.effectiveOG = activeBrewProfile.recipeOG;
+        activeBrewProfile.ogVerified = true;
+      }
+      persistActiveBrewProfile();
+    }
+  }
+
+  unsigned long deltaSeconds = previousAnalyticsEpoch > 0 && epoch_s > previousAnalyticsEpoch
+    ? epoch_s - previousAnalyticsEpoch
+    : 600UL;
+  float previousSG = previousAnalyticsSG > 0.0f ? previousAnalyticsSG : data.density;
+  fermentationMetrics = DerivedCalculations::compute(
+    activeBrewProfile.effectiveOG,
+    data.density,
+    previousSG,
+    deltaSeconds,
+    activeBrewProfile.expectedApparentAttenuation);
+
+  activeBrewProfile.expectedFinalGravity = fermentationMetrics.expectedFinalGravity;
+  activeBrewProfile.estimatedABV = fermentationMetrics.estimatedABV;
+  currentABV = fermentationMetrics.estimatedABV;
+  originalGravity = activeBrewProfile.effectiveOG;
+  ogCaptured = activeBrewProfile.effectiveOG > 1.0f;
+
+  FermentationPhase phase = fermentationStateMachine.update(
+    activeBrewProfile,
+    data.density,
+    fermentationMetrics.expectedFinalGravity,
+    fermentationMetrics.currentAttenuation,
+    fermentationMetrics.gravityDeltaPerHour,
+    data.temperature,
+    epoch_s);
+
+  unsigned long elapsedSeconds = 0;
+  if (isEpochValid(epoch_s) && isEpochValid(activeBrewProfile.createdAt) && epoch_s > activeBrewProfile.createdAt) {
+    elapsedSeconds = epoch_s - activeBrewProfile.createdAt;
+  }
+
+  currentRecommendation = RecommendationEngine::build(
+    activeBrewProfile,
+    phase,
+    activeBrewProfile.ogVerified,
+    activeBrewProfile.ogNeedsChoice,
+    fermentationMetrics.currentAttenuation,
+    fermentationMetrics.expectedFinalGravity,
+    data.density,
+    data.temperature,
+    fermentationMetrics.gravityDeltaPerHour,
+    elapsedSeconds);
+  currentETA = ETAPredictor::predict(activeBrewProfile, data.density, fermentationMetrics.expectedFinalGravity,
+                                     fermentationMetrics.gravityDeltaPerHour, elapsedSeconds);
+
+  if (!yeastPerformanceSaved &&
+      (phase == FERMENTATION_READY_TO_PACKAGE || phase == FERMENTATION_COMPLETED)) {
+    saveYeastPerformanceSummary(data.density, epoch_s);
+  }
+
+  previousAnalyticsSG = data.density;
+  previousAnalyticsEpoch = epoch_s;
+}
+
+void refreshFermentationAssistantFromProfile() {
+  if (!brewProfileLoaded) return;
+
+  activeBrewProfile.expectedFinalGravity = DerivedCalculations::expectedFG(
+    activeBrewProfile.effectiveOG,
+    activeBrewProfile.expectedApparentAttenuation);
+
+  if (displayDataCount > 0) {
+    int latestIndex = (displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS;
+    updateFermentationAssistant(displayDataBuffer[latestIndex], displayTimestampBuffer[latestIndex]);
+    return;
+  }
+
+  fermentationMetrics.expectedFinalGravity = activeBrewProfile.expectedFinalGravity;
+  fermentationMetrics.currentAttenuation = 0.0f;
+  fermentationMetrics.estimatedABV = activeBrewProfile.estimatedABV;
+  fermentationMetrics.gravityDeltaPerHour = 0.0f;
+  fermentationMetrics.fermentationRate = 0.0f;
+
+  unsigned long elapsedSeconds = 0;
+  uint32_t nowEpoch = getCurrentEpoch();
+  if (isEpochValid(nowEpoch) && isEpochValid(activeBrewProfile.createdAt) && nowEpoch > activeBrewProfile.createdAt) {
+    elapsedSeconds = nowEpoch - activeBrewProfile.createdAt;
+  }
+
+  FermentationPhase phase = fermentationStateMachine.update(
+    activeBrewProfile,
+    activeBrewProfile.effectiveOG,
+    activeBrewProfile.expectedFinalGravity,
+    0.0f,
+    0.0f,
+    0.0f,
+    nowEpoch);
+
+  currentRecommendation = RecommendationEngine::build(
+    activeBrewProfile,
+    phase,
+    activeBrewProfile.ogVerified,
+    activeBrewProfile.ogNeedsChoice,
+    0.0f,
+    activeBrewProfile.expectedFinalGravity,
+    activeBrewProfile.effectiveOG,
+    0.0f,
+    0.0f,
+    elapsedSeconds);
+
+  currentETA = ETAPredictor::predict(
+    activeBrewProfile,
+    activeBrewProfile.effectiveOG,
+    activeBrewProfile.expectedFinalGravity,
+    0.0f,
+    elapsedSeconds);
+}
+
 void checkExistingFermentation() {
   #if !SD_ENABLED
-    Serial.println("SD disabled, skipping fermentation file check");
+    LOG_INFOLN("SD disabled, skipping fermentation file check");
     // Create new file when data arrives
     return;
   #endif
   
   // Mount SD temporarily to check for existing fermentation files
   if (mountSDTemporarily()) {
-    // Ensure fermentation directory exists
-    if (!SD.exists("/fermentation")) {
-      SD.mkdir("/fermentation");
-      Serial.println("Created fermentation directory");
-    }
+    if (!SD.exists("/data")) SD.mkdir("/data");
+    if (!SD.exists("/data/batches")) SD.mkdir("/data/batches");
     
-    File root = SD.open("/fermentation");
+    File root = SD.open("/data/batches");
     if (!root) {
-      Serial.println("Failed to open fermentation directory, creating new file");
+      LOG_ERRORLN("Failed to open batch directory, starting Brew Wizard");
       dismountSD();
-      createNewFermentationFile();
+      beginBrewWizard();
       return;
     }
     
@@ -3041,38 +4988,54 @@ void checkExistingFermentation() {
     
     File file = root.openNextFile();
     while (file) {
-      if (!file.isDirectory()) {
-        hasExistingFiles = true;
+      if (file.isDirectory()) {
         const char* filename = file.name();
-        // Parse fermentation_XXX.csv format
+        const char* slash = strrchr(filename, '/');
+        if (slash) filename = slash + 1;
         int fileNum = 0;
-        if (sscanf(filename, "fermentation_%d.csv", &fileNum) == 1) {
-          if (fileNum > highestNumber) {
+        if (sscanf(filename, "batch_%d", &fileNum) == 1) {
+          char candidateBatchId[24];
+          char profilePath[80];
+          BrewProfileStore::buildBatchId(fileNum, candidateBatchId, sizeof(candidateBatchId));
+          BrewProfileStore::profilePath(candidateBatchId, profilePath, sizeof(profilePath));
+          if (SD.exists(profilePath) && fileNum > highestNumber) {
+            hasExistingFiles = true;
             highestNumber = fileNum;
           }
         }
       }
+      file.close();
       file = root.openNextFile();
     }
     
     root.close();
     
     if (hasExistingFiles && highestNumber > 0) {
-      // Auto-continue the highest numbered file
-      sprintf(currentFermentationFile, "/fermentation/fermentation_%03d.csv", highestNumber);
-      fermentationFileOpen = true;
-      Serial.printf("Auto-continuing fermentation file: %s\n", currentFermentationFile);
+      char batchId[24];
+      BrewProfileStore::buildBatchId(highestNumber, batchId, sizeof(batchId));
+      if (BrewProfileStore::load(batchId, &activeBrewProfile)) {
+        brewProfileLoaded = true;
+        originalGravity = activeBrewProfile.effectiveOG;
+        currentABV = activeBrewProfile.estimatedABV;
+        ogCaptured = activeBrewProfile.effectiveOG > 1.0f;
+      }
+      bool logReady = ensureFermentationLogFile(batchId);
+      BrewProfileStore::logPath(batchId, currentFermentationFile, sizeof(currentFermentationFile));
+      fermentationFileOpen = logReady;
+      LOG_INFO("Auto-continuing batch log: %s\n", currentFermentationFile);
       
       // Load historical data from the CSV file
-      if (loadHistoricalDataFromCSV(currentFermentationFile, LOAD_6H, MAX_DATA_POINTS, 1)) {
-        Serial.println("Historical data loaded successfully - views will show previous data");
+      if (logReady && loadHistoricalDataFromCSV(currentFermentationFile, LOAD_6H, MAX_DATA_POINTS, 1)) {
+        LOG_INFOLN("Historical data loaded successfully - views will show previous data");
       } else {
-        Serial.println("Failed to load historical data - starting fresh");
+        LOG_VERBOSELN("No historical CSV data loaded - starting fresh");
       }
+      refreshFermentationAssistantFromProfile();
     } else {
-      // No existing files, create fermentation_001.csv
-      Serial.println("No existing fermentation files found, creating fermentation_001.csv");
-      createNewFermentationFile();
+      LOG_INFOLN("No existing batches found, opening Brew Wizard");
+      dismountSD();
+      beginBrewWizard();
+      return;
     }
     
     dismountSD();
@@ -3081,32 +5044,41 @@ void checkExistingFermentation() {
 
 void createNewFermentationFile() {
   #if !SD_ENABLED
-    Serial.println("SD disabled, cannot create fermentation file");
+    LOG_ERRORLN("SD disabled, cannot create fermentation file");
     return;
   #endif
   
   // Mount SD temporarily to create new fermentation file
   if (mountSDTemporarily()) {
-    // Ensure fermentation directory exists
-    if (!SD.exists("/fermentation")) {
-      SD.mkdir("/fermentation");
-    }
+    if (!SD.exists("/data")) SD.mkdir("/data");
+    if (!SD.exists("/data/batches")) SD.mkdir("/data/batches");
     
     char filename[64];
     int newFileNumber = 1;
     
-    // Parse current file number if exists
+    // Parse current batch number if exists
     if (strlen(currentFermentationFile) > 0) {
       int currentNum = 0;
-      if (sscanf(currentFermentationFile, "/fermentation/fermentation_%d.csv", &currentNum) == 1) {
+      if (sscanf(currentFermentationFile, "/data/batches/batch_%d/log.csv", &currentNum) == 1) {
         newFileNumber = currentNum + 1;
       }
     }
     
     // Find next available number if file already exists
     while (true) {
-      snprintf(filename, sizeof(filename), "/fermentation/fermentation_%03d.csv", newFileNumber);
-      if (!SD.exists(filename)) {
+      char batchId[24];
+      char profilePath[80];
+      char batchDir[64];
+      BrewProfileStore::buildBatchId(newFileNumber, batchId, sizeof(batchId));
+      BrewProfileStore::profilePath(batchId, profilePath, sizeof(profilePath));
+      BrewProfileStore::logPath(batchId, filename, sizeof(filename));
+      snprintf(batchDir, sizeof(batchDir), "/data/batches/%s", batchId);
+      if (!SD.exists(filename) && !SD.exists(profilePath) && !SD.exists(batchDir)) {
+        BrewProfileStore::setDefaults(&activeBrewProfile);
+        strncpy(activeBrewProfile.batchId, batchId, sizeof(activeBrewProfile.batchId) - 1);
+        activeBrewProfile.batchId[sizeof(activeBrewProfile.batchId) - 1] = '\0';
+        activeBrewProfile.createdAt = getCurrentEpoch();
+        BrewProfileStore::ensureBatchDirectory(activeBrewProfile.batchId);
         break;
       }
       newFileNumber++;
@@ -3114,19 +5086,22 @@ void createNewFermentationFile() {
     
     File file = SD.open(filename, FILE_WRITE);
     if (!file) {
-      Serial.println("Failed to create new fermentation file");
+      LOG_ERRORLN("Failed to create new fermentation file");
       dismountSD();
       return;
     }
     
     // Write CSV header
-    file.println("uptime_s,angle,density,temperature,battery_voltage,battery_percent");
+    file.println("timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code");
     file.flush();  // Ensure header is written to SD card
     file.close();
     
     strncpy(currentFermentationFile, filename, sizeof(currentFermentationFile) - 1);
     currentFermentationFile[sizeof(currentFermentationFile) - 1] = '\0';
     fermentationFileOpen = true;
+    brewProfileLoaded = true;
+    BrewProfileStore::save(activeBrewProfile);
+    TargetCurveGenerator::generateAndSave(activeBrewProfile);
     
     // Reset OG/ABV for new fermentation
     originalGravity = 0.0;
@@ -3136,18 +5111,14 @@ void createNewFermentationFile() {
     last3Readings[0] = 0.0;
     last3Readings[1] = 0.0;
     last3Readings[2] = 0.0;
+    clearHistoricalDisplayData();
     
-    Serial.printf("Created new fermentation file: %s (OG/ABV reset)\n", currentFermentationFile);
+    LOG_INFO("Created new fermentation file: %s (OG/ABV reset)\n", currentFermentationFile);
     dismountSD();
   }
 }
 
-void continueFermentationFile() {
-  fermentationFileOpen = true;
-  Serial.printf("Continuing fermentation file: %s\n", currentFermentationFile);
-}
-
-bool logDataToSD(payload_t data) {
+bool logDataToSD(payload_t data, uint32_t epoch_s) {
   #if !SD_ENABLED
     return false;
   #endif
@@ -3185,9 +5156,9 @@ bool logDataToSD(payload_t data) {
     // Only log failure occasionally to reduce spam
     static unsigned long lastSDFailureLog = 0;
     if (millis() - lastSDFailureLog > 10000) { // Log every 10 seconds max
-      Serial.println("Failed to mount SD card for data logging");
-      Serial.printf("SD CS pin: %d, MOSI: %d, MISO: %d, SCK: %d\n", SD_CS, SD_MOSI, SD_MISO, SD_SCK);
-      Serial.println("Troubleshooting: Check SD card insertion, wiring, and format (FAT32)");
+      LOG_ERRORLN("Failed to mount SD card for data logging");
+      LOG_ERROR("SD CS pin: %d, MOSI: %d, MISO: %d, SCK: %d\n", SD_CS, SD_MOSI, SD_MISO, SD_SCK);
+      LOG_ERRORLN("Troubleshooting: Check SD card insertion, wiring, and format (FAT32)");
       lastSDFailureLog = millis();
     }
     
@@ -3206,27 +5177,27 @@ bool logDataToSD(payload_t data) {
   
   File file = SD.open(currentFermentationFile, FILE_APPEND);
   if (!file) {
-    Serial.printf("Failed to open fermentation file '%s' for writing\n", currentFermentationFile);
+    LOG_ERROR("Failed to open fermentation file '%s' for writing\n", currentFermentationFile);
     
     // Try to create the file if it doesn't exist
-    Serial.println("Attempting to create fermentation file...");
+    LOG_VERBOSELN("Attempting to create fermentation file...");
     file = SD.open(currentFermentationFile, FILE_WRITE);
     if (!file) {
-      Serial.println("Failed to create fermentation file");
+      LOG_ERRORLN("Failed to create fermentation file");
       return false;
     }
     
     // Write CSV header for new file
-    file.println("uptime,angle,sg,temperature,voltage,battery_percent");
+    file.println("timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code");
     file.close();
     
     // Try opening again in append mode
     file = SD.open(currentFermentationFile, FILE_APPEND);
     if (!file) {
-      Serial.println("Failed to open fermentation file after creation");
+      LOG_ERRORLN("Failed to open fermentation file after creation");
       return false;
     }
-    Serial.println("Successfully created new fermentation file with header");
+    LOG_INFOLN("Successfully created new fermentation file with header");
   }
   
   // Add timeout protection
@@ -3235,15 +5206,21 @@ bool logDataToSD(payload_t data) {
   
   // Write CSV data
   uint8_t batteryPercent = calculateBatteryPercentage(data.battery_voltage);
-  Serial.printf("DEBUG: Writing to SD - SG:%.4f, Temp:%.2f, Batt:%.2fV\n", 
+  char timestamp[24];
+  formatTimestamp(epoch_s, timestamp, sizeof(timestamp));
+  LOG_VERBOSE("Writing to SD - SG:%.4f, Temp:%.2f, Batt:%.2fV\n", 
                 data.density, data.temperature, data.battery_voltage);
-  int bytesWritten = file.printf("%lu,%.2f,%.4f,%.2f,%.2f,%d\n", 
-             data.uptime_s, data.angle, data.density, data.temperature, 
-             data.battery_voltage, batteryPercent);
+  int bytesWritten = file.printf("%s,%lu,%lu,%.2f,%.4f,%.2f,%.2f,%d,%s,%.2f,%.2f,%d\n", 
+             timestamp, (unsigned long)epoch_s, (unsigned long)data.uptime_s, data.angle, data.density,
+             data.temperature, data.battery_voltage, batteryPercent,
+             fermentationStateMachine.phaseName(),
+             fermentationMetrics.currentAttenuation,
+             fermentationMetrics.estimatedABV,
+             currentRecommendation.code);
   
   // Check for timeout
   if (millis() - startTime > SD_TIMEOUT) {
-    Serial.println("SD write operation timed out");
+    LOG_ERRORLN("SD write operation timed out");
     file.close();
     SD.end(); // Properly dismount SD card
     sdSPI.end(); // End separate SPI instance completely
@@ -3275,44 +5252,13 @@ bool logDataToSD(payload_t data) {
   tft.getTouch(NULL, NULL); // Dummy touch read to reset touch controller
   
   if (bytesWritten > 0) {
-    Serial.printf("Logged data to SD: SG=%.4f, Temp=%.2f°C, Battery=%.2fV (%d%%)\n", 
+    LOG_VERBOSE("Logged data to SD: SG=%.4f, Temp=%.2f°C, Battery=%.2fV (%d%%)\n", 
                  data.density, data.temperature, data.battery_voltage, batteryPercent);
     return true;
   } else {
-    Serial.println("Failed to write data to SD file");
+    LOG_ERRORLN("Failed to write data to SD file");
     return false;
   }
-}
-
-void drawRebootPrompt() {
-  tft.fillScreen(uiColorBackground);
-  
-  // Title card
-  uiCard(MARGIN, TOPBAR_H + MARGIN, UI_W - MARGIN * 2, 60, CARD_RADIUS);
-  tft.setTextColor(uiColorAccent);
-  tft.setFreeFont(FONT_SIZE_XL);
-  tft.setCursor(MARGIN + 60, TOPBAR_H + MARGIN + 30);  // Adjust for FreeFont baseline
-  tft.print("Fermentation");
-  
-  // Question (concise)
-  int contentY = TOPBAR_H + MARGIN + 80;
-  tft.setTextColor(uiColorTextPrimary);
-  tft.setFreeFont(FONT_SIZE_MD);
-  uiTextCenter(MARGIN, contentY, UI_W - MARGIN * 2, 20, "Continue or start new?", FONT_SIZE_MD, uiColorTextPrimary);
-  
-  // Continue button
-  drawButton(BUTTON_CONTINUE_X, BUTTON_CONTINUE_Y, BUTTON_CONTINUE_W, BUTTON_CONTINUE_H, "CONTINUE", false);
-  
-  // New button
-  drawButton(BUTTON_NEW_X, BUTTON_NEW_Y, BUTTON_NEW_W, BUTTON_NEW_H, "NEW", false);
-  
-  // Ellipsized file name
-  char ellipsized[32];
-  uiEllipsize(currentFermentationFile, UI_W - MARGIN * 4, ellipsized, sizeof(ellipsized));
-  tft.setTextColor(uiColorTextMuted);
-  tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(MARGIN * 2, 244);  // Adjust for FreeFont baseline
-  tft.print(ellipsized);
 }
 
 void drawCreateNewDialog() {
@@ -3322,7 +5268,7 @@ void drawCreateNewDialog() {
   // Title
   tft.setTextColor(uiColorTextPrimary);
   tft.setFreeFont(FONT_SIZE_LG);
-  uiTextCenter(20, 100, UI_W - 40, 24, "Create New Fermentation?", FONT_SIZE_LG, uiColorTextPrimary);
+  uiTextCenter(20, 100, UI_W - 40, 24, "Create New Brew?", FONT_SIZE_SM_BOLD, uiColorTextPrimary);
   
   // Current file info
   char ellipsized[32];
@@ -3355,20 +5301,24 @@ void logOGToSD() {
   
   File file = SD.open(currentFermentationFile, FILE_APPEND);
   if (!file) {
-    Serial.println("Failed to open fermentation file for OG logging");
+    LOG_ERRORLN("Failed to open fermentation file for OG logging");
     return;
   }
   
   // Write OG as a comment line in the CSV file
-  int bytesWritten = file.printf("# OG_CAPTURED: %.4f at reading #%d\n", originalGravity, readingCount);
+  uint32_t epoch_s = getCurrentEpoch();
+  char timestamp[24];
+  formatTimestamp(epoch_s, timestamp, sizeof(timestamp));
+  int bytesWritten = file.printf("# OG_CAPTURED: %.4f at reading #%d, timestamp=%s, epoch_s=%lu\n",
+                                 originalGravity, readingCount, timestamp, (unsigned long)epoch_s);
   
   file.flush();  // Ensure OG is written to SD card
   file.close();
   
   if (bytesWritten > 0) {
-    Serial.printf("OG logged to SD: %.4f at reading #%d\n", originalGravity, readingCount);
+    LOG_INFO("OG logged to SD: %.4f at reading #%d\n", originalGravity, readingCount);
   } else {
-    Serial.println("Failed to write OG to SD card");
+    LOG_ERRORLN("Failed to write OG to SD card");
   }
 }
 
@@ -3377,7 +5327,7 @@ void checkOGStability(float currentSG) {
   last3Readings[readingCount % 3] = currentSG;
   readingCount++;
   
-  Serial.printf("OG check: reading #%d, SG=%.4f\n", readingCount, currentSG);
+  LOG_VERBOSE("OG check: reading #%d, SG=%.4f\n", readingCount, currentSG);
   
   // Check if we have at least 3 readings
   if (readingCount >= 3) {
@@ -3391,14 +5341,14 @@ void checkOGStability(float currentSG) {
     float minSG = min(r1, min(r2, r3));
     float variance = maxSG - minSG;
     
-    Serial.printf("Last 3 readings: %.4f, %.4f, %.4f, variance: %.4f\n", r1, r2, r3, variance);
+    LOG_VERBOSE("Last 3 readings: %.4f, %.4f, %.4f, variance: %.4f\n", r1, r2, r3, variance);
     
     // Check if 3 readings in a row are stable (within threshold)
     if (variance < OG_STABILITY_THRESHOLD) {
       // Calculate average of the 3 stable readings
       originalGravity = (r1 + r2 + r3) / 3.0;
       ogCaptured = true;
-      Serial.printf("OG captured as stable: %.4f (average of 3 readings)\n", originalGravity);
+      LOG_INFO("OG captured as stable: %.4f (average of 3 readings)\n", originalGravity);
       logOGToSD();
       return;
     }
@@ -3411,7 +5361,7 @@ void checkOGStability(float currentSG) {
     float r3 = last3Readings[(readingCount - 3) % 3];
     originalGravity = (r1 + r2 + r3) / 3.0;
     ogCaptured = true;
-    Serial.printf("OG captured by fallback (reading #%d): %.4f (average of last 3)\n", readingCount, originalGravity);
+    LOG_INFO("OG captured by fallback (reading #%d): %.4f (average of last 3)\n", readingCount, originalGravity);
     logOGToSD();
   }
 }
@@ -3433,6 +5383,131 @@ uint8_t calculateBatteryPercentage(float voltage) {
   
   // Linear interpolation between 3.0V and 4.2V
   return (uint8_t)((voltage - 3.0) / 1.2 * 100);
+}
+
+void drawViewTopbar(const char* title) {
+  uint8_t battPercent = 0;
+  if (displayDataCount > 0) {
+    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+    battPercent = calculateBatteryPercentage(latest.battery_voltage);
+  }
+  uiDrawTopbar(title, true, fermentationFileOpen, battPercent);
+}
+
+void drawNoDataCard(const char* message, const char* subtext, int activeTab) {
+  int contentY = TOPBAR_H + MARGIN;
+  int contentH = UI_H - contentY - NAV_H;
+  uiCard(MARGIN, contentY + contentH / 2 - 40, UI_W - MARGIN * 2, 80, CARD_RADIUS);
+  uiTextCenter(MARGIN, contentY + contentH / 2 - 10, UI_W - MARGIN * 2, 20, message, FONT_SIZE_MD, uiColorTextMuted);
+  uiTextCenter(MARGIN, contentY + contentH / 2 + 10, UI_W - MARGIN * 2, 20, subtext, FONT_SIZE_SM, uiColorTextMuted);
+  uiDrawBottomNav(activeTab);
+}
+
+void drawDetailSection(int* y, const char* title) {
+  tft.setTextColor(uiColorInfo);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(MARGIN, *y);
+  tft.print(title);
+  *y += 8;
+  tft.drawFastHLine(MARGIN, *y, UI_W - MARGIN * 2, uiColorBorder);
+  *y += 3;
+}
+
+void drawDetailRow(int* y, const char* label, const char* value) {
+  char clipped[40];
+  uiEllipsize(value, 250, clipped, sizeof(clipped));
+
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(MARGIN, *y);
+  tft.print(label);
+
+  tft.setTextColor(uiColorTextPrimary);
+  uiTextRight(MARGIN + 150, *y - 13, UI_W - MARGIN * 2 - 150, 16, clipped, FONT_SIZE_XS, uiColorTextPrimary);
+  *y += 12;
+}
+
+void drawDetailSectionAt(int x, int* y, int w, const char* title) {
+  tft.setTextColor(uiColorInfo);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(x, *y);
+  tft.print(title);
+  *y += 8;
+  tft.drawFastHLine(x, *y, w, uiColorBorder);
+  *y += 4;
+}
+
+void drawDetailRowAt(int x, int* y, int w, const char* label, const char* value) {
+  char clipped[28];
+  uiEllipsize(value, w - 64, clipped, sizeof(clipped));
+
+  tft.setTextColor(uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(x, *y);
+  tft.print(label);
+
+  tft.setTextColor(uiColorTextPrimary);
+  uiTextRight(x + 58, *y - 13, w - 58, 16, clipped, FONT_SIZE_XS, uiColorTextPrimary);
+  *y += 14;
+}
+
+void drawWrappedText(int x, int y, int w, const char* text, uint16_t color) {
+  char first[48] = "";
+  char second[48] = "";
+  char current[48] = "";
+  const char* p = text;
+  bool onSecond = false;
+
+  while (*p) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+
+    char word[24];
+    int wi = 0;
+    while (*p && *p != ' ' && wi < (int)sizeof(word) - 1) word[wi++] = *p++;
+    word[wi] = '\0';
+    if (*p && *p != ' ') {
+      while (*p && *p != ' ') p++;
+    }
+
+    char candidate[48];
+    if (current[0]) snprintf(candidate, sizeof(candidate), "%s %s", current, word);
+    else snprintf(candidate, sizeof(candidate), "%s", word);
+
+    tft.setFreeFont(FONT_SIZE_XS);
+    if (!onSecond && tft.textWidth(candidate) <= w) {
+      strncpy(current, candidate, sizeof(current) - 1);
+      current[sizeof(current) - 1] = '\0';
+    } else if (!onSecond) {
+      strncpy(first, current, sizeof(first) - 1);
+      first[sizeof(first) - 1] = '\0';
+      strncpy(current, word, sizeof(current) - 1);
+      current[sizeof(current) - 1] = '\0';
+      onSecond = true;
+    } else if (tft.textWidth(candidate) <= w) {
+      strncpy(current, candidate, sizeof(current) - 1);
+      current[sizeof(current) - 1] = '\0';
+    } else {
+      break;
+    }
+  }
+
+  if (!onSecond) {
+    strncpy(first, current, sizeof(first) - 1);
+    first[sizeof(first) - 1] = '\0';
+  } else {
+    strncpy(second, current, sizeof(second) - 1);
+    second[sizeof(second) - 1] = '\0';
+  }
+
+  tft.setTextColor(color);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(x, y);
+  tft.print(first);
+  if (second[0]) {
+    tft.setCursor(x, y + 14);
+    tft.print(second);
+  }
 }
 
 void updateChargingState(float currentVoltage) {
@@ -3458,7 +5533,7 @@ void updateChargingState(float currentVoltage) {
 
 float calculateDischargeRateLinearRegression() {
   if (dischargeRateBufferCount < 25) {
-    Serial.println("Linear regression: Not enough data");
+    LOG_VERBOSELN("Linear regression: Not enough data");
     return 0.0; // Not enough data for regression
   }
   
@@ -3466,20 +5541,29 @@ float calculateDischargeRateLinearRegression() {
   float voltages[25];
   float times[25];
   
-  Serial.printf("Linear regression: Processing %d data points\n", dischargeRateBufferCount);
+  LOG_VERBOSE("Linear regression: Processing %d data points\n", dischargeRateBufferCount);
+  
+  uint32_t firstEpoch = dischargeRateTimestampBuffer[0];
+  bool useRtcTime = isEpochValid(firstEpoch);
   
   for (int i = 0; i < 25; i++) {
     voltages[i] = dischargeRateBuffer[i].battery_voltage;
     
     // Filter out battery voltage spikes from float reboots (ignore values > 4.5V)
     if (voltages[i] > 4.5) {
-      Serial.printf("  Point %d: V=%.3f (IGNORED - spike >4.5V)\n", i, voltages[i]);
+      LOG_VERBOSE("  Point %d: V=%.3f (IGNORED - spike >4.5V)\n", i, voltages[i]);
       continue; // Skip this point in regression calculation
     }
     
-    // Use relative time based on 600s intervals instead of absolute uptime_s
-    times[i] = i * 600.0; // 0, 600, 1200, 1800... seconds
-    Serial.printf("  Point %d: V=%.3f, rel_time=%.0f\n", i, voltages[i], times[i]);
+    if (useRtcTime && isEpochValid(dischargeRateTimestampBuffer[i]) &&
+        dischargeRateTimestampBuffer[i] >= firstEpoch) {
+      times[i] = (float)(dischargeRateTimestampBuffer[i] - firstEpoch);
+    } else {
+      // Fallback for old data without RTC timestamps.
+      times[i] = i * 600.0; // 0, 600, 1200, 1800... seconds
+      useRtcTime = false;
+    }
+    LOG_VERBOSE("  Point %d: V=%.3f, rel_time=%.0f\n", i, voltages[i], times[i]);
   }
   
   // Calculate linear regression: y = mx + b
@@ -3501,7 +5585,7 @@ float calculateDischargeRateLinearRegression() {
   
   int n = validPoints;
   if (n < 10) {
-    Serial.printf("  Not enough valid points after filtering: %d\n", n);
+    LOG_VERBOSE("  Not enough valid points after filtering: %d\n", n);
     return 0.0;
   }
   
@@ -3526,14 +5610,14 @@ float calculateDischargeRateLinearRegression() {
   
   float rSquared = 1.0 - (ssResidual / ssTotal);
   
-  Serial.printf("Linear regression results:\n");
-  Serial.printf("  Slope: %.6f V/s\n", slope);
-  Serial.printf("  R²: %.3f\n", rSquared);
-  Serial.printf("  Discharge rate: %.6f V/s\n", -slope);
+  LOG_VERBOSELN("Linear regression results:");
+  LOG_VERBOSE("  Slope: %.6f V/s\n", slope);
+  LOG_VERBOSE("  R²: %.3f\n", rSquared);
+  LOG_VERBOSE("  Discharge rate: %.6f V/s\n", -slope);
   
   // Only trust regression if correlation is reasonable (R² > 0.01)
   if (rSquared < 0.01) {
-    Serial.printf("  Poor correlation (R² < 0.01), returning 0.0\n");
+    LOG_VERBOSELN("  Poor correlation (R² < 0.01), returning 0.0");
     return 0.0; // Poor correlation, data too noisy
   }
   
@@ -3547,66 +5631,83 @@ float calculateDischargeRateLinearRegression() {
     float firstVoltage = voltages[0];
     float lastVoltage = voltages[24];
     if (lastVoltage < firstVoltage) {
-      dischargeRate = (firstVoltage - lastVoltage) / (24 * 600.0); // Total drop over time period
-      Serial.printf("  Applied minimum discharge rate: %.6f V/s\n", dischargeRate);
+      float elapsedSeconds = times[24] > times[0] ? times[24] - times[0] : 24 * 600.0;
+      dischargeRate = (firstVoltage - lastVoltage) / elapsedSeconds; // Total drop over time period
+      LOG_VERBOSE("  Applied minimum discharge rate: %.6f V/s\n", dischargeRate);
     }
   }
   
-  Serial.printf("  Returning discharge rate: %.6f V/s\n", dischargeRate);
+  LOG_VERBOSE("  Returning discharge rate: %.6f V/s\n", dischargeRate);
   return dischargeRate;
 }
 
-void showSDErrorIfFailed() {
-  // TODO: Implement SD error display if needed
-  // This function can be used to show SD card error messages
-  // Set sdErrorMessageShown to true when error is displayed
-  sdErrorMessageShown = true;
-}
-
-// More view - four large option cards with chevrons
+// More view - two-column option grid
 void drawMoreView() {
   tft.fillScreen(uiColorBackground);
   
-  uint8_t battPercent = 0;
-  if (displayDataCount > 0) {
-    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-    battPercent = calculateBatteryPercentage(latest.battery_voltage);
-  }
-  uiDrawTopbar("More", true, fermentationFileOpen, battPercent);
+  drawViewTopbar("More");
   
   int contentY = TOPBAR_H + MARGIN;
   int cardH = (UI_H - TOPBAR_H - NAV_H - MARGIN * 2 - GAP * 3) / 4;
-  int cardW = (UI_W - MARGIN * 2)/2;
+  int contentW = UI_W - MARGIN * 2;
+  int cardW = (contentW - GAP) / 2;
+  int leftX = MARGIN;
+  int rightX = MARGIN + cardW + GAP;
   
   // 1) Details
-  uiCard(MARGIN, contentY, cardW, cardH, CARD_RADIUS);
-  tft.setTextColor(uiColorError);
-  tft.setFreeFont(FONT_SIZE_LG);
-  tft.setCursor(MARGIN + 15, contentY + cardH / 2 + 15);  // Adjust for FreeFont baseline
+  uiCard(leftX, contentY, cardW, cardH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(leftX + 12, contentY + cardH / 2 + 8);
   tft.print("Details >");
+
+  uiCard(rightX, contentY, cardW, cardH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(rightX + 12, contentY + cardH / 2 + 8);
+  tft.print("Theme");
+  drawThemeToggle(rightX + cardW - 64, contentY + (cardH - 28) / 2, darkMode);
   
   // 2) Calibration
   contentY += cardH + GAP;
-  uiCard(MARGIN, contentY, cardW, cardH, CARD_RADIUS);
-  tft.setTextColor(uiColorError);
-  tft.setFreeFont(FONT_SIZE_LG);
-  tft.setCursor(MARGIN + 15, contentY + cardH / 2 + 15);  // Adjust for FreeFont baseline
+  uiCard(leftX, contentY, cardW, cardH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(leftX + 12, contentY + cardH / 2 + 8);
   tft.print("Polygone >");
+
+  uiCard(rightX, contentY, cardW, cardH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(rightX + 12, contentY + cardH / 2 + 8);
+  tft.print("New Yeast >");
   
   // 3) Create New Fermentation
   contentY += cardH + GAP;
-  uiCard(MARGIN, contentY, cardW, cardH, CARD_RADIUS);
-  tft.setTextColor(uiColorError);
-  tft.setFreeFont(FONT_SIZE_LG);
-  tft.setCursor(MARGIN + 15, contentY + cardH / 2 + 15);  // Adjust for FreeFont baseline
+  uiCard(leftX, contentY, cardW, cardH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(leftX + 12, contentY + cardH / 2 + 8);
   tft.print("New Brew >");
+
+  uiCard(rightX, contentY, cardW, cardH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(rightX + 12, contentY + cardH / 2 + 8);
+  tft.print("Manage Yeast >");
   
-  // 4) Reboot
+  // 4) Manage Brew / Reboot
   contentY += cardH + GAP;
-  uiCard(MARGIN, contentY, cardW, cardH, CARD_RADIUS);
-  tft.setTextColor(uiColorError);
-  tft.setFreeFont(FONT_SIZE_LG);
-  tft.setCursor(MARGIN + 15, contentY + cardH / 2 + 15);  // Adjust for FreeFont baseline
+  uiCard(leftX, contentY, cardW, cardH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(leftX + 12, contentY + cardH / 2 + 8);
+  tft.print("Manage Brew >");
+
+  uiCard(rightX, contentY, cardW, cardH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(rightX + 12, contentY + cardH / 2 + 8);
   tft.print("Reboot >");
   
   uiDrawBottomNav(TAB_MORE);
@@ -3615,145 +5716,102 @@ void drawMoreView() {
 // Live Details view - structured cards with KV data
 void drawLiveDetailsView() {
   tft.fillScreen(uiColorBackground);
-  
-  uint8_t battPercent = 0;
-  if (displayDataCount > 0) {
-    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-    battPercent = calculateBatteryPercentage(latest.battery_voltage);
-  }
-  uiDrawTopbar("Details", true, fermentationFileOpen, battPercent);
-  
+  drawViewTopbar("Details");
+
   int contentY = TOPBAR_H + MARGIN;
   int contentW = UI_W - MARGIN * 2;
-  
-  // Header card: SG value + last update
-  int headerH = 50;
-  uiCard(MARGIN, contentY, contentW, headerH, CARD_RADIUS);
+  int navTop = UI_H - NAV_H;
+  payload_t latest = {0};
+  bool hasData = displayDataCount > 0;
+  uint32_t latestEpoch = 0;
+  if (hasData) {
+    latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+    latestEpoch = displayTimestampBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+  }
+
+  uiCard(MARGIN, contentY, contentW, 46, CARD_RADIUS);
   tft.setTextColor(uiColorTextPrimary);
-  tft.setFreeFont(FONT_SIZE_LG);
-  tft.setCursor(MARGIN + 15, contentY + 18);  // Adjust for FreeFont baseline
-  if (displayDataCount > 0) {
-    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+  tft.setFreeFont(FONT_SIZE_MD);
+  tft.setCursor(MARGIN + 10, contentY + 30);
+  if (hasData) {
     tft.printf("SG: %.3f", latest.density);
-    tft.setTextColor(uiColorTextMuted);
-    tft.setFreeFont(FONT_SIZE_SM);
-    tft.setCursor(MARGIN + 15, contentY + 38);  // Adjust for FreeFont baseline
-    unsigned long secs = (millis() - lastUpdate) / 1000;
-    tft.printf("Last update: %lus", secs);
   } else {
     tft.print("SG: --");
   }
-  contentY += headerH + GAP;
-  
-  // Connection card (half width)
-  int halfW = (contentW - GAP) / 2;
-  int cardH = 80;
-  uiCard(MARGIN, contentY, halfW, cardH, CARD_RADIUS);
-  tft.setTextColor(uiColorAccent);
-  tft.setFreeFont(FONT_SIZE_MD);
-  tft.setCursor(MARGIN + 10, contentY + 14);  // Adjust for FreeFont baseline
-  tft.print("Connection");
+
+  char value[48];
   tft.setTextColor(uiColorTextSecondary);
-  tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(MARGIN + 10, contentY + 34);  // Adjust for FreeFont baseline
-  tft.print("ESP-NOW: OK");
-  tft.setCursor(MARGIN + 10, contentY + 49);  // Adjust for FreeFont baseline
-  if (rssiAvailable) {
-    tft.printf("RSSI: %ddBm", lastRSSI);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(MARGIN + 166, contentY + 16);
+  if (brewProfileLoaded) {
+    char phase[34];
+    uiEllipsize(fermentationStateMachine.phaseName(), 180, phase, sizeof(phase));
+    tft.print(phase);
   } else {
-    tft.print("RSSI: --");
+    tft.print("No active batch");
   }
-  tft.setCursor(MARGIN + 10, contentY + 64);  // Adjust for FreeFont baseline
-  if (displayDataCount > 0) {
-    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-    tft.printf("SEQ: %d", latest.sequence_id);
+  tft.setCursor(MARGIN + 166, contentY + 34);
+  if (isEpochValid(latestEpoch)) {
+    char timestamp[24];
+    formatTimestamp(latestEpoch, timestamp, sizeof(timestamp));
+    tft.printf("Last %s", timestamp + 11);
   } else {
-    tft.print("SEQ: --");
+    unsigned long secs = (millis() - lastUpdate) / 1000;
+    tft.printf("Last %lus ago", secs);
   }
-  
-  // Power card (half width)
-  uiCard(MARGIN + halfW + GAP, contentY, halfW, cardH, CARD_RADIUS);
-  tft.setTextColor(uiColorAccent);
-  tft.setFreeFont(FONT_SIZE_MD);
-  tft.setCursor(MARGIN + halfW + GAP + 10, contentY + 14);  // Adjust for FreeFont baseline
-  tft.print("Power");
-  tft.setTextColor(uiColorTextSecondary);
-  tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(MARGIN + halfW + GAP + 10, contentY + 34);  // Adjust for FreeFont baseline
-  tft.printf("Battery: %d%%", battPercent);
-  tft.setCursor(MARGIN + halfW + GAP + 10, contentY + 49);  // Adjust for FreeFont baseline
-  if (displayDataCount > 0) {
-    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-    tft.printf("Voltage: %.2fV", latest.battery_voltage);
-  } else {
-    tft.print("Voltage: --");
-  }
-  tft.setCursor(MARGIN + halfW + GAP + 10, contentY + 64);  // Adjust for FreeFont baseline
-  // Show actual device uptime since boot in seconds
-  unsigned long deviceUptime = millis() / 1000;
-  tft.printf("Uptime: %lus", deviceUptime);
-  contentY += cardH + GAP;
-  
-    
-  // Logging card (full width)
-  int logH = 70;
-  uiCard(MARGIN, contentY, contentW, logH, CARD_RADIUS);
-  tft.setTextColor(uiColorAccent);
-  tft.setFreeFont(FONT_SIZE_MD);
-  tft.setCursor(MARGIN + 10, contentY + 14);  // Adjust for FreeFont baseline
-  tft.print("Logging");
-  tft.setTextColor(uiColorTextSecondary);
-  tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(MARGIN + 10, contentY + 34);  // Adjust for FreeFont baseline
-  tft.printf("SD: %s", fermentationFileOpen ? "OK" : "ERR");
-  tft.setCursor(MARGIN + 10, contentY + 49);  // Adjust for FreeFont baseline
-  char ellipsized[24];
-  // Extract just the filename from the path (remove folder name)
-  const char* filename = currentFermentationFile;
-  const char* lastSlash = strrchr(currentFermentationFile, '/');
-  if (lastSlash != NULL) {
-    filename = lastSlash + 1;
-  }
-  uiEllipsize(filename, contentW - 80, ellipsized, sizeof(ellipsized));
-  tft.printf("File: %s", ellipsized);
-  tft.setCursor(MARGIN + 10, contentY + 64);  // Adjust for FreeFont baseline
-  tft.printf("Points: %d (total: %d)", displayDataCount, totalCSVDataLines);
-  contentY += logH + GAP;
-  
-  // OG/ABV row (only shown in LIVE_DETAILS_VIEW)
-  int ogRowH = 35;
-  uiCard(MARGIN, contentY, contentW, ogRowH, CARD_RADIUS);
-  tft.setTextColor(uiColorTextMuted);
-  tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(MARGIN + 10, contentY + 14);  // Adjust for FreeFont baseline
-  tft.print("OG: ");
-  tft.setTextColor(uiColorTextPrimary);
-  if (ogCaptured) {
-    tft.printf("%.3f", originalGravity);
-  } else {
-    tft.print("Not set");
-  }
-  
-  // ABV on right side
-  tft.setTextColor(uiColorTextMuted);
-  tft.setCursor(MARGIN + contentW / 2, contentY + 14);  // Adjust for FreeFont baseline
-  tft.print("ABV: ");
-  tft.setTextColor(uiColorTextPrimary);
-  if (ogCaptured && displayDataCount > 0) {
-    tft.printf("%.1f%%", currentABV);
-  } else {
-    tft.print("—");
-  }
-  contentY += ogRowH + GAP;
-  
-  // SET OG button (only if OG not captured)
-  if (!ogCaptured && displayDataCount > 0) {
-    drawButton(MARGIN, contentY, contentW, 40, "SET OG", false);
-  }
-  
+
+  int leftX = MARGIN;
+  int colY = contentY + 61;
+  int colW = (contentW - GAP) / 2;
+  int rightX = MARGIN + colW + GAP;
+  int leftY = colY;
+  int rightY = colY;
+
+  drawDetailSectionAt(leftX, &leftY, colW, "BATCH");
+  snprintf(value, sizeof(value), "%s", brewProfileLoaded ? activeBrewProfile.batchName : "--");
+  drawDetailRowAt(leftX, &leftY, colW, "Name", value);
+  snprintf(value, sizeof(value), "%s", brewProfileLoaded ? activeBrewProfile.beerStyle : "--");
+  drawDetailRowAt(leftX, &leftY, colW, "Style", value);
+  snprintf(value, sizeof(value), "%s", brewProfileLoaded ? activeBrewProfile.yeastName : "--");
+  drawDetailRowAt(leftX, &leftY, colW, brewProfileLoaded && activeBrewProfile.autoModeEnabled ? "Preset" : "Yeast", value);
+
+  leftY += 4;
+  drawDetailSectionAt(leftX, &leftY, colW, "FERMENTATION");
+  snprintf(value, sizeof(value), "%s", brewProfileLoaded ? fermentationStateMachine.phaseName() : "--");
+  drawDetailRowAt(leftX, &leftY, colW, "Phase", value);
+  snprintf(value, sizeof(value), "%.3f / %.3f", brewProfileLoaded ? activeBrewProfile.effectiveOG : 0.0f,
+           brewProfileLoaded ? activeBrewProfile.expectedFinalGravity : 0.0f);
+  drawDetailRowAt(leftX, &leftY, colW, "OG/FG", brewProfileLoaded ? value : "--");
+  snprintf(value, sizeof(value), "%.0f%% / %.1f%%", fermentationMetrics.currentAttenuation, fermentationMetrics.estimatedABV);
+  drawDetailRowAt(leftX, &leftY, colW, "Att/ABV", hasData ? value : "--");
+  char eta[16];
+  if (currentETA.valid) formatDurationShort(currentETA.secondsToPackaging, eta, sizeof(eta));
+  else strcpy(eta, "--");
+  drawDetailRowAt(leftX, &leftY, colW, "ETA", eta);
+
+  drawDetailSectionAt(rightX, &rightY, colW, "FLOAT");
+  snprintf(value, sizeof(value), "%.1f C / %.1f deg", latest.temperature, latest.angle);
+  drawDetailRowAt(rightX, &rightY, colW, "Temp/Ang", hasData ? value : "--");
+  uint8_t battPercent = hasData ? calculateBatteryPercentage(latest.battery_voltage) : 0;
+  snprintf(value, sizeof(value), "%.2f V / %d%%", latest.battery_voltage, battPercent);
+  drawDetailRowAt(rightX, &rightY, colW, "Battery", hasData ? value : "--");
+  snprintf(value, sizeof(value), "%d", hasData ? latest.sequence_id : 0);
+  drawDetailRowAt(rightX, &rightY, colW, "Seq", hasData ? value : "--");
+  snprintf(value, sizeof(value), "%d dBm", lastRSSI);
+  drawDetailRowAt(rightX, &rightY, colW, "RSSI", rssiAvailable ? value : "--");
+
+  rightY += 4;
+  drawDetailSectionAt(rightX, &rightY, colW, "SYSTEM");
+  snprintf(value, sizeof(value), "%s", fermentationFileOpen ? "OK" : "ERR");
+  drawDetailRowAt(rightX, &rightY, colW, "SD", value);
+  snprintf(value, sizeof(value), "%d/%d", lastHistoricalLoadedLines, totalCSVDataLines);
+  drawDetailRowAt(rightX, &rightY, colW, "CSV L/T", value);
+  snprintf(value, sizeof(value), "%d", bufferedCount);
+  drawDetailRowAt(rightX, &rightY, colW, "Buf", value);
+  snprintf(value, sizeof(value), "%s / %s", calibCoeffs.isValid ? "Cal OK" : "Cal --", darkMode ? "Dark" : "Light");
+  drawDetailRowAt(rightX, &rightY, colW, "Device", value);
+
   uiDrawBottomNav(TAB_LIVE);
-  
-  // Reset dirty flag after redraw
   detailsDirty = false;
 }
 
@@ -3769,7 +5827,7 @@ bool mountSDTemporarily() {
     
     // Use the separate SPI instance for SD card
     if (!SD.begin(SD_CS, sdSPI)) {
-      Serial.println("SD card mount failed!");
+      LOG_ERRORLN("SD card mount failed!");
       sdCardPresent = false;
       return false;
     }
@@ -3794,17 +5852,18 @@ void dismountSD() {
 }
 
 // Buffer sensor data to avoid real-time SD operations
-void bufferSensorData(payload_t data) {
+void bufferSensorData(payload_t data, uint32_t epoch_s) {
   if (bufferedCount < MAX_DATA_BUFFER) {
     // Normal case: buffer has space
     dataBuffer[bufferIndex].data = data;
-    dataBuffer[bufferIndex].timestamp = millis();
+    dataBuffer[bufferIndex].epoch_s = epoch_s;
+    dataBuffer[bufferIndex].buffered_millis = millis();
     dataBuffer[bufferIndex].written = false;
     bufferIndex = (bufferIndex + 1) % MAX_DATA_BUFFER;
     bufferedCount++;
     
     if (bufferedCount % 50 == 0) { // Only log every 50th message to reduce spam
-      Serial.printf("Buffered sensor data: seq=%d, sg=%.3f, temp=%.1f°C (buffer: %d/%d)\n", 
+      LOG_VERBOSE("Buffered sensor data: seq=%d, sg=%.3f, temp=%.1f°C (buffer: %d/%d)\n", 
                     data.sequence_id, data.density, data.temperature, bufferedCount, MAX_DATA_BUFFER);
     }
   } else {
@@ -3813,15 +5872,16 @@ void bufferSensorData(payload_t data) {
     unsigned long currentTime = millis();
     
     if (currentTime - lastOverflowWarning > 10000) { // Warn every 10 seconds
-      Serial.printf("WARNING: Sensor data buffer full (%d entries) - overwriting oldest data\n", MAX_DATA_BUFFER);
-      Serial.println("Consider increasing SD write frequency or buffer size");
+      LOG_ERROR("WARNING: Sensor data buffer full (%d entries) - overwriting oldest data\n", MAX_DATA_BUFFER);
+      LOG_ERRORLN("Consider increasing SD write frequency or buffer size");
       lastOverflowWarning = currentTime;
     }
     
     // Overwrite oldest data (circular buffer behavior)
     int oldestIndex = bufferIndex; // bufferIndex points to oldest when full
     dataBuffer[oldestIndex].data = data;
-    dataBuffer[oldestIndex].timestamp = currentTime;
+    dataBuffer[oldestIndex].epoch_s = epoch_s;
+    dataBuffer[oldestIndex].buffered_millis = currentTime;
     dataBuffer[oldestIndex].written = false;
     
     // Move buffer index forward (maintains circular behavior)
@@ -3837,7 +5897,7 @@ void bufferSensorData(payload_t data) {
     }
     
     if (unwrittenCount > MAX_DATA_BUFFER * 0.8) { // 80% threshold
-      Serial.printf("CRITICAL: Buffer health warning - %d/%d entries unwritten\n", 
+      LOG_ERROR("CRITICAL: Buffer health warning - %d/%d entries unwritten\n", 
                     unwrittenCount, MAX_DATA_BUFFER);
     }
   }
@@ -3856,7 +5916,7 @@ void writeBufferedDataToSD() {
   
   // Only log when actually writing data (rate limited)
   if (currentTime - lastWriteLog > 5000) { // Log every 5 seconds max
-    Serial.printf("Writing %d sensor data points to SD\n", bufferedCount);
+    LOG_VERBOSE("Writing %d sensor data points to SD\n", bufferedCount);
     lastWriteLog = currentTime;
   }
   
@@ -3871,12 +5931,12 @@ int entriesToCheck = (bufferedCount == MAX_DATA_BUFFER) ? MAX_DATA_BUFFER : buff
 for (int i = 0; i < entriesToCheck && checkedCount < bufferedCount; i++) {
   // Check if we've exceeded the maximum time for SD operations
   if (millis() - operationStartTime > MAX_SD_OPERATION_TIME) {
-    Serial.printf("SD operation timeout after %dms, deferring remaining writes\n", MAX_SD_OPERATION_TIME);
+    LOG_ERROR("SD operation timeout after %dms, deferring remaining writes\n", MAX_SD_OPERATION_TIME);
     break;
   }
   
-  if (!dataBuffer[i].written && dataBuffer[i].timestamp > 0) {
-    if (logDataToSD(dataBuffer[i].data)) {
+  if (!dataBuffer[i].written && dataBuffer[i].buffered_millis > 0) {
+    if (logDataToSD(dataBuffer[i].data, dataBuffer[i].epoch_s)) {
       dataBuffer[i].written = true;
       writtenCount++;
     }
@@ -3886,14 +5946,14 @@ for (int i = 0; i < entriesToCheck && checkedCount < bufferedCount; i++) {
 
 // Only log success when data was actually written
 if (writtenCount > 0) {
-  Serial.printf("Wrote %d points to SD\n", writtenCount);
+  LOG_VERBOSE("Wrote %d points to SD\n", writtenCount);
 }
 lastSDWrite = millis();
 
 // Compact buffer: move unwritten entries to the beginning
 int newCount = 0;
 for (int i = 0; i < entriesToCheck; i++) {
-  if (!dataBuffer[i].written && dataBuffer[i].timestamp > 0) {
+  if (!dataBuffer[i].written && dataBuffer[i].buffered_millis > 0) {
     // Move unwritten data to front of buffer
     if (newCount != i) {
       dataBuffer[newCount] = dataBuffer[i];
@@ -3909,7 +5969,7 @@ bufferIndex = newCount; // Reset buffer index to end of valid data
 // Debug: Show buffer status (rate limited)
 static unsigned long lastDebugLog = 0;
 if (currentTime - lastDebugLog > 10000) { // Every 10 seconds
-  Serial.printf("Buffer status: wrote %d, remaining %d/%d\n", writtenCount, bufferedCount, MAX_DATA_BUFFER);
+  LOG_VERBOSE("Buffer status: wrote %d, remaining %d/%d\n", writtenCount, bufferedCount, MAX_DATA_BUFFER);
   lastDebugLog = currentTime;
 }
 }
@@ -3925,12 +5985,6 @@ bool isSafeForSDOperation() {
           bufferedCount > 0);
 }
 
-void loadFloatMacFromEEPROM();
-void saveFloatMacToEEPROM();
-void startWait(int durationMs);
-void checkWaitTimeout();
-void stopWait();
-
 void loadFloatMacFromEEPROM() {
   EEPROM.begin(128); // Reserve space for float MAC
   uint32_t magic;
@@ -3939,7 +5993,7 @@ void loadFloatMacFromEEPROM() {
   if (magic == FLOAT_MAC_MAGIC) {
     EEPROM.get(EEPROM_FLOAT_MAC_ADDR, floatMac);
     floatMacKnown = true;
-    Serial.printf("Float MAC loaded from EEPROM: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+    LOG_INFO("Float MAC loaded from EEPROM: %02X:%02X:%02X:%02X:%02X:%02X\n", 
                   floatMac[0], floatMac[1], floatMac[2], floatMac[3], floatMac[4], floatMac[5]);
     
     // Register float as peer immediately
@@ -3951,14 +6005,14 @@ void loadFloatMacFromEEPROM() {
     
     esp_err_t addResult = esp_now_add_peer(&peerInfo);
     if (addResult == ESP_OK) {
-      Serial.println("Float unit registered as ESP-NOW peer (from EEPROM)");
+      LOG_INFOLN("Float unit registered as ESP-NOW peer (from EEPROM)");
     } else if (addResult == ESP_ERR_ESPNOW_EXIST) {
-      Serial.println("Float unit already registered as peer");
+      LOG_INFOLN("Float unit already registered as peer");
     } else {
-      Serial.printf("Failed to register float as peer: %d\n", addResult);
+      LOG_ERROR("Failed to register float as peer: %d\n", addResult);
     }
   } else {
-    Serial.println("No valid float MAC found in EEPROM");
+    LOG_INFOLN("No valid float MAC found in EEPROM");
   }
 }
 
@@ -3971,9 +6025,9 @@ void saveFloatMacToEEPROM() {
   
   bool success = EEPROM.commit();
   if (success) {
-    Serial.println("Float MAC saved to EEPROM");
+    LOG_INFOLN("Float MAC saved to EEPROM");
   } else {
-    Serial.println("ERROR: Failed to save float MAC to EEPROM");
+    LOG_ERRORLN("ERROR: Failed to save float MAC to EEPROM");
   }
 }
 
@@ -3982,18 +6036,13 @@ void startWait(int durationMs) {
   waitDuration = durationMs;
   waitActive = true;
   screenDirty = true;
-  Serial.printf("Wait started for %d ms\n", durationMs);
+  LOG_VERBOSE("Wait started for %d ms\n", durationMs);
 }
 
 void drawPolynomialGraph() {
   tft.fillScreen(uiColorBackground);
   
-  uint8_t battPercent = 0;
-  if (displayDataCount > 0) {
-    payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
-    battPercent = calculateBatteryPercentage(latest.battery_voltage);
-  }
-  uiDrawTopbar("Polynomial", true, fermentationFileOpen, battPercent);
+  drawViewTopbar("Polynomial");
   
   int contentY = TOPBAR_H + MARGIN;
   int contentW = UI_W - MARGIN * 2;
@@ -4047,9 +6096,9 @@ void calculateGraphPoints() {
 void drawGraphAxes() {
   // Draw axes
   tft.drawLine(POLY_GRAPH_INNER_X, POLY_GRAPH_INNER_Y + POLY_GRAPH_INNER_H - 1, 
-                POLY_GRAPH_INNER_X + POLY_GRAPH_INNER_W - 1, POLY_GRAPH_INNER_Y, POLY_GRAPH_AXIS_COLOR);
+                POLY_GRAPH_INNER_X + POLY_GRAPH_INNER_W - 1, POLY_GRAPH_INNER_Y, uiColorBorder);
   tft.drawLine(POLY_GRAPH_INNER_X, POLY_GRAPH_INNER_Y, 
-                POLY_GRAPH_INNER_X + POLY_GRAPH_INNER_W - 1, POLY_GRAPH_INNER_Y + POLY_GRAPH_INNER_H - 1, POLY_GRAPH_AXIS_COLOR);
+                POLY_GRAPH_INNER_X + POLY_GRAPH_INNER_W - 1, POLY_GRAPH_INNER_Y + POLY_GRAPH_INNER_H - 1, uiColorBorder);
   
   // Draw Y-axis labels (SG values)
   tft.setTextColor(uiColorTextSecondary);
@@ -4069,20 +6118,20 @@ void drawGraphAxes() {
     int x = POLY_GRAPH_INNER_X + (angleLabels[i] * (POLY_GRAPH_INNER_W - 1) / 90);
     int y = POLY_GRAPH_INNER_Y + POLY_GRAPH_INNER_H - 1 + 10;
     tft.setCursor(x, y);
-    tft.printf("%d°", angleLabels[i]);
+    tft.printf("%d deg", angleLabels[i]);
   }
   
   // Draw grid lines
-  tft.setTextColor(POLY_GRAPH_GRID_COLOR);
+  tft.setTextColor(currentTheme->gridLine);
   for (int i = 1; i < 6; i++) {
     int x = POLY_GRAPH_INNER_X + (i * (POLY_GRAPH_INNER_W - 1) / 6);
-    tft.drawLine(x, POLY_GRAPH_INNER_Y, x, POLY_GRAPH_INNER_Y + POLY_GRAPH_INNER_H - 1, POLY_GRAPH_GRID_COLOR);
+    tft.drawLine(x, POLY_GRAPH_INNER_Y, x, POLY_GRAPH_INNER_Y + POLY_GRAPH_INNER_H - 1, currentTheme->gridLine);
   }
   
   for (int i = 1; i < 4; i++) {
     float sg = 0.900 + (i * 0.050);
     int y = POLY_GRAPH_INNER_Y + POLY_GRAPH_INNER_H - 1 - ((sg - 0.900) / (1.200 - 0.900) * (POLY_GRAPH_INNER_H - 20));
-    tft.drawLine(POLY_GRAPH_INNER_X, y, POLY_GRAPH_INNER_X + POLY_GRAPH_INNER_W - 1, y, POLY_GRAPH_GRID_COLOR);
+    tft.drawLine(POLY_GRAPH_INNER_X, y, POLY_GRAPH_INNER_X + POLY_GRAPH_INNER_W - 1, y, currentTheme->gridLine);
   }
 }
 
@@ -4093,7 +6142,7 @@ void drawGraphCurve() {
     
     if (i > 0 && graphPoints[i-1].valid) {
       tft.drawLine(graphPoints[i-1].x, graphPoints[i-1].y, 
-                    graphPoints[i].x, graphPoints[i].y, POLY_GRAPH_CURVE_COLOR);
+                    graphPoints[i].x, graphPoints[i].y, uiColorGold);
     }
   }
 }
@@ -4112,7 +6161,7 @@ void checkWaitTimeout() {
       calibrationModeActive = false;
       screenDirty = true;
       staticElementsDrawn = false; // Force complete redraw to clear artifacts
-      Serial.println("Apply timeout - calibration complete, returning to Live View");
+      LOG_INFOLN("Apply timeout - calibration complete, returning to Live View");
     } else if (calibMode >= CALIB_POINT1 && calibMode <= CALIB_POINT4) {
       // Record timeout - advance to next step
       switch (calibMode) {
@@ -4122,7 +6171,7 @@ void checkWaitTimeout() {
         case CALIB_POINT4: calibMode = CALIB_COMPLETE; break;
         default: break;
       }
-      Serial.printf("Record timeout - advanced to next step\n");
+      LOG_VERBOSELN("Record timeout - advanced to next step");
     }
     
     screenDirty = true;
@@ -4132,13 +6181,19 @@ void checkWaitTimeout() {
 void stopWait() {
   waitActive = false;
   waitDuration = 0;
-  Serial.println("Wait stopped");
+  LOG_VERBOSELN("Wait stopped");
 }
 
 // Graph cursor helper functions
 void formatTimeFromDataPoint(int index, char* buf, int bufSize) {
   if (index < 0 || index >= displayDataCount) {
     snprintf(buf, bufSize, "0m");
+    return;
+  }
+  
+  uint32_t pointEpoch = timestampForPoint(index);
+  if (isEpochValid(pointEpoch)) {
+    formatTimestamp(pointEpoch, buf, bufSize);
     return;
   }
   
@@ -4197,7 +6252,7 @@ void drawCursorValueDisplay(int x, int y, bool showRight) {
   
   // Temperature value (green)
   tft.setTextColor(currentTheme->graphGreen);
-  snprintf(buf, sizeof(buf), "Temp: %.1f°C", data.temperature);
+  snprintf(buf, sizeof(buf), "Temp: %.1f C", data.temperature);
   textWidth = tft.textWidth(buf);
   textX = showRight ? x + 4 : x - textWidth - 4;
   tft.setCursor(textX, textY);
@@ -4235,26 +6290,26 @@ void handleGraphButton6h() {
       cursorPosition = 1.0;
       cursorIndex = displayDataCount - 1;
       screenDirty = true;
-      Serial.println("Loaded 6h data");
+      LOG_INFOLN("Loaded 6h data");
     }
     dismountSD();
   } else {
-    Serial.println("Failed to mount SD for 6h data load");
+    LOG_ERRORLN("Failed to mount SD for 6h data load");
   }
 }
 
 void handleGraphButton24h() {
   currentLoadMode = LOAD_24H;
   if (mountSDTemporarily()) {
-    if (loadHistoricalDataFromCSV(currentFermentationFile, LOAD_24H, MAX_DATA_POINTS, 2)) {
+    if (loadHistoricalDataFromCSV(currentFermentationFile, LOAD_24H, MAX_DATA_POINTS, 1)) {
       cursorPosition = 1.0;
       cursorIndex = displayDataCount - 1;
       screenDirty = true;
-      Serial.println("Loaded 24h data");
+      LOG_INFOLN("Loaded 24h data");
     }
     dismountSD();
   } else {
-    Serial.println("Failed to mount SD for 24h data load");
+    LOG_ERRORLN("Failed to mount SD for 24h data load");
   }
 }
 
@@ -4265,11 +6320,11 @@ void handleGraphButtonAll() {
       cursorPosition = 1.0;
       cursorIndex = displayDataCount - 1;
       screenDirty = true;
-      Serial.println("Loaded all data");
+      LOG_INFOLN("Loaded all data");
     }
     dismountSD();
   } else {
-    Serial.println("Failed to mount SD for all data load");
+    LOG_ERRORLN("Failed to mount SD for all data load");
   }
 }
 
@@ -4278,7 +6333,7 @@ void handleGraphButtonLeft() {
   if (cursorPosition < 0.0) cursorPosition = 0.0;
   updateCursorPosition();
   screenDirty = true;
-  Serial.printf("Cursor moved left to position %.2f (index %d)\n", cursorPosition, cursorIndex);
+  LOG_VERBOSE("Cursor moved left to position %.2f (index %d)\n", cursorPosition, cursorIndex);
 }
 
 void handleGraphButtonRight() {
@@ -4286,5 +6341,5 @@ void handleGraphButtonRight() {
   if (cursorPosition > 1.0) cursorPosition = 1.0;
   updateCursorPosition();
   screenDirty = true;
-  Serial.printf("Cursor moved right to position %.2f (index %d)\n", cursorPosition, cursorIndex);
+  LOG_VERBOSE("Cursor moved right to position %.2f (index %d)\n", cursorPosition, cursorIndex);
 }

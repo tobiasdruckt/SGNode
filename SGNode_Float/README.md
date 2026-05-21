@@ -1,77 +1,71 @@
-# ESP32 Fermentation Float Unit - v0.3.0-alpha
+# SGNode Float Firmware
 
-## Overview
-Battery-powered ESP32 fermentation monitoring float unit that measures tilt via BMI160 IMU and temperature via BMP180, transmitting data via ESP-NOW to base station.
+**Release:** alpha 0.4.0  
+**Role:** Battery-powered ESP32 sensor float
 
-## Features
-- ✅ **Sensors**: BMI160 IMU (tilt) + BMP180 (temperature/pressure)
-- ✅ **Calculations**: Specific gravity from tilt angle
-- ✅ **Wireless**: ESP-NOW transmission to base station
-- ✅ **Battery**: 4.164V monitoring with calibrated voltage divider
-- ✅ **SOC**: State of charge calculation (100% at 4.175V)
-- ✅ **Power**: Deep sleep cycle (180s intervals)
-- ✅ **Calibration**: Polynomial calibration system
+The float measures tilt, temperature, and battery voltage, converts tilt to specific gravity using stored calibration coefficients, and sends packets to the base station via ESP-NOW.
 
-## Hardware Configuration
-- **Board**: ESP32 (WeMos D32 compatible)
-- **I2C**: SDA=GPIO21, SCL=GPIO22
-- **Battery**: GPIO15 (ADC1_CH3) with 51kΩ:51kΩ voltage divider
-- **LEDs**: GPIO5 (built-in), GPIO16 (extra)
-- **Calibration**: GPIO12 (pull-down switch)
+## Hardware
 
-## Battery Monitoring
-- **Voltage Divider**: 51kΩ + 51kΩ (2:1 ratio) with 10µF filtering capacitor
-- **Calibration Factor**: 1.048 (corrected for 13% measurement error)
-- **SOC Range**: 3.0V (0%) to 4.175V (100%)
-- **Accuracy**: ±0.01V after calibration
+- WeMos D32 ESP32 board with 18650 holder
+- BMI160 IMU on I2C
+- BMP180 temperature sensor on I2C
+- Battery voltage divider on GPIO15
+- Calibration switch on GPIO12
+- Status LEDs on GPIO5 and GPIO16
 
-## Data Transmission
+## Main Behavior
+
+1. Wake from sleep.
+2. Read battery before Wi-Fi activity.
+3. Initialize sensors.
+4. Collect filtered tilt and temperature readings.
+5. Calculate specific gravity.
+6. Send ESP-NOW payload with protocol version and CRC.
+7. Return to deep sleep.
+
+Calibration switch ON keeps the float awake for the base station calibration workflow.
+
+## Required Libraries
+
+- EmotiBit BMI160
+- Adafruit BMP085
+- Wire
+- EEPROM
+
+## Configuration
+
+Set the base station MAC address in `SGNode_Float.ino`:
+
+```cpp
+uint8_t baseStationMac[] = {0xA4, 0xF0, 0x0F, 0x68, 0x22, 0x00};
 ```
-Protocol Version: 2
-Payload: SG, Temperature, Battery Voltage, Sequence ID, Flags, CRC
-Interval: 180 seconds (configurable 60-600s)
-```
 
-## Installation
-1. Install required libraries:
-   - EmotiBit BMI160 (from GitHub ZIP)
-   - Adafruit BMP085 Library
-   - Wire, EEPROM (built-in)
-
-2. Configure base station MAC address in code:
-   ```cpp
-   uint8_t baseStationMac[] = {0xA4, 0xF0, 0x0F, 0x68, 0x22, 0x00};
-   ```
-
-3. Upload sketch and connect battery voltage divider to GPIO15
+The shared payload format is defined in `../SGNode_Shared/sg_protocol.h`.
 
 ## Calibration
-- Physical switch on GPIO12 enables calibration mode
-- Polynomial calibration stored in EEPROM
-- Use base station commands for calibration points
 
-## Status
-**v0.3.0-alpha - Design Freeze - Stable Release**
-- ✅ All core functions operational
-- ✅ Battery monitoring calibrated (1.048 factor)
-- ✅ ESP-NOW transmission reliable with CRC verification
-- ✅ Deep sleep power management
-- ✅ Sensor data accurate
-- ✅ Polynomial calibration system working
-- ✅ Hardware watchdog timer implemented
+Calibration coefficients are stored in EEPROM. The base station sends calibration commands while the float is in calibration mode.
 
-## Power Consumption
-- **Active**: ~80mA (sensors + WiFi)
-- **Deep Sleep**: ~10µA
-- **Battery Life**: ~2-3 weeks (typical usage)
+Current behavior:
+- Sensor offset calibration is supported.
+- Multiple SG points are recorded.
+- Polynomial coefficients are calculated on the float.
+- EEPROM versioning is used for backward compatibility.
+
+Adding extra optional calibration points normally requires flashing the float because the point handling, polynomial fit, and EEPROM format live in the float firmware.
+
+## Power Notes
+
+- Deep sleep is the expected normal state.
+- Calibration mode has high drain because the float stays awake.
+- Battery measurement uses GPIO15 with a calibrated voltage divider.
+- If battery drain is high, first confirm that the float is not staying in calibration mode and that the sleep interval is actually reached after each send.
 
 ## Troubleshooting
-- **No data received**: Check base station MAC address
-- **Battery reads 0V**: Verify voltage divider connection to GPIO15
-- **WiFi issues**: Ensure ADC1 pins used (GPIO15 is ADC1_CH3)
 
-## Development Notes
-- Battery voltage read before WiFi initialization to avoid ADC interference
-- SOC calculated locally but not transmitted (base station can calculate)
-- Calibration factor accounts for voltage divider and ADC tolerance
-- Payload size maintained for base station compatibility
+- No packets: check base station MAC and ESP-NOW channel.
+- Wrong SG: recalibrate and verify the float is mechanically stable.
+- Wrong temperature: check BMP180 wiring and I2C sharing.
+- Battery reads wrong: verify the divider and calibration factor.
+- Fast drain: inspect deep sleep entry and sensor power behavior.

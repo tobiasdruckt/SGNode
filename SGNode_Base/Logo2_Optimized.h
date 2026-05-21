@@ -24,7 +24,7 @@ const uint16_t logo2_width = 255;
 const uint16_t logo2_height = 220;
 
 // Include the optimized pixel data
-#include "Logo2_Optimized_Data_Cleaned.h"
+#include "Logo2_Optimized_Data.h"
 
 
 #endif // LOGO2_OPTIMIZED_H

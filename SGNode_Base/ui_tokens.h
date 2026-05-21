@@ -8,7 +8,7 @@
 #define NAV_H           44   // Bottom navigation height
 #define MARGIN          14   // General margin spacing
 #define GAP             12   // Gap between elements
-#define CARD_RADIUS     18   // Card corner radius (ultra-clean)
+#define CARD_RADIUS     8    // Card corner radius, compact for 4-inch UI
 #define TILE_H          80   // Standard tile height
 #define HERO_H          120  // Hero section height
 
@@ -36,7 +36,8 @@
 #define TAB_COUNT       4
 #define TAB_LIVE        0
 #define TAB_GRAPH       1
-#define TAB_BATTERY     2
+#define TAB_DASHBOARD   2
+#define TAB_BATTERY     TAB_DASHBOARD
 #define TAB_MORE        3
 
 // Color constants (RGB565)

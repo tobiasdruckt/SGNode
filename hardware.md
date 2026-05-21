@@ -1,139 +1,85 @@
-# Hardware Documentation
+# SGNode Hardware Notes
 
-## Bill of Materials (BOM)
+**Current release:** alpha 0.4.0
+
+## Bill Of Materials
 
 ### Float Unit
 
-| Component | Quantity | Notes | Source |
-|-----------|----------|-------|--------|
-| WeMos D32 ESP32 Board | 1 | Built-in 18650 battery holder | Amazon / AliExpress |
-| BMI160 IMU Sensor | 1 | 6-axis accelerometer/gyroscope | Amazon / AliExpress |
-| GY-68 BMP180 Sensor | 1 | Temperature/pressure sensor | Amazon / AliExpress |
-| 18650 Li-ion Battery | 1 | 2000mAh+ recommended | Amazon / electronics store |
-| SPST Switch | 1 | For calibration mode | Electronics store |
-| Jumper Wires | Various | For connections | Electronics store |
-| PCB / Prototyping Board | 1 | Optional, for neat wiring | Electronics store |
+| Part | Qty | Notes |
+| --- | ---: | --- |
+| WeMos D32 ESP32 board | 1 | Built-in 18650 holder and charger |
+| BMI160 IMU | 1 | Tilt measurement |
+| BMP180 / GY-68 | 1 | Temperature measurement |
+| 18650 Li-ion cell | 1 | 2000 mAh or larger recommended |
+| SPST switch | 1 | Calibration mode on GPIO12 |
+| Waterproof enclosure | 1 | Must fit fermenter opening |
 
 ### Base Station
 
-| Component | Quantity | Notes | Source |
-|-----------|----------|-------|--------|
-| 4.0inch ESP32-32E Display | 1 | Integrated ESP32 + ST7796 display + touch | LilyGO / AliExpress |
-| MicroSD Card | 1 | 4GB+ for data logging | Electronics store |
-| 5V Power Supply | 1 | USB or external (2A+) | Electronics store |
-| USB-C Cable | 1 | For power/uploading | Electronics store |
+| Part | Qty | Notes |
+| --- | ---: | --- |
+| 4.0-inch ESP32-32E display module | 1 | Integrated ESP32, ST7796 display, touch |
+| MicroSD card | 1 | FAT32, 4 GB or larger |
+| 5V USB power supply | 1 | 2 A recommended |
+| DS323x-compatible RTC | 1 | Optional but recommended for stable timestamps |
 
-## 3D Printed Parts
+## Float Pin Summary
 
-### Float Unit Enclosure
-- **Status**: Design pending
-- **Purpose**: Waterproof housing for float unit
-- **Features to include**:
-  - Compartment for WeMos D32 board
-  - Mounting points for sensors
-  - Battery compartment access
-  - Calibration switch access
-  - Waterproof seal design
-  - Float attachment point
+| Signal | GPIO | Notes |
+| --- | ---: | --- |
+| I2C SDA | 21 | BMI160 and BMP180 |
+| I2C SCL | 22 | BMI160 and BMP180 |
+| Battery ADC | 15 | 51k/51k divider plus capacitor |
+| Calibration switch | 12 | Switch to GND |
+| Built-in LED | 5 | Status |
+| Extra LED | 16 | Calibration indicator |
 
-### Base Station Display Enclosure
-- **Status**: Design pending
-- **Purpose**: Protective housing for 4.0inch display
-- **Features to include**:
-  - Display window with touch access
-  - Mounting stand/bracket
-  - Cable management
-  - Ventilation for ESP32
-  - SD card access slot
+## Base Pin Summary
 
-## Wiring Diagrams
+The 4-inch base module has display, touch, and SD wiring integrated. Current firmware also supports an RTC:
 
-### Float Unit Connections
-```
-WeMos D32 ESP32 Board:
-├── BMI160 IMU (I2C)
-│   ├── VCC → 3.3V
-│   ├── GND → GND
-│   ├── SDA → GPIO 21
-│   └── SCL → GPIO 22
-├── BMP180 (I2C)
-│   ├── VCC → 3.3V
-│   ├── GND → GND
-│   ├── SDA → GPIO 21 (shared with BMI160)
-│   └── SCL → GPIO 22 (shared with BMI160)
-├── Calibration Switch
-│   ├── One side → GPIO 12
-│   └── Other side → GND
-└── Battery
-    └── Built-in 18650 holder on WeMos D32
-```
-
-### Base Station Connections
-```
-4.0inch ESP32-32E Display:
-├── Built-in ST7796 Display (SPI)
-├── Built-in XPT2046 Touchscreen (SPI)
-├── MicroSD Card Slot (SPI)
-└── USB-C for power and programming
-```
+| Signal | GPIO |
+| --- | ---: |
+| RTC SDA | 32 |
+| RTC SCL | 25 |
+| SD CS | 13 |
+| Display CS | 5 |
+| Touch CS | 15 |
 
 ## Assembly Notes
 
-### Float Unit Assembly
-1. Mount WeMos D32 in enclosure
-2. Connect BMI160 and BMP180 via I2C (shared bus)
-3. Install calibration switch on GPIO 12
-4. Install 18650 battery in holder
-5. Test all connections before sealing enclosure
-6. Ensure waterproof seal is properly installed
+- Keep the float antenna area clear of metal.
+- Mount the IMU rigidly; movement inside the enclosure will ruin calibration.
+- Put the battery low in the float for stable orientation.
+- Seal the float enclosure before real fermentation use.
+- Keep SD card access available on the base enclosure.
+- Use a stable 5V supply for the base station; display and SD writes need margin.
 
-### Base Station Assembly
-1. The 4.0inch ESP32-32E Display is an all-in-one unit
-2. Simply connect via USB-C for power
-3. Insert MicroSD card for data logging
-4. Mount in 3D printed enclosure when available
+## Power Notes
 
-## Power Requirements
+### Float
 
-### Float Unit
-- **Operating Voltage**: 3.3V (regulated by WeMos D32)
-- **Battery**: 18650 Li-ion (3.7V nominal)
-- **Expected Battery Life**: 2-4 weeks with 2000mAh battery (depends on measurement interval)
-- **Charging**: Built-in TP4056 charging circuit on WeMos D32
+- Normal operation should spend most time in deep sleep.
+- Calibration mode keeps the float awake and drains the battery quickly.
+- If drain is high, measure sleep current directly and confirm sensor shutdown behavior.
 
-### Base Station
-- **Operating Voltage**: 5V via USB-C
-- **Current Draw**: ~200-500mA (display dependent)
-- **Power Supply**: 5V 2A+ recommended
+### Base
 
-## Sensor Specifications
+- Designed for powered operation, not battery operation.
+- Typical draw depends heavily on display backlight.
+- SD access is mounted only when needed to reduce SPI/touch conflicts.
 
-### BMI160 IMU
-- **Type**: 6-axis IMU (3-axis accelerometer + 3-axis gyroscope)
-- **Interface**: I2C
-- **Accelerometer Range**: ±2g, ±4g, ±8g, ±16g
-- **Gyroscope Range**: ±125°/s to ±2000°/s
-- **I2C Address**: 0x68
+## Enclosure Targets
 
-### BMP180
-- **Type**: Temperature and Pressure Sensor
-- **Interface**: I2C
-- **Temperature Range**: -40°C to +85°C
-- **Pressure Range**: 300 to 1100 hPa
-- **I2C Address**: 0x77
+### Float
 
-## Enclosure Design Guidelines
+- PETG or ABS preferred.
+- Waterproof target: IP67 style sealing.
+- Stable buoyancy and consistent tilt response are more important than minimum size.
 
-### Float Unit Enclosure
-- **Material**: PETG or ABS (water-resistant)
-- **Wall Thickness**: 2-3mm
-- **IP Rating**: IP67 target
-- **Size**: Compact, fits standard fermenter opening
-- **Weight**: Neutral buoyancy when partially filled
+### Base
 
-### Base Station Enclosure
-- **Material**: PLA or PETG
-- **Wall Thickness**: 2-3mm
-- **Design**: Desktop stand or wall mount option
-- **Access**: Easy SD card and USB access
-- **Ventilation**: Passive cooling vents for ESP32
+- Desktop stand or wall mount.
+- Access for USB and MicroSD.
+- Passive ventilation for ESP32 and display driver.

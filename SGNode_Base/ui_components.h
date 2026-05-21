@@ -13,13 +13,10 @@
 // battPercent: Battery percentage (0-100)
 void uiDrawTopbar(const char* title, bool espNowOk, bool sdOk, uint8_t battPercent);
 
-// Redraw only the topbar region (for status updates)
-void uiRedrawTopbar();
-
 // Bottom navigation component
 // Draws bottom navigation bar with 4 tabs
 // activeTab: Currently active tab index (0-3)
-// Tabs: LIVE, GRAPH, CALIB, MORE with icons and gold underline
+// Tabs: LIVE, GRAPH, DASHBOARD, MORE with icons and underline
 void uiDrawBottomNav(int activeTab);
 
 // Navigation hit test - returns which tab was touched

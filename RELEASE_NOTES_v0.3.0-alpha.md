@@ -1,5 +1,7 @@
 # SGNode v0.3.0-alpha Release Notes
 
+> Historical archive. Current documentation and active release notes are in `README.md` and `RELEASE_NOTES_v0.4.0-alpha.md`.
+
 **Release Date:** May 6, 2026  
 **Status:** Design Freeze - Alpha Release  
 

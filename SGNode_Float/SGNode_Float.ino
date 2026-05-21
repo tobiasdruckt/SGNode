@@ -114,6 +114,7 @@ void initIMU();
 void initBMP180();
 void initESPNow();
 void configureUnusedGPIOs();
+void suspendBMI160();
 float measureTilt();
 float measureTemperature();
 float calculateDensity(float angle, float temperature);
@@ -125,7 +126,6 @@ void onCalibrationCommand(const uint8_t *mac, const uint8_t *incomingData, int l
 void sendCalibrationResponse(float angle, float target_sg, uint8_t request_id, const char* message);
 void sendCalibrationCoefficients(uint8_t request_id);
 uint16_t crc16(const uint8_t* data, size_t length);
-float medianFilter(float arr[], int n);
 float ema(float prev, float x, float alpha);
 
 void setup() {
@@ -305,13 +305,14 @@ void loop() {
   switch (currentState) {
     case INIT:
       if (debug_mode) Serial.println("State: INIT");
-      delay(3000);  // 3s stabilization delay after wake
+      delay(100);   // Short stabilization delay after wake
       initIMU();
       initBMP180();
-      initESPNow();
+      // WiFi initialization moved to SEND state for power savings
       
       // Send calibration trigger if in calibration mode and ESP-NOW is ready
       if (calibrationMode) {
+        initESPNow();  // Only init WiFi in calibration mode
         static bool calibrationTriggerSent = false;
         if (!calibrationTriggerSent) {
           sendCalibrationTrigger();
@@ -334,8 +335,9 @@ void loop() {
       break;
       
     case SEND:
-      // Only transmit normal data if NOT in calibration mode
+      // Initialize WiFi only when needed for transmission (power savings)
       if (!calibrationMode) {
+        initESPNow();  // Initialize WiFi/ESP-NOW only for transmission
         if (debug_mode) Serial.println("Transmitting normal sensor data");
         transmitData();
         currentState = SLEEP;
@@ -386,6 +388,24 @@ void initIMU() {
     sensorData.flags |= 0x02;  // Set sensor error flag
   }
   delay(50);
+}
+
+void suspendBMI160() {
+  // Put BMI160 into suspend mode for power savings
+  // In suspend mode, BMI160 draws ~3uA vs ~925uA in normal mode
+  Wire.beginTransmission(0x69);
+  Wire.write(0x7E);  // Command register address
+  Wire.write(0x10);  // Suspend accelerometer
+  Wire.endTransmission();
+  
+  delay(10);
+  
+  Wire.beginTransmission(0x69);
+  Wire.write(0x7E);  // Command register address
+  Wire.write(0x14);  // Suspend gyroscope
+  Wire.endTransmission();
+  
+  if (debug_mode) Serial.println("BMI160 put into suspend mode");
 }
 
 void initBMP180() {
@@ -615,11 +635,20 @@ uint8_t calculateSOC(float voltage) {
 }
 
 float getBatteryVoltage() {
-  // Read ADC value - pin 15 (ADC1_CH3) with 11dB attenuation
-  int adc_value = analogRead(BATTERY_PIN);
+  // Read ADC value with averaging for better accuracy and power efficiency
+  // Reduced from 10 samples to 5 samples with 5ms delays (25ms total vs 100ms)
+  const int numSamples = 5;
+  int total = 0;
+  
+  for (int i = 0; i < numSamples; i++) {
+    total += analogRead(BATTERY_PIN);
+    delay(5);  // 5ms delay between samples
+  }
+  
+  int adc_value = total / numSamples;
   
   // Always show raw ADC value for battery debugging
-  Serial.printf("Raw ADC pin 15: %d", adc_value);
+  Serial.printf("Raw ADC pin 15 (avg of %d): %d", numSamples, adc_value);
   if (adc_value == 0) {
     Serial.println(" - No battery detected");
   } else {
@@ -735,7 +764,7 @@ void transmitData() {
   // Turn off WiFi completely (only in normal mode)
   if (!calibrationMode) {
     esp_now_deinit();
-    WiFi.mode(WIFI_OFF);
+    WiFi.mode(WIFI_OFF);  // Turn off WiFi radio
     delay(100);  // Wait for WiFi to fully shut down
   }
 }
@@ -743,10 +772,12 @@ void transmitData() {
 void enterDeepSleep() {
   if (debug_mode) Serial.println("Entering deep sleep...");
   
+  // Put BMI160 into suspend mode for power savings (~3uA vs ~925uA)
+  suspendBMI160();
+  
   // Ensure WiFi/ESP-NOW is fully deinitialized before sleep
   esp_now_deinit();
-  WiFi.mode(WIFI_OFF);
-  // esp_wifi_stop is deprecated in newer ESP-IDF versions
+  WiFi.mode(WIFI_OFF);  // Turn off WiFi radio
   
   // Adjust sleep interval based on battery voltage
   uint64_t sleep_duration = MEASUREMENT_INTERVAL * 1000000ULL;
@@ -1040,21 +1071,6 @@ uint16_t crc16(const uint8_t* data, size_t length) {
     }
   }
   return crc;
-}
-
-// Median filter for noise reduction
-float medianFilter(float arr[], int n) {
-  // Simple bubble sort for small arrays
-  for (int i = 0; i < n-1; i++) {
-    for (int j = 0; j < n-i-1; j++) {
-      if (arr[j] > arr[j+1]) {
-        float temp = arr[j];
-        arr[j] = arr[j+1];
-        arr[j+1] = temp;
-      }
-    }
-  }
-  return arr[n/2];  // Return median
 }
 
 // Helper functions for calibration mode management

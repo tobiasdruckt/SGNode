@@ -1,24 +1,30 @@
 #include "ui_components.h"
 #include <TFT_eSPI.h>
+#include <string.h>
 
 // External references to TFT and theme from main sketch
 extern TFT_eSPI tft;
 extern struct Theme {
   uint16_t background;
   uint16_t cardBackground;
-  uint16_t textPrimary;
-  uint16_t textSecondary;
-  uint16_t textMuted;
-  uint16_t border;
+  uint16_t buttonInactive;
   uint16_t primary;
   uint16_t primaryText;
   uint16_t accent;
-  uint16_t success;
-  uint16_t error;
-  uint16_t warning;
-  uint16_t info;
-  uint16_t buttonInactive;
+  uint16_t accentText;
   uint16_t gold;
+  uint16_t textPrimary;
+  uint16_t textSecondary;
+  uint16_t textMuted;
+  uint16_t success;
+  uint16_t warning;
+  uint16_t error;
+  uint16_t info;
+  uint16_t border;
+  uint16_t gridLine;
+  uint16_t graphPurple;
+  uint16_t graphBlue;
+  uint16_t graphGreen;
 } *currentTheme;
 
 // UI color token implementations
@@ -56,14 +62,20 @@ void uiInitColors() {
 }
 
 void uiDrawTopbar(const char* title, bool espNowOk, bool sdOk, uint8_t battPercent) {
-  // Draw top bar background with navy color
-  tft.fillRect(0, 0, UI_W, TOPBAR_H, uiColorPrimary);  // Using primary (navy)
+  tft.fillRect(0, 0, UI_W, TOPBAR_H, uiColorPrimary);
   
-  // Draw title "SGNode" (left side)
   tft.setTextColor(uiColorPrimaryText);
-  tft.setFreeFont(FONT_SIZE_SM);  // Use smaller font
-  tft.setCursor(MARGIN, TOPBAR_H / 2 + 4);  // Adjust position
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(MARGIN, TOPBAR_H / 2 + 4);
   tft.print("SGNode");
+
+  if (title != NULL && title[0] != '\0' && strcmp(title, "SGNode") != 0) {
+    char viewTitle[28];
+    uiEllipsize(title, 160, viewTitle, sizeof(viewTitle));
+    tft.setFreeFont(FONT_SIZE_XS);
+    tft.setCursor(MARGIN + 92, TOPBAR_H / 2 + 4);
+    tft.print(viewTitle);
+  }
   
   // Draw battery icon + percentage on the right side
   int battW = 24;                  // Battery body width
@@ -93,13 +105,6 @@ void uiDrawTopbar(const char* title, bool espNowOk, bool sdOk, uint8_t battPerce
   tft.print(battBuf);
 }
 
-void uiRedrawTopbar() {
-  // Redraw only the topbar region - called for status updates
-  // Note: Need external data for status - this is a placeholder
-  // In practice, the caller should use uiDrawTopbar with current status
-  tft.fillRect(0, 0, UI_W, TOPBAR_H, uiColorPrimary);
-}
-
 int uiNavHitTest(int x, int y) {
   int navY = UI_H - NAV_H;
   if (y < navY) return -1;  // Not in nav area
@@ -113,22 +118,28 @@ int uiNavHitTest(int x, int y) {
 void uiDrawBottomNav(int activeTab) {
   int navY = UI_H - NAV_H;
   int tabWidth = UI_W / TAB_COUNT;
+  int labelCenters[TAB_COUNT] = {
+    tabWidth / 2,
+    tabWidth + 50,
+    tabWidth * 2 + 66,
+    tabWidth * 3 + tabWidth / 2
+  };
   
   // Draw navigation background
   tft.fillRect(0, navY, UI_W, NAV_H, uiColorCardBackground);
   
   // Tab labels
-  const char* tabLabels[] = {"LIVE", "GRAPH", "BATTERY", ""};
+  const char* tabLabels[] = {"LIVE", "GRAPH", "DASHBOARD", ""};
   
   for (int i = 0; i < TAB_COUNT; i++) {
     int tabX = i * tabWidth;
-    int centerX = tabX + tabWidth / 2;
+    int centerX = labelCenters[i];
     
     // Remove icon circles - cleaner look
     
     if (i == 3) {
       // Draw hamburger menu icon manually (3 horizontal lines) - double size
-      uint16_t iconColor = (i == activeTab) ? COLOR_BLUE : COLOR_MUTED;
+      uint16_t iconColor = (i == activeTab) ? uiColorInfo : uiColorTextMuted;
       int iconY = navY + 12;
       int iconX = centerX - 16;
       int lineLength = 32;
@@ -139,17 +150,17 @@ void uiDrawBottomNav(int activeTab) {
       tft.drawFastHLine(iconX, iconY + lineSpacing * 2, lineLength, iconColor);
     } else {
       // Draw label centered using textWidth
-      tft.setTextColor(i == activeTab ? COLOR_BLUE : COLOR_MUTED);
+      tft.setTextColor(i == activeTab ? uiColorInfo : uiColorTextMuted);
       tft.setFreeFont(FONT_SIZE_SM);
       int labelWidth = tft.textWidth(tabLabels[i]);
-      int labelX = tabX + (tabWidth - labelWidth) / 2;
+      int labelX = centerX - labelWidth / 2;
       tft.setCursor(labelX, navY + 28);  // Adjust for FreeFont baseline
       tft.print(tabLabels[i]);
     }
     
     // Draw blue underline for active tab (thin bar)
     if (i == activeTab) {
-      tft.drawFastHLine(tabX + 20, navY + NAV_H - 3, tabWidth - 40, COLOR_BLUE);
+      tft.drawFastHLine(tabX + 20, navY + NAV_H - 3, tabWidth - 40, uiColorInfo);
     }
   }
 }
@@ -244,12 +255,17 @@ void uiHeroSG(int x, int y, int w, int h, float sgValue, const char* trendText,
 
 void uiDrawSparkline(int x, int y, int w, int h, float* data, int count) {
   // Draw sparkline background
-  tft.fillRect(x, y, w, h, uiColorBackground);
+  tft.fillRect(x, y, w, h, uiColorCardBackground);
   
   if (data == NULL || count < 2) {
     // Draw placeholder line
-    tft.drawFastHLine(x, y + h / 2, w, uiColorTextMuted);
+    tft.drawFastHLine(x, y + h / 2, w, currentTheme->gridLine);
     return;
+  }
+
+  for (int i = 1; i < 4; i++) {
+    int gy = y + (h * i / 4);
+    tft.drawFastHLine(x, gy, w, currentTheme->gridLine);
   }
   
   // Find min/max for scaling
@@ -270,12 +286,15 @@ void uiDrawSparkline(int x, int y, int w, int h, float* data, int count) {
     int py = y + h - ((data[i] - minVal) / range * h);
     
     if (prevX >= 0 && prevY >= 0) {
-      tft.drawLine(prevX, prevY, px, py, uiColorAccent);
+      tft.drawLine(prevX, prevY, px, py, uiColorGold);
+      tft.drawLine(prevX, prevY + 1, px, py + 1, uiColorGold);
     }
     
     prevX = px;
     prevY = py;
   }
+
+  tft.fillCircle(prevX, prevY, 3, uiColorGold);
 }
 
 void uiTextCenter(int x, int y, int w, int h, const char* text, const GFXfont* font, uint16_t color) {
