@@ -59,14 +59,18 @@ public:
   bool handleTouch(int x, int y);
   bool completed() const;
   bool cancelled() const;
+  bool cancelConfirmationVisible() const;
   void clearResultFlags();
+  BrewWizardStep currentStep() const;
 
 private:
   BrewProfile* profile;
   BrewWizardStep step;
   bool isComplete;
   bool isCancelled;
+  bool confirmCancel;
   char editBuffer[40];
+  char validationMessage[48];
   bool keyboardUpper;
   bool editPristine;
   char yeastHistory[3][32];
@@ -74,6 +78,9 @@ private:
 
   void loadStepBuffer();
   void commitStepBuffer();
+  bool validateCurrentStep();
+  void drawValidationMessage(TFT_eSPI& tft);
+  void drawCancelConfirmation(TFT_eSPI& tft);
   void nextStep();
   void previousStep();
   void drawFrame(TFT_eSPI& tft, const char* title);

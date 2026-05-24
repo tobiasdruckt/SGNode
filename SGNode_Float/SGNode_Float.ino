@@ -31,6 +31,12 @@
 #define MAX_INIT_RETRIES 3        // sensor initialization retry attempts
 #define BATTERY_PIN 15            // Battery voltage monitoring (GPIO15 - ADC1_CH3)
 #define CALIBRATION_SWITCH_PIN 12  // Physical switch for calibration mode (pull-down)
+#define ACK_PACKET_TYPE 0xA5
+#define RETRY_BUFFER_SIZE 8
+#define ACK_WAIT_MS 120
+#ifndef SGNODE_FLOAT_TEST_HARNESS
+#define SGNODE_FLOAT_TEST_HARNESS 0
+#endif
 
 // LED indicators (WeMos D32)
 #define LED_BUILTIN 16           // Built-in LED - blinks during calibration mode
@@ -42,6 +48,31 @@
 uint8_t baseStationMac[] = {0xA4, 0xF0, 0x0F, 0x68, 0x22, 0x00};
 
 payload_t sensorData;
+
+struct StoredPayload {
+  bool valid;
+  payload_t payload;
+};
+
+RTC_DATA_ATTR StoredPayload retryBuffer[RETRY_BUFFER_SIZE];
+RTC_DATA_ATTR uint8_t retryWriteIndex = 0;
+RTC_DATA_ATTR uint16_t lastAckedSeq = 0;
+RTC_DATA_ATTR uint16_t rtcSequenceCounter = 0;
+volatile bool ackReceived = false;
+volatile uint16_t receivedAckSeq = 0;
+#if SGNODE_FLOAT_TEST_HARNESS
+bool harnessNoSleep = true;
+bool harnessPauseStateMachine = true;
+bool harnessMockEnabled = false;
+bool harnessRxDebug = false;
+uint32_t harnessLastIdlePrint = 0;
+float harnessMockAngle = 50.0f;
+float harnessMockTemp = 20.0f;
+float harnessMockBattery = 4.0f;
+float harnessMockSG = 1.000f;
+char harnessCommandBuffer[128];
+size_t harnessCommandLength = 0;
+#endif
 
 // BMP180 instance
 Adafruit_BMP085 bmp180;
@@ -121,12 +152,25 @@ float calculateDensity(float angle, float temperature);
 float getBatteryVoltage();
 void computeSensorData();
 void transmitData();
+void onDataAck(const uint8_t *mac, const uint8_t *incomingData, int len);
+void storePayloadForRetry(const payload_t& payload);
+void markAcked(uint16_t sequence_id);
+void sendRetryPayloads(bool includeCurrent = false);
+bool sendPayloadWithAck(payload_t* payload, bool waitForAck);
 void enterDeepSleep();
 void onCalibrationCommand(const uint8_t *mac, const uint8_t *incomingData, int len);
+void recordCalibrationPoint(float target_sg, uint8_t request_id, uint8_t point_number);
 void sendCalibrationResponse(float angle, float target_sg, uint8_t request_id, const char* message);
 void sendCalibrationCoefficients(uint8_t request_id);
 uint16_t crc16(const uint8_t* data, size_t length);
 float ema(float prev, float x, float alpha);
+#if SGNODE_FLOAT_TEST_HARNESS
+void handleFloatTestHarness();
+bool processFloatHarnessCommand(char* line);
+int retryBufferCount();
+void printFloatHarnessOK(const char* message);
+void printFloatHarnessERR(const char* message);
+#endif
 
 void setup() {
   // Configure unused GPIOs FIRST to avoid conflicts
@@ -175,21 +219,23 @@ void setup() {
   
   debug_mode = calibrationMode;  // Debug mode follows calibration mode
   
-  // Start Serial only if in debug mode
-  if (debug_mode) {
+  // Start Serial in debug/calibration mode or when the test harness is compiled in.
+  if (debug_mode || SGNODE_FLOAT_TEST_HARNESS) {
     Serial.begin(115200);
     delay(100);  // Wait for Serial to initialize
-    
-    Serial.println("=== CALIBRATION MODE ACTIVATED AT BOOT ===");
-    if (switchPressed) {
-      Serial.println("Switch pressed at boot");
-    } else {
-      Serial.println("Woke up from calibration interrupt");
+
+    if (debug_mode) {
+      Serial.println("=== CALIBRATION MODE ACTIVATED AT BOOT ===");
+      if (switchPressed) {
+        Serial.println("Switch pressed at boot");
+      } else {
+        Serial.println("Woke up from calibration interrupt");
+      }
+
+      Serial.printf("Base Station MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    baseStationMac[0], baseStationMac[1], baseStationMac[2],
+                    baseStationMac[3], baseStationMac[4], baseStationMac[5]);
     }
-    
-    Serial.printf("Base Station MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                  baseStationMac[0], baseStationMac[1], baseStationMac[2],
-                  baseStationMac[3], baseStationMac[4], baseStationMac[5]);
   }
   
   if (calibrationMode) {
@@ -208,6 +254,20 @@ void setup() {
   
   // Initialize sensor offset system
   initSensorOffsets();
+
+  #if SGNODE_FLOAT_TEST_HARNESS
+  boot_time = millis() / 1000;
+  Serial.println("OK float_harness_ready paused=1");
+  while (harnessPauseStateMachine) {
+    handleFloatTestHarness();
+    if (harnessRxDebug && millis() - harnessLastIdlePrint > 3000) {
+      harnessLastIdlePrint = millis();
+      Serial.printf("OK float_harness_idle avail=%d\n", Serial.available());
+    }
+    delay(10);
+  }
+  return;
+  #endif
   
   // Configure I2C with pull-ups
   pinMode(I2C_SDA, INPUT_PULLUP);
@@ -241,6 +301,13 @@ void setup() {
 }
 
 void loop() {
+  #if SGNODE_FLOAT_TEST_HARNESS
+  handleFloatTestHarness();
+  if (harnessPauseStateMachine) {
+    delay(10);
+    return;
+  }
+  #endif
   
   // Ensure debug_mode follows calibration mode
   debug_mode = calibrationMode;
@@ -486,17 +553,19 @@ void initESPNow() {
     });
     if (debug_mode) Serial.println("ESP-NOW initialized with calibration support");
   } else {
+    esp_now_register_recv_cb([](const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
+      onDataAck(recv_info->src_addr, data, len);
+    });
     if (debug_mode) Serial.println("ESP-NOW initialized (transmit only)");
   }
 }
 
 void configureUnusedGPIOs() {
   // Configure unused GPIOs as OUTPUT LOW to minimize power consumption
-  // Used GPIOs: 12(switch), 16(LED), 26(I2C_SDA), 27(I2C_SCL), 35(battery)
-  // Skip: strapping pins (0, 2, 15), FLASH pins (6-11), input-only pins (34-39), non-existent pins
+  // Used GPIOs: 1/3(UART0), 12(switch), 15(battery), 16(LED), 26(I2C_SDA), 27(I2C_SCL)
+  // Skip: UART pins (1, 3), strapping pins (0, 2, 15), FLASH pins (6-11), input-only pins (34-39), non-existent pins
   
   const uint8_t unusedGpios[] = {
-    3,              // Safe unused RTC (pin 4 used for battery)
     13, 14,         // Safe unused (SPI/JTAG)
     17, 18, 19, 20, // Safe unused (USB)
     21, 22,         // Safe unused (I2C master)
@@ -699,10 +768,28 @@ float getBatteryVoltage() {
 }
 
 void computeSensorData() {
+  #if SGNODE_FLOAT_TEST_HARNESS
+  if (harnessMockEnabled) {
+    sensorData.angle = harnessMockAngle;
+    sensorData.temperature = harnessMockTemp;
+    sensorData.density = harnessMockSG;
+    sensorData.uptime_s = (millis() / 1000) - boot_time;
+    sequence_counter = rtcSequenceCounter;
+    sensorData.sequence_id = sequence_counter++;
+    rtcSequenceCounter = sequence_counter;
+    sensorData.version = SG_PROTOCOL_VERSION;
+    sensorData.flags = 0;
+    sensorData.battery_voltage = harnessMockBattery;
+    return;
+  }
+  #endif
+
   sensorData.temperature = measureTemperature();
   sensorData.density = calculateDensity(sensorData.angle, sensorData.temperature);
   sensorData.uptime_s = (millis() / 1000) - boot_time;
+  sequence_counter = rtcSequenceCounter;
   sensorData.sequence_id = sequence_counter++;
+  rtcSequenceCounter = sequence_counter;
   sensorData.version = SG_PROTOCOL_VERSION;
   sensorData.flags = 0;  // Clear flags
   
@@ -721,17 +808,76 @@ void computeSensorData() {
 }
 
 void transmitData() {
-  // Calculate CRC before transmission (exclude version from CRC for backward compatibility)
-  size_t payload_size = sizeof(sensorData) - sizeof(sensorData.crc) - sizeof(sensorData.version);
-  sensorData.crc = crc16((const uint8_t*)&sensorData + sizeof(sensorData.version), payload_size);
-  
   if (debug_mode) Serial.println("Transmitting data...");
-  
-  // Send data via ESP-NOW with retry
-  esp_err_t result;
+
+  storePayloadForRetry(sensorData);
+  sendRetryPayloads();
+  bool acked = sendPayloadWithAck(&sensorData, true);
+
+  if (acked) {
+    markAcked(sensorData.sequence_id);
+  } else {
+    sensorData.flags |= 0x01;  // Set delayed flag for local sleep interval handling
+    storePayloadForRetry(sensorData);
+  }
+
+  delay(50);
+
+  // Turn off WiFi completely (only in normal mode)
+  if (!calibrationMode) {
+    esp_now_deinit();
+    WiFi.mode(WIFI_OFF);  // Turn off WiFi radio
+    delay(100);  // Wait for WiFi to fully shut down
+  }
+}
+
+void onDataAck(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  if (len != sizeof(ack_packet_t)) return;
+
+  ack_packet_t ack;
+  memcpy(&ack, incomingData, len);
+  if (ack.packet_type != ACK_PACKET_TYPE) return;
+
+  receivedAckSeq = ack.sequence_id;
+  ackReceived = true;
+  markAcked(ack.sequence_id);
+  if (ack.highest_seen > lastAckedSeq) {
+    lastAckedSeq = ack.highest_seen;
+  }
+}
+
+void storePayloadForRetry(const payload_t& payload) {
+  for (int i = 0; i < RETRY_BUFFER_SIZE; i++) {
+    if (retryBuffer[i].valid && retryBuffer[i].payload.sequence_id == payload.sequence_id) {
+      retryBuffer[i].payload = payload;
+      return;
+    }
+  }
+
+  retryBuffer[retryWriteIndex].valid = true;
+  retryBuffer[retryWriteIndex].payload = payload;
+  retryWriteIndex = (retryWriteIndex + 1) % RETRY_BUFFER_SIZE;
+}
+
+void markAcked(uint16_t sequence_id) {
+  lastAckedSeq = sequence_id;
+  for (int i = 0; i < RETRY_BUFFER_SIZE; i++) {
+    if (retryBuffer[i].valid && retryBuffer[i].payload.sequence_id == sequence_id) {
+      retryBuffer[i].valid = false;
+    }
+  }
+}
+
+bool sendPayloadWithAck(payload_t* payload, bool waitForAck) {
+  size_t payload_size = sizeof(*payload) - sizeof(payload->crc) - sizeof(payload->version);
+  payload->crc = crc16((const uint8_t*)payload + sizeof(payload->version), payload_size);
+
+  esp_err_t result = ESP_FAIL;
   for (int i = 0; i <= MAX_RETRIES; i++) {
-    result = esp_now_send(baseStationMac, (uint8_t *)&sensorData, sizeof(sensorData));
-    
+    ackReceived = false;
+    receivedAckSeq = 0;
+    result = esp_now_send(baseStationMac, (uint8_t *)payload, sizeof(*payload));
+
     if (result == ESP_OK) {
       if (debug_mode) Serial.println("Data sent successfully");
       break;
@@ -742,7 +888,7 @@ void transmitData() {
       delay(100);
     }
   }
-  
+
   if (result != ESP_OK) {
     if (debug_mode) {
       Serial.printf("Error sending data after retries: %d\n", result);
@@ -756,20 +902,45 @@ void transmitData() {
                     baseStationMac[0], baseStationMac[1], baseStationMac[2],
                     baseStationMac[3], baseStationMac[4], baseStationMac[5]);
     }
-    sensorData.flags |= 0x01;  // Set delayed flag
+    return false;
   }
-  
-  delay(50);
-  
-  // Turn off WiFi completely (only in normal mode)
-  if (!calibrationMode) {
-    esp_now_deinit();
-    WiFi.mode(WIFI_OFF);  // Turn off WiFi radio
-    delay(100);  // Wait for WiFi to fully shut down
+
+  if (!waitForAck) return false;
+
+  unsigned long start = millis();
+  while (millis() - start < ACK_WAIT_MS) {
+    if (ackReceived && receivedAckSeq == payload->sequence_id) {
+      return true;
+    }
+    delay(5);
+  }
+  return false;
+}
+
+void sendRetryPayloads(bool includeCurrent) {
+  int sent = 0;
+  for (int i = 0; i < RETRY_BUFFER_SIZE && sent < 2; i++) {
+    if (!retryBuffer[i].valid) continue;
+    if (!includeCurrent && retryBuffer[i].payload.sequence_id == sensorData.sequence_id) continue;
+
+    retryBuffer[i].payload.flags |= 0x01; // delayed/retry flag
+    if (sendPayloadWithAck(&retryBuffer[i].payload, true)) {
+      markAcked(retryBuffer[i].payload.sequence_id);
+    }
+    sent++;
   }
 }
 
 void enterDeepSleep() {
+  #if SGNODE_FLOAT_TEST_HARNESS
+  if (harnessNoSleep) {
+    if (debug_mode) Serial.println("Harness no_sleep active - staying awake");
+    delay(1000);
+    currentState = INIT;
+    return;
+  }
+  #endif
+
   if (debug_mode) Serial.println("Entering deep sleep...");
   
   // Put BMI160 into suspend mode for power savings (~3uA vs ~925uA)
@@ -990,12 +1161,51 @@ void onCalibrationCommand(const uint8_t *mac, const uint8_t *incomingData, int l
         }
       }
       break;
+
+    case 8:
+    case 9:
+    case 10:
+    case 11:
+    case 12:
+    case 13:
+      recordCalibrationPoint(cmd.target_sg, cmd.request_id, cmd.command - 7);
+      break;
       
           
     default:
       if (debug_mode) Serial.println("Unknown calibration command");
       sendCalibrationResponse(0, 0, cmd.request_id, "Unknown command");
       break;
+  }
+}
+
+void recordCalibrationPoint(float target_sg, uint8_t request_id, uint8_t point_number) {
+  if (debug_mode) {
+    Serial.printf("Point %u calibration measurement requested (SG=%.3f)\n", point_number, target_sg);
+  }
+
+  float totalAngle = 0.0f;
+  float totalTemp = 0.0f;
+  int numReadings = 5;
+
+  for (int i = 0; i < numReadings; i++) {
+    totalAngle += measureTilt();
+    totalTemp += measureTemperature();
+    delay(100);
+  }
+
+  float avgAngle = totalAngle / numReadings;
+  float avgTemp = totalTemp / numReadings;
+
+  addCalibrationPoint(avgAngle, target_sg, avgTemp);
+
+  char message[24];
+  snprintf(message, sizeof(message), "Point %u added", point_number);
+  sendCalibrationResponse(avgAngle, target_sg, request_id, message);
+
+  if (debug_mode) {
+    Serial.printf("Point %u averaged: %.2f deg, %.1f C (%d readings)\n",
+                  point_number, avgAngle, avgTemp, numReadings);
   }
 }
 
@@ -1072,6 +1282,208 @@ uint16_t crc16(const uint8_t* data, size_t length) {
   }
   return crc;
 }
+
+#if SGNODE_FLOAT_TEST_HARNESS
+void printFloatHarnessOK(const char* message) {
+  Serial.print("OK");
+  if (message && message[0]) {
+    Serial.print(' ');
+    Serial.print(message);
+  }
+  Serial.println();
+}
+
+void printFloatHarnessERR(const char* message) {
+  Serial.print("ERR");
+  if (message && message[0]) {
+    Serial.print(' ');
+    Serial.print(message);
+  }
+  Serial.println();
+}
+
+int retryBufferCount() {
+  int count = 0;
+  for (int i = 0; i < RETRY_BUFFER_SIZE; i++) {
+    if (retryBuffer[i].valid) count++;
+  }
+  return count;
+}
+
+void handleFloatTestHarness() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      harnessCommandBuffer[harnessCommandLength] = '\0';
+      if (harnessCommandLength > 0) processFloatHarnessCommand(harnessCommandBuffer);
+      harnessCommandLength = 0;
+    } else if (harnessCommandLength + 1 < sizeof(harnessCommandBuffer)) {
+      harnessCommandBuffer[harnessCommandLength++] = c;
+    }
+  }
+}
+
+bool processFloatHarnessCommand(char* line) {
+  char* args = strchr(line, ' ');
+  if (args) {
+    *args++ = '\0';
+    while (*args == ' ') args++;
+  } else {
+    args = line + strlen(line);
+  }
+
+  if (strcmp(line, "help") == 0) {
+    printFloatHarnessOK("commands=help,build_info,status,dump_config,mock_measurement,set_mock_sg,set_mock_temp,set_mock_battery,set_mock_angle,set_sequence,send_now,send_retry_buffer,dump_retry_buffer,clear_retry_buffer,simulate_ack,simulate_no_ack,no_sleep,pause_state,rx_debug,enter_calibration_mode,exit_calibration_mode,calib_status");
+    return true;
+  }
+  if (strcmp(line, "build_info") == 0) {
+    printFloatHarnessOK("build=float_ack_retry_harness_2026_05_23");
+    return true;
+  }
+  if (strcmp(line, "status") == 0) {
+    char msg[160];
+    snprintf(msg, sizeof(msg), "status seq=%u rtcSeq=%u lastAck=%u retry=%d noSleep=%d paused=%d mock=%d calib=%d state=%d",
+             sensorData.sequence_id, rtcSequenceCounter, lastAckedSeq, retryBufferCount(),
+             harnessNoSleep ? 1 : 0, harnessPauseStateMachine ? 1 : 0,
+             harnessMockEnabled ? 1 : 0, calibrationMode ? 1 : 0, (int)currentState);
+    printFloatHarnessOK(msg);
+    return true;
+  }
+  if (strcmp(line, "dump_config") == 0) {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "config interval=%d ackWait=%d retrySize=%d maxRetries=%d",
+             MEASUREMENT_INTERVAL, ACK_WAIT_MS, RETRY_BUFFER_SIZE, MAX_RETRIES);
+    printFloatHarnessOK(msg);
+    return true;
+  }
+  if (strcmp(line, "mock_measurement") == 0) {
+    harnessMockEnabled = true;
+    computeSensorData();
+    printFloatHarnessOK("mock_measurement ready");
+    return true;
+  }
+  if (strcmp(line, "set_mock_sg") == 0) {
+    harnessMockSG = atof(args);
+    harnessMockEnabled = true;
+    printFloatHarnessOK("mock_sg set");
+    return true;
+  }
+  if (strcmp(line, "set_mock_temp") == 0) {
+    harnessMockTemp = atof(args);
+    harnessMockEnabled = true;
+    printFloatHarnessOK("mock_temp set");
+    return true;
+  }
+  if (strcmp(line, "set_mock_battery") == 0) {
+    harnessMockBattery = atof(args);
+    harnessMockEnabled = true;
+    printFloatHarnessOK("mock_battery set");
+    return true;
+  }
+  if (strcmp(line, "set_mock_angle") == 0) {
+    harnessMockAngle = atof(args);
+    harnessMockEnabled = true;
+    printFloatHarnessOK("mock_angle set");
+    return true;
+  }
+  if (strcmp(line, "set_sequence") == 0) {
+    rtcSequenceCounter = (uint16_t)atoi(args);
+    sequence_counter = rtcSequenceCounter;
+    printFloatHarnessOK("sequence set");
+    return true;
+  }
+  if (strcmp(line, "send_now") == 0) {
+    if (!harnessMockEnabled) {
+      harnessMockEnabled = true;
+    }
+    computeSensorData();
+    if (WiFi.getMode() == WIFI_OFF) initESPNow();
+    bool acked = sendPayloadWithAck(&sensorData, true);
+    if (acked) markAcked(sensorData.sequence_id);
+    else storePayloadForRetry(sensorData);
+    char msg[80];
+    snprintf(msg, sizeof(msg), "send_now seq=%u ack=%d retry=%d", sensorData.sequence_id, acked ? 1 : 0, retryBufferCount());
+    printFloatHarnessOK(msg);
+    return true;
+  }
+  if (strcmp(line, "send_retry_buffer") == 0) {
+    if (WiFi.getMode() == WIFI_OFF) initESPNow();
+    int before = retryBufferCount();
+    sendRetryPayloads(true);
+    char msg[64];
+    snprintf(msg, sizeof(msg), "retry_sent before=%d after=%d", before, retryBufferCount());
+    printFloatHarnessOK(msg);
+    return true;
+  }
+  if (strcmp(line, "dump_retry_buffer") == 0) {
+    char msg[180];
+    int used = snprintf(msg, sizeof(msg), "retry count=%d", retryBufferCount());
+    for (int i = 0; i < RETRY_BUFFER_SIZE && used < (int)sizeof(msg) - 12; i++) {
+      if (retryBuffer[i].valid) {
+        used += snprintf(msg + used, sizeof(msg) - used, " %u", retryBuffer[i].payload.sequence_id);
+      }
+    }
+    printFloatHarnessOK(msg);
+    return true;
+  }
+  if (strcmp(line, "clear_retry_buffer") == 0) {
+    memset(retryBuffer, 0, sizeof(retryBuffer));
+    retryWriteIndex = 0;
+    printFloatHarnessOK("retry_cleared");
+    return true;
+  }
+  if (strcmp(line, "simulate_ack") == 0) {
+    uint16_t seq = (uint16_t)atoi(args);
+    markAcked(seq);
+    printFloatHarnessOK("ack_simulated");
+    return true;
+  }
+  if (strcmp(line, "simulate_no_ack") == 0) {
+    storePayloadForRetry(sensorData);
+    printFloatHarnessOK("no_ack_simulated");
+    return true;
+  }
+  if (strcmp(line, "no_sleep") == 0) {
+    harnessNoSleep = atoi(args) != 0;
+    printFloatHarnessOK(harnessNoSleep ? "no_sleep on" : "no_sleep off");
+    return true;
+  }
+  if (strcmp(line, "pause_state") == 0) {
+    harnessPauseStateMachine = atoi(args) != 0;
+    printFloatHarnessOK(harnessPauseStateMachine ? "state_paused" : "state_running");
+    return true;
+  }
+  if (strcmp(line, "rx_debug") == 0) {
+    harnessRxDebug = atoi(args) != 0;
+    printFloatHarnessOK(harnessRxDebug ? "rx_debug on" : "rx_debug off");
+    return true;
+  }
+  if (strcmp(line, "enter_calibration_mode") == 0) {
+    calibrationMode = true;
+    debug_mode = true;
+    currentState = INIT;
+    printFloatHarnessOK("calibration_mode on");
+    return true;
+  }
+  if (strcmp(line, "exit_calibration_mode") == 0) {
+    exitCalibrationMode();
+    printFloatHarnessOK("calibration_mode off");
+    return true;
+  }
+  if (strcmp(line, "calib_status") == 0) {
+    char msg[96];
+    snprintf(msg, sizeof(msg), "calib mode=%d points=%d valid=%d offset=%d",
+             calibrationMode ? 1 : 0, numCalibPoints, isCalibrationValid() ? 1 : 0,
+             isSensorOffsetValid() ? 1 : 0);
+    printFloatHarnessOK(msg);
+    return true;
+  }
+
+  printFloatHarnessERR("unknown_command");
+  return false;
+}
+#endif
 
 // Helper functions for calibration mode management
 void toggleCalibrationMode() {

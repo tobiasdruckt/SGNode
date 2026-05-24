@@ -277,7 +277,13 @@ void uiDrawSparkline(int x, int y, int w, int h, float* data, int count) {
   }
   
   float range = maxVal - minVal;
-  if (range == 0) range = 1;
+  const float minVisualRange = 0.006f;
+  if (range < minVisualRange) {
+    float mid = (maxVal + minVal) * 0.5f;
+    minVal = mid - minVisualRange * 0.5f;
+    maxVal = mid + minVisualRange * 0.5f;
+    range = minVisualRange;
+  }
   
   // Draw sparkline
   int prevX = -1, prevY = -1;

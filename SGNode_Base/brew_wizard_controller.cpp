@@ -2,6 +2,7 @@
 #include "brix_converter.h"
 #include "derived_calculations.h"
 #include "yeast_preset_repository.h"
+#include "batch_action.h"
 #include "ui_tokens.h"
 #include "ui_components.h"
 #include <string.h>
@@ -18,8 +19,8 @@ extern uint16_t uiColorSuccess;
 extern uint16_t uiColorGold;
 
 static const char* STYLE_VALUES[] = {
-  "German Pils", "Helles", "Koelsch", "Wheat Beer",
-  "IPA", "Pale Ale", "Stout", "Porter",
+  "German Pils", "Hoppy Pils", "Helles", "Koelsch",
+  "Wheat Beer", "IPA", "Pale Ale", "Stout", "Porter",
   "Saison", "Lager", "Cider", "Mead", "Other"
 };
 
@@ -198,6 +199,7 @@ BrewWizardController::BrewWizardController() {
   step = WIZARD_BATCH_NAME;
   isComplete = false;
   isCancelled = false;
+  confirmCancel = false;
   editBuffer[0] = '\0';
   keyboardUpper = true;
   editPristine = false;
@@ -209,6 +211,8 @@ void BrewWizardController::begin(BrewProfile* targetProfile) {
   step = WIZARD_BATCH_NAME;
   isComplete = false;
   isCancelled = false;
+  confirmCancel = false;
+  validationMessage[0] = '\0';
   yeastHistoryCount = BrewProfileStore::loadYeastHistory(yeastHistory, 3);
   if (profile && profile->autoModeEnabled) applySelectedPreset();
   loadStepBuffer();
@@ -216,7 +220,9 @@ void BrewWizardController::begin(BrewProfile* targetProfile) {
 
 bool BrewWizardController::completed() const { return isComplete; }
 bool BrewWizardController::cancelled() const { return isCancelled; }
-void BrewWizardController::clearResultFlags() { isComplete = false; isCancelled = false; }
+bool BrewWizardController::cancelConfirmationVisible() const { return confirmCancel; }
+void BrewWizardController::clearResultFlags() { isComplete = false; isCancelled = false; confirmCancel = false; }
+BrewWizardStep BrewWizardController::currentStep() const { return step; }
 
 void BrewWizardController::loadStepBuffer() {
   if (!profile) return;
@@ -254,7 +260,6 @@ void BrewWizardController::commitStepBuffer() {
       break;
     case WIZARD_BATCH_SIZE:
       profile->batchSizeLiters = atof(editBuffer);
-      if (profile->batchSizeLiters <= 0.0f) profile->batchSizeLiters = 20.0f;
       break;
     case WIZARD_BRIX:
       profile->recipeBrix = atof(editBuffer);
@@ -274,7 +279,54 @@ void BrewWizardController::commitStepBuffer() {
   }
 }
 
+bool BrewWizardController::validateCurrentStep() {
+  validationMessage[0] = '\0';
+  if (!profile) return false;
+
+  if (step == WIZARD_BATCH_SIZE) {
+    float liters = atof(editBuffer);
+    if (liters < 1.0f || liters > 200.0f) {
+      strncpy(validationMessage, "Use 1.0-200.0 L", sizeof(validationMessage) - 1);
+      validationMessage[sizeof(validationMessage) - 1] = '\0';
+      return false;
+    }
+  } else if (step == WIZARD_BRIX) {
+    float brix = atof(editBuffer);
+    if (brix < 2.0f || brix > 35.0f) {
+      strncpy(validationMessage, "Use 2.0-35.0 Brix", sizeof(validationMessage) - 1);
+      validationMessage[sizeof(validationMessage) - 1] = '\0';
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void BrewWizardController::drawValidationMessage(TFT_eSPI& tft) {
+  if (validationMessage[0] == '\0') return;
+  tft.setTextColor(TFT_RED);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(MARGIN, WIZ_INPUT_Y + 54);
+  tft.print(validationMessage);
+}
+
+void BrewWizardController::drawCancelConfirmation(TFT_eSPI& tft) {
+  if (!confirmCancel) return;
+  int x = MARGIN + 28;
+  int y = 86;
+  int w = UI_W - (MARGIN + 28) * 2;
+  int h = 132;
+  tft.fillRoundRect(x, y, w, h, 8, uiColorCardBackground);
+  tft.drawRoundRect(x, y, w, h, 8, uiColorBorder);
+  uiTextCenter(x, y + 18, w, 30, "Discard changes?", FONT_SIZE_MD, uiColorTextPrimary);
+  tft.drawRoundRect(x + 14, y + 68, 116, 38, 8, uiColorBorder);
+  uiTextCenter(x + 14, y + 68, 116, 38, "NO", FONT_SIZE_SM, uiColorTextPrimary);
+  tft.fillRoundRect(x + w - 130, y + 68, 116, 38, 8, uiColorGold);
+  uiTextCenter(x + w - 130, y + 68, 116, 38, "YES", FONT_SIZE_SM, uiColorPrimaryText);
+}
+
 void BrewWizardController::nextStep() {
+  if (!validateCurrentStep()) return;
   commitStepBuffer();
   if (step == WIZARD_REVIEW) {
     isComplete = true;
@@ -292,12 +344,15 @@ void BrewWizardController::nextStep() {
   } else {
     step = (BrewWizardStep)((int)step + 1);
   }
+  if (step == WIZARD_REVIEW && profile) {
+    BatchActionEngine::applyStyleDefaults(profile);
+  }
   loadStepBuffer();
 }
 
 void BrewWizardController::previousStep() {
   if (step == WIZARD_BATCH_NAME) {
-    isCancelled = true;
+    confirmCancel = true;
     return;
   }
   commitStepBuffer();
@@ -447,6 +502,7 @@ void BrewWizardController::selectStyleOffset(int offset) {
   if (idx >= total) idx = 0;
   strncpy(profile->beerStyle, StyleDropdown::valueAt(idx), sizeof(profile->beerStyle) - 1);
   profile->beerStyle[sizeof(profile->beerStyle) - 1] = '\0';
+  BatchActionEngine::applyStyleDefaults(profile);
 }
 
 void BrewWizardController::selectPresetOffset(int offset) {
@@ -474,6 +530,7 @@ void BrewWizardController::draw(TFT_eSPI& tft) {
     case WIZARD_BATCH_SIZE:
       drawFrame(tft, "Batch Size (L)");
       VirtualKeyboardInput::drawNumber(tft, editBuffer);
+      drawValidationMessage(tft);
       drawNav(tft, true, true, "NEXT");
       break;
     case WIZARD_BRIX:
@@ -483,6 +540,7 @@ void BrewWizardController::draw(TFT_eSPI& tft) {
       tft.setFreeFont(FONT_SIZE_SM);
       tft.setCursor(UI_W - MARGIN - 125, WIZ_INPUT_Y + 26);
       tft.printf("OG %.3f", BrixConverter::brixToSG(atof(editBuffer)));
+      drawValidationMessage(tft);
       drawNav(tft, true, true, "NEXT");
       break;
     case WIZARD_AUTO_MODE:
@@ -534,15 +592,40 @@ void BrewWizardController::draw(TFT_eSPI& tft) {
       tft.setCursor(MARGIN, 122); tft.printf("%.1f L, %.1f Brix, OG %.3f", profile->batchSizeLiters, profile->recipeBrix, profile->recipeOG);
       tft.setCursor(MARGIN, 152); tft.printf("%s, %d%% attenuation", profile->yeastName, profile->expectedApparentAttenuation);
       tft.setCursor(MARGIN, 182); tft.printf("Expected FG %.3f", profile->expectedFinalGravity);
-      tft.setCursor(MARGIN, 212); tft.printf("%s / D-rest: %s", profile->autoModeEnabled ? "Auto" : "Manual", profile->diacetylRestEnabled ? "On" : "Off");
+      tft.setCursor(MARGIN, 212);
+      tft.printf("%s / D-rest: %s", profile->autoModeEnabled ? "Auto" : "Manual", profile->diacetylRestEnabled ? "On" : "Off");
+      tft.setTextColor(profile->dryHopEnabled ? uiColorTextPrimary : uiColorTextSecondary);
+      tft.setFreeFont(FONT_SIZE_XS);
+      tft.setCursor(MARGIN, 238);
+      if (profile->dryHopEnabled) {
+        tft.printf("Dry hop: SG %.3f, contact %lu h", profile->dryHopTriggerSG, profile->dryHopContactHours);
+      } else {
+        tft.print("Dry hop: Off");
+      }
       drawNav(tft, true, true, "START");
       break;
     default:
       break;
   }
+  drawCancelConfirmation(tft);
 }
 
 bool BrewWizardController::handleCommonNav(int x, int y) {
+  if (confirmCancel) {
+    int dialogX = MARGIN + 28;
+    int dialogY = 86;
+    int dialogW = UI_W - (MARGIN + 28) * 2;
+    if (hitRect(x, y, dialogX + 14, dialogY + 68, 116, 38)) {
+      confirmCancel = false;
+      return true;
+    }
+    if (hitRect(x, y, dialogX + dialogW - 130, dialogY + 68, 116, 38)) {
+      confirmCancel = false;
+      isCancelled = true;
+      return true;
+    }
+    return true;
+  }
   if (hitRect(x, y, MARGIN - 6, WIZ_NAV_Y - 8, 136, 48)) {
     previousStep();
     return true;

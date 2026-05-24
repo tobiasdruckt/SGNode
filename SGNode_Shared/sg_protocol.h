@@ -21,10 +21,16 @@ typedef struct __attribute__((packed)) {
 // Calibration command structure
 // Size: 1 + 4 + 1 = 6 bytes
 typedef struct __attribute__((packed)) {
-  uint8_t command;        // 0=CALIBRATE_POINT1, 1=CALIBRATE_POINT2, 2=CALIBRATE_POINT3, 3=CALIBRATE_POINT4, 4=APPLY_CALIBRATION, 5=CALIBRATION_TRIGGER
+  uint8_t command;        // 0-3=legacy points, 4=APPLY, 5=OFFSET, 6=TRIGGER, 7=EXIT, 8-13=variable SG points
   float target_sg;        // Target specific gravity for calibration point
   uint8_t request_id;     // Unique ID for response tracking
 } calib_command_t;
+
+typedef struct __attribute__((packed)) {
+  uint8_t packet_type;     // 0xA5 = payload ACK
+  uint16_t sequence_id;    // Echoed payload sequence
+  uint16_t highest_seen;   // Highest sequence observed by base in this boot/session
+} ack_packet_t;
 
 // Calibration response structure
 // Size: 1 + 4 + 4 + 1 + 32 = 42 bytes
@@ -52,5 +58,6 @@ typedef struct __attribute__((packed)) {
 // Compile-time size validation
 static_assert(sizeof(payload_t) == 26, "payload_t size mismatch");
 static_assert(sizeof(calib_command_t) == 6, "calib_command_t size mismatch");
+static_assert(sizeof(ack_packet_t) == 5, "ack_packet_t size mismatch");
 static_assert(sizeof(calib_response_t) == 42, "calib_response_t size mismatch");
 static_assert(sizeof(calib_coeffs_t) == 26, "calib_coeffs_t size mismatch");

@@ -10,6 +10,15 @@ static void jsonEscapePrint(File& file, const char* text) {
   }
 }
 
+static void csvEscapePrint(File& file, const char* text) {
+  file.print('"');
+  for (const char* p = text; p && *p; ++p) {
+    if (*p == '"') file.print('"');
+    if ((unsigned char)*p >= 32) file.print(*p);
+  }
+  file.print('"');
+}
+
 static bool extractString(const char* json, const char* key, char* out, size_t outSize) {
   char pattern[32];
   snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
@@ -88,6 +97,26 @@ void BrewProfileStore::setDefaults(BrewProfile* profile) {
   strcpy(profile->curveTemplate, "clean_ale");
   profile->diacetylRestRecommendedByYeast = false;
   strcpy(profile->attenuationSource, "yeast_preset");
+  profile->completed = false;
+  profile->completedAt = 0;
+  profile->dryHopEnabled = false;
+  profile->dryHopTriggerSG = 1.014f;
+  profile->dryHopContactHours = 48;
+  profile->dryHopDone = false;
+  profile->dryHopSkipped = false;
+  profile->dryHopStartTime = 0;
+  profile->dryHopRemoved = false;
+  profile->dryHopRemoveSkipped = false;
+  profile->dryHopRemovedAt = 0;
+  profile->dRestDone = false;
+  profile->dRestSkipped = false;
+  profile->dRestStartedAt = 0;
+  profile->coldCrashDone = false;
+  profile->coldCrashSkipped = false;
+  profile->coldCrashStartedAt = 0;
+  profile->packageDone = false;
+  profile->packageSkipped = false;
+  profile->packagedAt = 0;
 }
 
 void BrewProfileStore::buildBatchId(int number, char* buffer, size_t bufferSize) {
@@ -106,6 +135,14 @@ void BrewProfileStore::logPath(const char* batchId, char* buffer, size_t bufferS
   snprintf(buffer, bufferSize, "/data/batches/%s/log.csv", batchId);
 }
 
+void BrewProfileStore::eventsPath(const char* batchId, char* buffer, size_t bufferSize) {
+  snprintf(buffer, bufferSize, "/data/batches/%s/events.csv", batchId);
+}
+
+void BrewProfileStore::activeBatchPath(char* buffer, size_t bufferSize) {
+  snprintf(buffer, bufferSize, "/data/active_batch.txt");
+}
+
 bool BrewProfileStore::ensureBatchDirectory(const char* batchId) {
   if (!SD.exists("/data")) SD.mkdir("/data");
   if (!SD.exists("/data/batches")) SD.mkdir("/data/batches");
@@ -113,6 +150,43 @@ bool BrewProfileStore::ensureBatchDirectory(const char* batchId) {
   snprintf(dir, sizeof(dir), "/data/batches/%s", batchId);
   if (!SD.exists(dir)) return SD.mkdir(dir);
   return true;
+}
+
+bool BrewProfileStore::saveActiveBatchId(const char* batchId) {
+  if (!batchId || batchId[0] == '\0') return false;
+  if (!SD.exists("/data")) SD.mkdir("/data");
+  char path[40];
+  activeBatchPath(path, sizeof(path));
+  if (SD.exists(path)) SD.remove(path);
+  File file = SD.open(path, FILE_WRITE);
+  if (!file) return false;
+  file.println(batchId);
+  file.close();
+  return true;
+}
+
+bool BrewProfileStore::loadActiveBatchId(char* batchId, size_t bufferSize) {
+  if (!batchId || bufferSize == 0) return false;
+  batchId[0] = '\0';
+  char path[40];
+  activeBatchPath(path, sizeof(path));
+  File file = SD.open(path, FILE_READ);
+  if (!file) return false;
+  size_t read = file.readBytesUntil('\n', batchId, bufferSize - 1);
+  batchId[read] = '\0';
+  file.close();
+
+  while (read > 0 && (batchId[read - 1] == '\r' || batchId[read - 1] == '\n' || batchId[read - 1] == ' ')) {
+    batchId[--read] = '\0';
+  }
+  return strncmp(batchId, "batch_", 6) == 0;
+}
+
+bool BrewProfileStore::clearActiveBatchId() {
+  char path[40];
+  activeBatchPath(path, sizeof(path));
+  if (!SD.exists(path)) return true;
+  return SD.remove(path);
 }
 
 bool BrewProfileStore::save(const BrewProfile& profile) {
@@ -155,7 +229,27 @@ bool BrewProfileStore::save(const BrewProfile& profile) {
   file.printf("  \"recommendedTempMaxC\":%.1f,\n", profile.recommendedTempMaxC);
   file.print("  \"curveTemplate\":\""); jsonEscapePrint(file, profile.curveTemplate); file.println("\",");
   file.printf("  \"diacetylRestRecommendedByYeast\":%s,\n", profile.diacetylRestRecommendedByYeast ? "true" : "false");
-  file.print("  \"attenuationSource\":\""); jsonEscapePrint(file, profile.attenuationSource); file.println("\"");
+  file.print("  \"attenuationSource\":\""); jsonEscapePrint(file, profile.attenuationSource); file.println("\",");
+  file.printf("  \"completed\":%s,\n", profile.completed ? "true" : "false");
+  file.printf("  \"completedAt\":%lu,\n", profile.completedAt);
+  file.printf("  \"dryHopEnabled\":%s,\n", profile.dryHopEnabled ? "true" : "false");
+  file.printf("  \"dryHopTriggerSG\":%.5f,\n", profile.dryHopTriggerSG);
+  file.printf("  \"dryHopContactHours\":%lu,\n", profile.dryHopContactHours);
+  file.printf("  \"dryHopDone\":%s,\n", profile.dryHopDone ? "true" : "false");
+  file.printf("  \"dryHopSkipped\":%s,\n", profile.dryHopSkipped ? "true" : "false");
+  file.printf("  \"dryHopStartTime\":%lu,\n", profile.dryHopStartTime);
+  file.printf("  \"dryHopRemoved\":%s,\n", profile.dryHopRemoved ? "true" : "false");
+  file.printf("  \"dryHopRemoveSkipped\":%s,\n", profile.dryHopRemoveSkipped ? "true" : "false");
+  file.printf("  \"dryHopRemovedAt\":%lu,\n", profile.dryHopRemovedAt);
+  file.printf("  \"dRestDone\":%s,\n", profile.dRestDone ? "true" : "false");
+  file.printf("  \"dRestSkipped\":%s,\n", profile.dRestSkipped ? "true" : "false");
+  file.printf("  \"dRestStartedAt\":%lu,\n", profile.dRestStartedAt);
+  file.printf("  \"coldCrashDone\":%s,\n", profile.coldCrashDone ? "true" : "false");
+  file.printf("  \"coldCrashSkipped\":%s,\n", profile.coldCrashSkipped ? "true" : "false");
+  file.printf("  \"coldCrashStartedAt\":%lu,\n", profile.coldCrashStartedAt);
+  file.printf("  \"packageDone\":%s,\n", profile.packageDone ? "true" : "false");
+  file.printf("  \"packageSkipped\":%s,\n", profile.packageSkipped ? "true" : "false");
+  file.printf("  \"packagedAt\":%lu\n", profile.packagedAt);
   file.println("}");
   file.close();
   return true;
@@ -172,7 +266,7 @@ bool BrewProfileStore::loadFromPath(const char* path, BrewProfile* profile) {
   if (!file) return false;
   size_t size = file.size();
   if (size > 4095) size = 4095;
-  char json[4096];
+  static char json[4096];
   size_t read = file.readBytes(json, size);
   json[read] = '\0';
   file.close();
@@ -210,6 +304,26 @@ bool BrewProfileStore::loadFromPath(const char* path, BrewProfile* profile) {
   extractString(json, "curveTemplate", profile->curveTemplate, sizeof(profile->curveTemplate));
   profile->diacetylRestRecommendedByYeast = extractBool(json, "diacetylRestRecommendedByYeast", profile->diacetylRestRecommendedByYeast);
   extractString(json, "attenuationSource", profile->attenuationSource, sizeof(profile->attenuationSource));
+  profile->completed = extractBool(json, "completed", profile->completed);
+  profile->completedAt = extractULong(json, "completedAt", profile->completedAt);
+  profile->dryHopEnabled = extractBool(json, "dryHopEnabled", profile->dryHopEnabled);
+  profile->dryHopTriggerSG = extractFloat(json, "dryHopTriggerSG", profile->dryHopTriggerSG);
+  profile->dryHopContactHours = extractULong(json, "dryHopContactHours", profile->dryHopContactHours);
+  profile->dryHopDone = extractBool(json, "dryHopDone", profile->dryHopDone);
+  profile->dryHopSkipped = extractBool(json, "dryHopSkipped", profile->dryHopSkipped);
+  profile->dryHopStartTime = extractULong(json, "dryHopStartTime", profile->dryHopStartTime);
+  profile->dryHopRemoved = extractBool(json, "dryHopRemoved", profile->dryHopRemoved);
+  profile->dryHopRemoveSkipped = extractBool(json, "dryHopRemoveSkipped", profile->dryHopRemoveSkipped);
+  profile->dryHopRemovedAt = extractULong(json, "dryHopRemovedAt", profile->dryHopRemovedAt);
+  profile->dRestDone = extractBool(json, "dRestDone", profile->dRestDone);
+  profile->dRestSkipped = extractBool(json, "dRestSkipped", profile->dRestSkipped);
+  profile->dRestStartedAt = extractULong(json, "dRestStartedAt", profile->dRestStartedAt);
+  profile->coldCrashDone = extractBool(json, "coldCrashDone", profile->coldCrashDone);
+  profile->coldCrashSkipped = extractBool(json, "coldCrashSkipped", profile->coldCrashSkipped);
+  profile->coldCrashStartedAt = extractULong(json, "coldCrashStartedAt", profile->coldCrashStartedAt);
+  profile->packageDone = extractBool(json, "packageDone", profile->packageDone);
+  profile->packageSkipped = extractBool(json, "packageSkipped", profile->packageSkipped);
+  profile->packagedAt = extractULong(json, "packagedAt", profile->packagedAt);
   return true;
 }
 
@@ -281,6 +395,27 @@ bool BrewProfileStore::appendYeastPerformance(const YeastPerformanceSummary& sum
   file.printf("\"fermentationDurationHours\":%.1f,\"averageTemperature\":%.2f,\"completedAt\":%lu}\n",
               summary.fermentationDurationHours, summary.averageTemperature, summary.completedAt);
   file.println("]");
+  file.close();
+  return true;
+}
+
+bool BrewProfileStore::appendBatchEvent(const char* batchId, unsigned long epoch, const char* eventType,
+                                        const char* message, float value) {
+  if (!batchId || batchId[0] == '\0') return false;
+  if (!ensureBatchDirectory(batchId)) return false;
+  char path[80];
+  eventsPath(batchId, path, sizeof(path));
+  bool needsHeader = !SD.exists(path);
+  File file = SD.open(path, FILE_APPEND);
+  if (!file) return false;
+  if (needsHeader) {
+    file.println("epoch,event,message,value");
+  }
+  file.printf("%lu,", epoch);
+  csvEscapePrint(file, eventType ? eventType : "");
+  file.print(",");
+  csvEscapePrint(file, message ? message : "");
+  file.printf(",%.5f\n", value);
   file.close();
   return true;
 }

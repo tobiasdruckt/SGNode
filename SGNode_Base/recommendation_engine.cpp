@@ -2,6 +2,17 @@
 #include <stdio.h>
 #include <string.h>
 
+Recommendation RecommendationEngine::sensorIssue(const char* detail) {
+  Recommendation rec;
+  rec.code = 90;
+  if (detail && detail[0]) {
+    snprintf(rec.message, sizeof(rec.message), "sensor issue: %s", detail);
+  } else {
+    strcpy(rec.message, "sensor issue: check float readings");
+  }
+  return rec;
+}
+
 Recommendation RecommendationEngine::build(FermentationPhase phase, bool ogVerified, bool ogWarning,
                                            float attenuation, float expectedFG, float currentSG) {
   Recommendation rec;
@@ -94,7 +105,8 @@ Recommendation RecommendationEngine::build(const BrewProfile& profile, Fermentat
     }
   }
 
-  if (profile.diacetylRestRecommendedByYeast && phase == FERMENTATION_ACTIVE && attenuation >= 65.0f) {
+  if (profile.diacetylRestRecommendedByYeast && !profile.dRestDone && !profile.dRestSkipped &&
+      phase == FERMENTATION_ACTIVE && attenuation >= 65.0f) {
     rec.code = 85;
     strcpy(rec.message, "Selected yeast usually benefits from D-rest");
     return rec;

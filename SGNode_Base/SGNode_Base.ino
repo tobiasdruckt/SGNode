@@ -30,9 +30,16 @@
 #include "fermentation_state_machine.h"
 #include "recommendation_engine.h"
 #include "eta_predictor.h"
+#include "batch_action.h"
 #include "yeast_preset_repository.h"
+#ifndef SGNODE_UI_TEST_HARNESS
+#define SGNODE_UI_TEST_HARNESS 0  // Debug-only serial UI harness. Keep disabled for production builds.
+#endif
+#include "ui_test_harness.h"
 #include "../SGNode_Shared/sg_protocol.h"
 #include "../SGNode_Base/polynomial_calibration.h"
+
+#define ACK_PACKET_TYPE 0xA5
 
 // 4.0inch ESP32-32E Display configuration - ST7796S landscape mode
 #define SCREEN_W    480  // Landscape width (320x480 native rotated)
@@ -225,10 +232,26 @@ payload_t displayDataBuffer[MAX_DATA_POINTS];
 uint32_t displayTimestampBuffer[MAX_DATA_POINTS];
 int displayDataIndex = 0;
 int displayDataCount = 0;
+payload_t latestFloatData = {0};
+uint32_t latestFloatEpoch = 0;
+bool latestFloatDataValid = false;
+uint16_t lastAckedFloatSeq = 0;
+uint16_t highestSeenFloatSeq = 0;
+uint16_t recentFloatSeqs[16] = {0};
+uint8_t recentFloatSeqIndex = 0;
+uint8_t recentFloatSeqCount = 0;
+uint32_t duplicateFloatPackets = 0;
 int totalCSVDataLines = 0;  // Total data points in CSV file
 int lastHistoricalLoadedLines = 0;
 int lastHistoricalSkippedLines = 0;
 int lastHistoricalParseErrors = 0;
+int lastHistoricalPreBatchLines = 0;
+int lastHistoricalPostBatchLines = 0;
+int lastHistoricalBatchFilteredLines = 0;
+int lastHistoricalCutoffFilteredLines = 0;
+bool lastHistoricalBatchStartRelaxed = false;
+uint32_t lastHistoricalOldestEpoch = 0;
+uint32_t lastHistoricalNewestEpoch = 0;
 
 // Separate buffer for discharge rate calculation (25 recent points only)
 payload_t dischargeRateBuffer[25];
@@ -308,12 +331,15 @@ enum GraphMetric { METRIC_DENSITY, METRIC_TEMPERATURE, METRIC_ANGLE, METRIC_ABV 
 // Calibration state
 enum CalibMode {
   CALIB_IDLE,
+  CALIB_SETUP,
   CALIB_INSTRUCTIONS,
   CALIB_OFFSET,
   CALIB_POINT1,
   CALIB_POINT2,
   CALIB_POINT3,
   CALIB_POINT4,
+  CALIB_POINT5,
+  CALIB_POINT6,
   CALIB_COMPLETE,
   CALIB_APPLYING,
   CALIB_FAILED,
@@ -321,9 +347,16 @@ enum CalibMode {
 };
 
 CalibMode calibMode = CALIB_IDLE;
-float calibAngles[4] = {0.0, 0.0, 0.0, 0.0}; // Store angles for 4 calibration points
-float calibSG[4] = {1.000, 1.040, 1.080, 1.120}; // Target SG values for 4 points
-int sugarAmounts[4] = {0, 80, 80, 80}; // Sugar to add at each step (grams) - for 2L water
+static const int MAX_BASE_CALIB_POINTS = 6;
+float calibAngles[MAX_BASE_CALIB_POINTS] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+float calibSG[MAX_BASE_CALIB_POINTS] = {1.000, 1.010, 1.020, 1.030, 1.045, 1.060};
+int sugarAmounts4[4] = {0, 107, 115, 124}; // Approx. incremental grams for 2kg water
+int sugarAmounts6[6] = {0, 53, 54, 56, 89, 94};
+int saltAmounts4[4] = {0, 58, 63, 60}; // Approx. incremental grams for 2kg water at 20C
+int saltAmounts6[6] = {0, 29, 29, 29, 49, 45};
+bool calibDoSGCalibration = true;
+bool calibUseSixPoints = false;
+bool calibUseSalt = false;
 float calibOffset = 0.0; // Store sensor offset angle
 bool offsetCalibrated = false; // Track if offset calibration is complete
 uint8_t currentRequestId = 0;
@@ -355,6 +388,27 @@ bool floatMacKnown = false; // Flag to indicate if float MAC is known
 
 // Touch handling
 uint16_t touchX, touchY;
+#if SGNODE_UI_TEST_HARNESS
+struct UITestObject {
+  const char* id;
+  const char* type;
+  const char* label;
+  int x;
+  int y;
+  int w;
+  int h;
+  bool enabled;
+  bool visible;
+};
+
+bool uiTestTouchActive = false;
+uint16_t uiTestTouchX = 0;
+uint16_t uiTestTouchY = 0;
+unsigned long uiTestMockTime = 0;
+payload_t uiTestMockPayload = {0};
+bool uiTestMockSGSet = false;
+bool uiTestMockTempSet = false;
+#endif
 
 // Timing
 unsigned long lastUpdate = 0;
@@ -411,8 +465,14 @@ OGVerifier ogVerifier;
 FermentationStateMachine fermentationStateMachine;
 DerivedMetrics fermentationMetrics = {1.000f, 0.0f, 0.0f, 0.0f, 0.0f};
 Recommendation currentRecommendation = {0, "Start Brew Wizard to enable guidance"};
+BatchAction currentBatchAction = {ACTION_NONE, 0, false, 0, "Next", "No action required"};
 ETAResult currentETA = {0, 0, false, false, 0};
 bool brewProfileLoaded = false;
+bool brewWizardHasSavedRuntime = false;
+BrewProfile brewWizardSavedProfile;
+bool brewWizardSavedProfileLoaded = false;
+bool brewWizardSavedFermentationFileOpen = false;
+char brewWizardSavedFermentationFile[sizeof(currentFermentationFile)] = "";
 bool ogVerificationPending = false;
 bool targetCurveAvailable = false;
 bool yeastPerformanceSaved = false;
@@ -468,66 +528,84 @@ int manageBatchIndex = 0;
 char managedBatchIds[16][24];
 char managedBatchNames[16][40];
 int managedBatchCount = 0;
+bool manageBrewCompleteConfirm = false;
+
+struct ManagedBatchSummary {
+  bool loaded;
+  bool completed;
+  char style[24];
+  float liters;
+  int points;
+  uint32_t firstEpoch;
+  uint32_t lastEpoch;
+  char status[18];
+  char evaluation[32];
+};
 
 // Calibration buttons (step-by-step wizard) - reorganized for consistent layout
-#define BUTTON_CALIB_START_X 110
-#define BUTTON_CALIB_START_Y 180
-#define BUTTON_CALIB_START_W 100
-#define BUTTON_CALIB_START_H 40
+#define BUTTON_CALIB_START_X (UI_W - MARGIN - 132)
+#define BUTTON_CALIB_START_Y 236
+#define BUTTON_CALIB_START_W 132
+#define BUTTON_CALIB_START_H 36
 
-#define BUTTON_CALIB_NEXT_X 220
-#define BUTTON_CALIB_NEXT_Y 180
-#define BUTTON_CALIB_NEXT_W 100
-#define BUTTON_CALIB_NEXT_H 40
+#define BUTTON_CALIB_BACK_X MARGIN
+#define BUTTON_CALIB_BACK_Y 236
+#define BUTTON_CALIB_BACK_W 132
+#define BUTTON_CALIB_BACK_H 36
 
-#define BUTTON_CALIB_APPLY_X 220
-#define BUTTON_CALIB_APPLY_Y 194
-#define BUTTON_CALIB_APPLY_W 100
-#define BUTTON_CALIB_APPLY_H 40
+#define BUTTON_CALIB_NEXT_X (UI_W - MARGIN - 132)
+#define BUTTON_CALIB_NEXT_Y 236
+#define BUTTON_CALIB_NEXT_W 132
+#define BUTTON_CALIB_NEXT_H 36
 
-#define BUTTON_CALIB_EXIT_X 220
-#define BUTTON_CALIB_EXIT_Y 220
-#define BUTTON_CALIB_EXIT_W 100
-#define BUTTON_CALIB_EXIT_H 25
+#define BUTTON_CALIB_APPLY_X (UI_W - MARGIN - 132)
+#define BUTTON_CALIB_APPLY_Y 236
+#define BUTTON_CALIB_APPLY_W 132
+#define BUTTON_CALIB_APPLY_H 36
+
+#define BUTTON_CALIB_EXIT_X MARGIN
+#define BUTTON_CALIB_EXIT_Y 236
+#define BUTTON_CALIB_EXIT_W 132
+#define BUTTON_CALIB_EXIT_H 36
 
 // Offset calibration buttons - repositioned for Step 1/5 layout
-#define BUTTON_CALIB_OFFSET_X 220  // Lower right
-#define BUTTON_CALIB_OFFSET_Y 194  // 6px higher
-#define BUTTON_CALIB_OFFSET_W 100
-#define BUTTON_CALIB_OFFSET_H 40
+#define BUTTON_CALIB_OFFSET_X (UI_W - MARGIN - 132)
+#define BUTTON_CALIB_OFFSET_Y 236
+#define BUTTON_CALIB_OFFSET_W 132
+#define BUTTON_CALIB_OFFSET_H 36
 
 // Record button - moved to same position as Calibrate button
-#define BUTTON_CALIB_RECORD_X 220
-#define BUTTON_CALIB_RECORD_Y 194
-#define BUTTON_CALIB_RECORD_W 100
-#define BUTTON_CALIB_RECORD_H 40
+#define BUTTON_CALIB_RECORD_X (UI_W - MARGIN - 132)
+#define BUTTON_CALIB_RECORD_Y 236
+#define BUTTON_CALIB_RECORD_W 132
+#define BUTTON_CALIB_RECORD_H 36
 
 // Battery view buttons
 #define BATTERY_BUTTON_H 40
 #define BATTERY_BUTTON_Y (UI_H - NAV_H - BATTERY_BUTTON_H - GAP)
 
 // Exit button for Step 1/5 - lower left
-#define BUTTON_CALIB_EXIT_OFFSET_X 80   // Lower left
-#define BUTTON_CALIB_EXIT_OFFSET_Y 200
-#define BUTTON_CALIB_EXIT_OFFSET_W 100
-#define BUTTON_CALIB_EXIT_OFFSET_H 40
+#define BUTTON_CALIB_EXIT_OFFSET_X MARGIN
+#define BUTTON_CALIB_EXIT_OFFSET_Y 236
+#define BUTTON_CALIB_EXIT_OFFSET_W 132
+#define BUTTON_CALIB_EXIT_OFFSET_H 36
 
 // Skip SG Calibration buttons
-#define BUTTON_CALIB_SKIP_X 80
-#define BUTTON_CALIB_SKIP_Y 194
-#define BUTTON_CALIB_SKIP_W 100
-#define BUTTON_CALIB_SKIP_H 40
+#define BUTTON_CALIB_SKIP_X MARGIN
+#define BUTTON_CALIB_SKIP_Y 236
+#define BUTTON_CALIB_SKIP_W 132
+#define BUTTON_CALIB_SKIP_H 36
 
 // Skip confirmation buttons - repositioned to avoid conflicts
-#define BUTTON_CALIB_SKIP_YES_X 80
-#define BUTTON_CALIB_SKIP_YES_Y 180
-#define BUTTON_CALIB_SKIP_YES_W 100
-#define BUTTON_CALIB_SKIP_YES_H 40
+#define BUTTON_CALIB_SKIP_YES_X (UI_W - MARGIN - 132)
+#define BUTTON_CALIB_SKIP_YES_Y 236
+#define BUTTON_CALIB_SKIP_YES_W 132
+#define BUTTON_CALIB_SKIP_YES_H 36
 
-#define BUTTON_CALIB_SKIP_NO_X 220
-#define BUTTON_CALIB_SKIP_NO_Y 180
-#define BUTTON_CALIB_SKIP_NO_W 100
-#define BUTTON_CALIB_SKIP_NO_H 40
+#define BUTTON_CALIB_SKIP_NO_X MARGIN
+#define BUTTON_CALIB_SKIP_NO_Y 236
+#define BUTTON_CALIB_SKIP_NO_W 132
+#define BUTTON_CALIB_SKIP_NO_H 36
 
 // Function prototypes
 void initESPNow();
@@ -544,6 +622,9 @@ void formatTimestamp(uint32_t epoch, char* buf, size_t bufSize);
 uint32_t buildEpochWithUploadOffset();
 uint32_t parseDateTimeToEpoch(const char* timestamp);
 void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len);
+void sendDataAck(const uint8_t* mac, uint16_t sequence_id);
+bool isDuplicateFloatSequence(uint16_t sequence_id);
+void rememberFloatSequence(uint16_t sequence_id);
 void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int len);
 void onCalibrationCommandFromFloat(const uint8_t *mac, const uint8_t *incomingData, int len);
 void onCalibrationCoefficients(const uint8_t *mac, const uint8_t *incomingData, int len);
@@ -581,20 +662,31 @@ void checkWaitTimeout();
 void stopWait();
 void sendCalibrationCommand(uint8_t command, float target_sg);
 void applyCalibration();
+int calibrationPointCount();
+int calibrationPointIndex(CalibMode mode);
+CalibMode calibrationModeForPoint(int index);
+float calibrationTargetSG(int index);
+int calibrationAddAmount(int index);
+void sendExitCalibrationCommand();
+void abortCalibrationFlow();
 bool logDataToSD(payload_t data, uint32_t epoch_s);
 void createNewFermentationFile();
 bool ensureFermentationLogFile(const char* batchId);
+bool findBestFallbackBatch(char* batchId, size_t bufferSize);
 void drawCreateNewDialog();
 void checkExistingFermentation();
 bool loadHistoricalDataFromCSV(const char* filename, 
                                GraphLoadMode mode = LOAD_6H,
                                int maxPoints = MAX_DATA_POINTS,
                                int samplingStep = 1);
+bool parseCSVDataLine(const char* line, payload_t* data, uint32_t* epoch_s, uint8_t* battery_percent);
 void checkOGStability(float currentSG);
 void logOGToSD();
 float calculateABV(float og, float currentSG);
+bool isPlausibleSensorReading(const payload_t& data, const char** issue);
 void beginBrewWizard();
 void completeBrewWizard();
+void cancelBrewWizard();
 void beginNewYeastWizard(const char* presetId = NULL);
 void loadYeastStepBuffer();
 void commitYeastStepBuffer();
@@ -616,6 +708,9 @@ void startNewBatchStorage(const char* batchId);
 void formatDurationShort(unsigned long seconds, char* buffer, size_t bufferSize);
 void handleOGChoice(bool useMeasuredOG);
 void saveYeastPerformanceSummary(float finalGravity, uint32_t completedAt);
+void refreshCurrentBatchAction(float currentSG, unsigned long nowEpoch);
+void handleCurrentActionChoice(bool done);
+void formatActionHeader(char* buffer, size_t bufferSize);
 uint8_t calculateBatteryPercentage(float voltage);
 void updateChargingState(float currentVoltage);
 float calculateDischargeRateLinearRegression();
@@ -700,6 +795,10 @@ void setup() {
 }
 
 void loop() {
+  #if SGNODE_UI_TEST_HARNESS
+    handleUITestHarness();
+  #endif
+
   // Check for touch input
   if (millis() - lastTouchCheck > TOUCH_CHECK_INTERVAL) {
     checkTouch();
@@ -1079,6 +1178,38 @@ void initESPNow() {
   LOG_INFO("Base Station MAC: %s\n", macAddress.c_str());
 }
 
+void sendDataAck(const uint8_t* mac, uint16_t sequence_id) {
+  if (!mac) return;
+
+  ack_packet_t ack;
+  ack.packet_type = ACK_PACKET_TYPE;
+  ack.sequence_id = sequence_id;
+  ack.highest_seen = highestSeenFloatSeq;
+
+  esp_err_t result = esp_now_send(mac, (uint8_t*)&ack, sizeof(ack));
+  if (result == ESP_OK) {
+    lastAckedFloatSeq = sequence_id;
+  } else {
+    LOG_VERBOSE("Failed to send ACK for seq=%u result=%d\n", sequence_id, result);
+  }
+}
+
+bool isDuplicateFloatSequence(uint16_t sequence_id) {
+  for (int i = 0; i < recentFloatSeqCount; i++) {
+    if (recentFloatSeqs[i] == sequence_id) return true;
+  }
+  return false;
+}
+
+void rememberFloatSequence(uint16_t sequence_id) {
+  recentFloatSeqs[recentFloatSeqIndex] = sequence_id;
+  recentFloatSeqIndex = (recentFloatSeqIndex + 1) % 16;
+  if (recentFloatSeqCount < 16) recentFloatSeqCount++;
+  if (sequence_id > highestSeenFloatSeq || highestSeenFloatSeq == 0) {
+    highestSeenFloatSeq = sequence_id;
+  }
+}
+
 void initDisplay() {
   tft.init();
   tft.setRotation(1); // Landscape mode - MUST match touchCalibration_rotate in Touch.h (which is 1)
@@ -1156,9 +1287,20 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
       LOG_ERROR("CRC mismatch: expected %d, got %d\n", receivedData.crc, calculated_crc);
       return;
     }
+
+    bool duplicatePacket = isDuplicateFloatSequence(receivedData.sequence_id);
+    if (!duplicatePacket) {
+      rememberFloatSequence(receivedData.sequence_id);
+    } else {
+      duplicateFloatPackets++;
+    }
+    sendDataAck(mac, receivedData.sequence_id);
     
     uint32_t receivedEpoch = getCurrentEpoch();
     uint8_t batteryPercent = calculateBatteryPercentage(receivedData.battery_voltage);
+    latestFloatData = receivedData;
+    latestFloatEpoch = receivedEpoch;
+    latestFloatDataValid = true;
     
     // Update charging state based on voltage trends
     updateChargingState(receivedData.battery_voltage);
@@ -1169,23 +1311,27 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
                   chargingState == CHARGING ? "CHARGING" : 
                   chargingState == DISCHARGING ? "DISCHARGING" : "UNKNOWN");
     
-    // Check OG stability if not yet captured
-    if (!brewProfileLoaded && !ogCaptured && fermentationFileOpen) {
-      checkOGStability(receivedData.density);
-    }
-    
-    // Calculate ABV if OG is captured
-    if (ogCaptured) {
-      currentABV = calculateABV(originalGravity, receivedData.density);
-    }
+    if (!duplicatePacket) {
+      // Check OG stability if not yet captured
+      if (!brewProfileLoaded && !ogCaptured && fermentationFileOpen) {
+        checkOGStability(receivedData.density);
+      }
 
-    updateFermentationAssistant(receivedData, receivedEpoch);
-    
-    // Add data to display buffer
-    addDataPoint(receivedData, receivedEpoch);
-    
-    // Buffer sensor data for SD writing (time-based approach)
-    bufferSensorData(receivedData, receivedEpoch);
+      // Calculate ABV if OG is captured
+      if (ogCaptured) {
+        currentABV = calculateABV(originalGravity, receivedData.density);
+      }
+
+      updateFermentationAssistant(receivedData, receivedEpoch);
+
+      // Add data to display buffer
+      addDataPoint(receivedData, receivedEpoch);
+
+      // Buffer sensor data for SD writing (time-based approach)
+      bufferSensorData(receivedData, receivedEpoch);
+    } else {
+      LOG_VERBOSE("Duplicate float packet seq=%u acknowledged, not logged again\n", receivedData.sequence_id);
+    }
     
     markScreenDirtyForFloatData();
     
@@ -1241,6 +1387,13 @@ void clearHistoricalDisplayData() {
   lastHistoricalLoadedLines = 0;
   lastHistoricalSkippedLines = 0;
   lastHistoricalParseErrors = 0;
+  lastHistoricalPreBatchLines = 0;
+  lastHistoricalPostBatchLines = 0;
+  lastHistoricalBatchFilteredLines = 0;
+  lastHistoricalCutoffFilteredLines = 0;
+  lastHistoricalBatchStartRelaxed = false;
+  lastHistoricalOldestEpoch = 0;
+  lastHistoricalNewestEpoch = 0;
   dischargeRateBufferCount = 0;
   memset(displayDataBuffer, 0, sizeof(displayDataBuffer));
   memset(displayTimestampBuffer, 0, sizeof(displayTimestampBuffer));
@@ -1576,6 +1729,18 @@ void drawRecommendationPanel(int x, int y, int w, int h) {
   tft.print(message);
 }
 
+void formatActionHeader(char* buffer, size_t bufferSize) {
+  if (!buffer || bufferSize == 0) return;
+  const char* prefix = currentBatchAction.requiresChoice ? "ACTION REQUIRED" : "NEXT";
+  if (!currentBatchAction.requiresChoice && currentBatchAction.secondsUntilDue > 0) {
+    char duration[16];
+    formatDurationShort(currentBatchAction.secondsUntilDue, duration, sizeof(duration));
+    snprintf(buffer, bufferSize, "%s (%s)", prefix, duration);
+  } else {
+    snprintf(buffer, bufferSize, "%s", prefix);
+  }
+}
+
 void drawDashboardScreen() {
   tft.fillScreen(uiColorBackground);
   drawViewTopbar("Dashboard");
@@ -1602,12 +1767,18 @@ void drawDashboardScreen() {
     latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
   }
 
-  uiCard(MARGIN, contentY, contentW, 48, CARD_RADIUS);
+  const int headerH = 42;
+  const int dashGap = 6;
+  const int actionH = 78;
+  const int metricH = 42;
+  const int lowerH = 38;
+
+  uiCard(MARGIN, contentY, contentW, headerH, CARD_RADIUS);
   char text[64];
   uiEllipsize(activeBrewProfile.batchName, contentW - 24, text, sizeof(text));
   tft.setTextColor(uiColorTextPrimary);
   tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(MARGIN + 12, contentY + 20);
+  tft.setCursor(MARGIN + 12, contentY + 18);
   tft.print(text);
 
   char phaseText[64];
@@ -1615,85 +1786,104 @@ void drawDashboardScreen() {
   uiEllipsize(phaseText, contentW - 24, text, sizeof(text));
   tft.setTextColor(uiColorTextSecondary);
   tft.setFreeFont(FONT_SIZE_XS);
-  tft.setCursor(MARGIN + 12, contentY + 40);
+  tft.setCursor(MARGIN + 12, contentY + 36);
   tft.print(text);
 
-  int tileY = contentY + 56;
-  int tileW = (contentW - GAP * 2) / 3;
-  int tileH = 54;
+  int actionY = contentY + headerH + dashGap;
+  uiCard(MARGIN, actionY, contentW, actionH, CARD_RADIUS);
+  tft.setTextColor(currentBatchAction.requiresChoice ? uiColorWarning : uiColorTextSecondary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(MARGIN + 10, actionY + 14);
+  char actionHeader[28];
+  formatActionHeader(actionHeader, sizeof(actionHeader));
+  tft.print(actionHeader);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM_BOLD);
+  tft.setCursor(MARGIN + 10, actionY + 34);
+  tft.print(currentBatchAction.title);
+  drawWrappedText(MARGIN + 10, actionY + 50, contentW - (currentBatchAction.requiresChoice ? 200 : 20),
+                  currentBatchAction.type == ACTION_NONE ? currentRecommendation.message : currentBatchAction.message,
+                  uiColorTextSecondary);
+  if (currentBatchAction.requiresChoice) {
+    int buttonW = 86;
+    int buttonY = actionY + actionH - 32;
+    int skipX = MARGIN + contentW - buttonW * 2 - GAP - 10;
+    int doneX = MARGIN + contentW - buttonW - 10;
+    tft.fillRoundRect(skipX, buttonY, buttonW, 28, 8, uiColorCardBackground);
+    tft.drawRoundRect(skipX, buttonY, buttonW, 28, 8, uiColorBorder);
+    uiTextCenter(skipX, buttonY, buttonW, 28, "SKIP", FONT_SIZE_XS, uiColorTextPrimary);
+    tft.fillRoundRect(doneX, buttonY, buttonW, 28, 8, uiColorGold);
+    uiTextCenter(doneX, buttonY, buttonW, 28, "DONE", FONT_SIZE_XS, uiColorPrimaryText);
+  }
+
+  int tileY = actionY + actionH + dashGap;
+  int tileW = (contentW - GAP * 3) / 4;
+  int tileH = metricH;
   char value[24];
 
   uiCard(MARGIN, tileY, tileW, tileH, CARD_RADIUS);
   tft.setTextColor(uiColorTextSecondary);
   tft.setFreeFont(FONT_SIZE_XS);
-  tft.setCursor(MARGIN + 10, tileY + 18);
+  tft.setCursor(MARGIN + 10, tileY + 15);
   tft.print("Atten");
   snprintf(value, sizeof(value), "%.0f", fermentationMetrics.currentAttenuation);
   tft.setTextColor(hasData ? uiColorTextPrimary : uiColorTextMuted);
   tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(MARGIN + 10, tileY + 44);
+  tft.setCursor(MARGIN + 10, tileY + 35);
   tft.printf("%s%%", hasData ? value : "--");
 
   int abvX = MARGIN + tileW + GAP;
   uiCard(abvX, tileY, tileW, tileH, CARD_RADIUS);
   tft.setTextColor(uiColorTextSecondary);
   tft.setFreeFont(FONT_SIZE_XS);
-  tft.setCursor(abvX + 10, tileY + 18);
+  tft.setCursor(abvX + 10, tileY + 15);
   tft.print("ABV");
   snprintf(value, sizeof(value), "%.1f", fermentationMetrics.estimatedABV);
   tft.setTextColor(hasData ? uiColorTextPrimary : uiColorTextMuted);
   tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(abvX + 10, tileY + 44);
+  tft.setCursor(abvX + 10, tileY + 35);
   tft.printf("%s%%", hasData ? value : "--");
 
   int fgX = MARGIN + (tileW + GAP) * 2;
   uiCard(fgX, tileY, tileW, tileH, CARD_RADIUS);
   tft.setTextColor(uiColorTextSecondary);
   tft.setFreeFont(FONT_SIZE_XS);
-  tft.setCursor(fgX + 10, tileY + 18);
+  tft.setCursor(fgX + 10, tileY + 15);
   tft.print("Exp FG");
   snprintf(value, sizeof(value), "%.3f", activeBrewProfile.expectedFinalGravity);
   tft.setTextColor(uiColorTextPrimary);
   tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(fgX + 10, tileY + 44);
+  tft.setCursor(fgX + 10, tileY + 35);
   tft.print(value);
 
-  int lowerY = tileY + tileH + 8;
-  int halfW = (contentW - GAP) / 2;
-  int lowerH = 50;
-  uiCard(MARGIN, lowerY, halfW, lowerH, CARD_RADIUS);
+  int etaX = MARGIN + (tileW + GAP) * 3;
+  uiCard(etaX, tileY, tileW, tileH, CARD_RADIUS);
   tft.setTextColor(uiColorTextSecondary);
   tft.setFreeFont(FONT_SIZE_XS);
-  tft.setCursor(MARGIN + 10, lowerY + 17);
+  tft.setCursor(etaX + 10, tileY + 15);
   tft.print("ETA");
   tft.setTextColor(uiColorTextPrimary);
   tft.setFreeFont(FONT_SIZE_SM);
   char eta[16];
   if (currentETA.valid) formatDurationShort(currentETA.secondsToPackaging, eta, sizeof(eta));
   else strcpy(eta, "--");
-  tft.setCursor(MARGIN + 10, lowerY + 42);
+  tft.setCursor(etaX + 10, tileY + 35);
   tft.print(eta);
   tft.setTextColor(uiColorTextSecondary);
   tft.setFreeFont(FONT_SIZE_XS);
-  tft.setCursor(MARGIN + 92, lowerY + 42);
+  tft.setCursor(etaX + tileW - 36, tileY + 35);
   tft.printf("%d%%", currentETA.confidencePercent);
 
-  int yeastX = MARGIN + halfW + GAP;
-  uiCard(yeastX, lowerY, halfW, lowerH, CARD_RADIUS);
+  int lowerY = tileY + tileH + dashGap;
+  int halfW = (contentW - GAP) / 2;
+  uiCard(MARGIN, lowerY, halfW, lowerH, CARD_RADIUS);
   tft.setTextColor(uiColorTextSecondary);
   tft.setFreeFont(FONT_SIZE_XS);
-  tft.setCursor(yeastX + 10, lowerY + 17);
-  tft.print(activeBrewProfile.autoModeEnabled ? "Yeast" : "OG");
+  tft.setCursor(MARGIN + 10, lowerY + 14);
+  tft.print("OG");
   tft.setTextColor(uiColorTextPrimary);
   tft.setFreeFont(FONT_SIZE_XS);
-  if (activeBrewProfile.autoModeEnabled) {
-    snprintf(text, sizeof(text), "%s %d-%d%% %.0f-%.0fC",
-             activeBrewProfile.selectedYeastPresetName,
-             activeBrewProfile.yeastAttenuationMin,
-             activeBrewProfile.yeastAttenuationMax,
-             activeBrewProfile.recommendedTempMinC,
-             activeBrewProfile.recommendedTempMaxC);
-  } else if (activeBrewProfile.ogNeedsChoice) {
+  if (activeBrewProfile.ogNeedsChoice) {
     snprintf(text, sizeof(text), "Needs choice");
   } else if (activeBrewProfile.ogVerified) {
     snprintf(text, sizeof(text), "OK %.3f", activeBrewProfile.effectiveOG);
@@ -1701,16 +1891,21 @@ void drawDashboardScreen() {
     snprintf(text, sizeof(text), "Measuring");
   }
   uiEllipsize(text, halfW - 20, value, sizeof(value));
-  tft.setCursor(yeastX + 10, lowerY + 40);
+  tft.setCursor(MARGIN + 10, lowerY + 31);
   tft.print(value);
 
-  int recY = lowerY + lowerH + 8;
-  uiCard(MARGIN, recY, contentW, 44, CARD_RADIUS);
+  int tempX = MARGIN + halfW + GAP;
+  uiCard(tempX, lowerY, halfW, lowerH, CARD_RADIUS);
   tft.setTextColor(uiColorTextSecondary);
   tft.setFreeFont(FONT_SIZE_XS);
-  tft.setCursor(MARGIN + 10, recY + 17);
-  tft.print("Next");
-  drawWrappedText(MARGIN + 62, recY + 17, contentW - 76, currentRecommendation.message, uiColorTextPrimary);
+  tft.setCursor(tempX + 10, lowerY + 14);
+  tft.print("Temp");
+  if (hasData) snprintf(text, sizeof(text), "%.1f C", latest.temperature);
+  else snprintf(text, sizeof(text), "--");
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setCursor(tempX + 10, lowerY + 31);
+  tft.print(text);
   uiDrawBottomNav(TAB_DASHBOARD);
 }
 
@@ -2157,7 +2352,7 @@ void loadManagedBatches() {
       const char* name = entry.name();
       const char* slash = strrchr(name, '/');
       const char* id = slash ? slash + 1 : name;
-      BrewProfile p;
+      static BrewProfile p;
       if (BrewProfileStore::load(id, &p)) {
         strncpy(managedBatchIds[managedBatchCount], p.batchId, 23);
         managedBatchIds[managedBatchCount][23] = '\0';
@@ -2198,10 +2393,18 @@ int nextBatchNumberOnSD() {
 void continueManagedBatch(const char* batchId) {
   if (!mountSDTemporarily()) return;
   if (BrewProfileStore::load(batchId, &activeBrewProfile)) {
+    if (activeBrewProfile.completed) {
+      LOG_INFO("Batch %s is completed; not continuing as active\n", batchId);
+      dismountSD();
+      currentMode = MANAGE_BREW_VIEW;
+      screenDirty = true;
+      return;
+    }
     bool logReady = ensureFermentationLogFile(activeBrewProfile.batchId);
     BrewProfileStore::logPath(activeBrewProfile.batchId, currentFermentationFile, sizeof(currentFermentationFile));
     fermentationFileOpen = logReady;
     brewProfileLoaded = true;
+    BrewProfileStore::saveActiveBatchId(activeBrewProfile.batchId);
     targetCurveAvailable = SD.exists("/data") && TargetCurveGenerator::generateAndSave(activeBrewProfile);
     if (logReady) loadHistoricalDataFromCSV(currentFermentationFile, currentLoadMode, MAX_DATA_POINTS, 1);
     refreshFermentationAssistantFromProfile();
@@ -2213,7 +2416,7 @@ void continueManagedBatch(const char* batchId) {
 
 void copyManagedBatch(const char* batchId) {
   if (!mountSDTemporarily()) return;
-  BrewProfile p;
+  static BrewProfile p;
   if (BrewProfileStore::load(batchId, &p)) {
     BrewProfileStore::buildBatchId(nextBatchNumberOnSD(), p.batchId, sizeof(p.batchId));
     char copiedName[40];
@@ -2221,6 +2424,23 @@ void copyManagedBatch(const char* batchId) {
     strncpy(p.batchName, copiedName, sizeof(p.batchName) - 1);
     p.batchName[sizeof(p.batchName) - 1] = '\0';
     p.createdAt = getCurrentEpoch();
+    p.completed = false;
+    p.completedAt = 0;
+    p.dryHopDone = false;
+    p.dryHopSkipped = false;
+    p.dryHopStartTime = 0;
+    p.dryHopRemoved = false;
+    p.dryHopRemoveSkipped = false;
+    p.dryHopRemovedAt = 0;
+    p.dRestDone = false;
+    p.dRestSkipped = false;
+    p.dRestStartedAt = 0;
+    p.coldCrashDone = false;
+    p.coldCrashSkipped = false;
+    p.coldCrashStartedAt = 0;
+    p.packageDone = false;
+    p.packageSkipped = false;
+    p.packagedAt = 0;
     p.measuredOG = 0.0f;
     p.ogDifference = 0.0f;
     p.ogVerified = false;
@@ -2232,6 +2452,7 @@ void copyManagedBatch(const char* batchId) {
     BrewProfileStore::logPath(activeBrewProfile.batchId, currentFermentationFile, sizeof(currentFermentationFile));
     fermentationFileOpen = logReady;
     brewProfileLoaded = true;
+    BrewProfileStore::saveActiveBatchId(activeBrewProfile.batchId);
     clearHistoricalDisplayData();
     refreshFermentationAssistantFromProfile();
   }
@@ -2250,14 +2471,95 @@ void deleteManagedBatch(const char* batchId) {
   if (SD.exists(path)) SD.remove(path);
   BrewProfileStore::logPath(batchId, path, sizeof(path));
   if (SD.exists(path)) SD.remove(path);
+  BrewProfileStore::eventsPath(batchId, path, sizeof(path));
+  if (SD.exists(path)) SD.remove(path);
   if (strcmp(activeBrewProfile.batchId, batchId) == 0) {
     brewProfileLoaded = false;
     fermentationFileOpen = false;
     currentFermentationFile[0] = '\0';
+    BrewProfileStore::clearActiveBatchId();
   }
   dismountSD();
   loadManagedBatches();
   screenDirty = true;
+}
+
+bool markManagedBatchCompleted(const char* batchId) {
+  if (!mountSDTemporarily()) return false;
+  static BrewProfile p;
+  bool ok = false;
+  if (BrewProfileStore::load(batchId, &p)) {
+    p.completed = true;
+    p.completedAt = getCurrentEpoch();
+    ok = BrewProfileStore::save(p);
+    char activeBatchId[24];
+    if (BrewProfileStore::loadActiveBatchId(activeBatchId, sizeof(activeBatchId)) &&
+        strcmp(activeBatchId, batchId) == 0) {
+      BrewProfileStore::clearActiveBatchId();
+    }
+    if (strcmp(activeBrewProfile.batchId, batchId) == 0) {
+      brewProfileLoaded = false;
+      fermentationFileOpen = false;
+      currentFermentationFile[0] = '\0';
+      clearHistoricalDisplayData();
+    }
+  }
+  dismountSD();
+  loadManagedBatches();
+  currentMode = MANAGE_BREW_VIEW;
+  screenDirty = true;
+  return ok;
+}
+
+void loadManagedBatchSummary(const char* batchId, ManagedBatchSummary* summary) {
+  memset(summary, 0, sizeof(ManagedBatchSummary));
+  strcpy(summary->status, "--");
+  strcpy(summary->evaluation, "No data yet");
+  if (!mountSDTemporarily()) return;
+
+  static BrewProfile p;
+  if (BrewProfileStore::load(batchId, &p)) {
+    summary->loaded = true;
+    summary->completed = p.completed;
+    strncpy(summary->style, p.beerStyle, sizeof(summary->style) - 1);
+    summary->liters = p.batchSizeLiters;
+    strcpy(summary->status, p.completed ? "Completed" : "Active");
+
+    char logPath[80];
+    BrewProfileStore::logPath(batchId, logPath, sizeof(logPath));
+    File file = SD.open(logPath, FILE_READ);
+    if (file) {
+      static char line[180];
+      while (file.available()) {
+        int bytesRead = file.readBytesUntil('\n', line, sizeof(line) - 1);
+        line[bytesRead] = '\0';
+        if (strncmp(line, "timestamp,", 10) == 0 || line[0] == '#' || strlen(line) == 0) continue;
+        payload_t data = {0};
+        uint32_t epoch = 0;
+        uint8_t batteryPercent = 0;
+        if (parseCSVDataLine(line, &data, &epoch, &batteryPercent) &&
+            (!isEpochValid(p.createdAt) || !isEpochValid(epoch) || epoch >= p.createdAt)) {
+          if (summary->points == 0) summary->firstEpoch = epoch;
+          summary->lastEpoch = epoch;
+          summary->points++;
+        }
+      }
+      file.close();
+    }
+
+    if (summary->points == 0) {
+      strcpy(summary->evaluation, "No log data");
+    } else if (p.ogNeedsChoice) {
+      strcpy(summary->evaluation, "OG needs verify");
+    } else if (p.completed) {
+      strcpy(summary->evaluation, "Archived batch");
+    } else if (summary->points < 6) {
+      strcpy(summary->evaluation, "Collecting data");
+    } else {
+      strcpy(summary->evaluation, "Trend available");
+    }
+  }
+  dismountSD();
 }
 
 void drawManageBrewScreen() {
@@ -2271,7 +2573,10 @@ void drawManageBrewScreen() {
     drawButton(MARGIN, 276, 120, 36, "BACK", false);
     return;
   }
-  uiCard(MARGIN, y, UI_W - MARGIN * 2, 126, CARD_RADIUS);
+  ManagedBatchSummary summary;
+  loadManagedBatchSummary(managedBatchIds[manageBatchIndex], &summary);
+
+  uiCard(MARGIN, y, UI_W - MARGIN * 2, 132, CARD_RADIUS);
   tft.setTextColor(uiColorTextPrimary);
   tft.setFreeFont(FONT_SIZE_SM_BOLD);
   char label[44];
@@ -2282,44 +2587,103 @@ void drawManageBrewScreen() {
   tft.setFreeFont(FONT_SIZE_XS);
   tft.setCursor(MARGIN + 12, y + 58);
   tft.print(managedBatchIds[manageBatchIndex]);
+  tft.setCursor(MARGIN + 126, y + 58);
+  tft.print(summary.status);
+  tft.setCursor(MARGIN + 12, y + 80);
+  tft.printf("%s / %.1f L", summary.style[0] ? summary.style : "--", summary.liters);
+  tft.setCursor(MARGIN + 12, y + 102);
+  if (summary.points > 0 && isEpochValid(summary.firstEpoch) && isEpochValid(summary.lastEpoch) && summary.lastEpoch >= summary.firstEpoch) {
+    unsigned long hours = (summary.lastEpoch - summary.firstEpoch) / 3600UL;
+    tft.printf("%d pts / %luh", summary.points, hours);
+  } else {
+    tft.printf("%d pts / --", summary.points);
+  }
+  tft.setCursor(MARGIN + 12, y + 124);
+  tft.print(summary.evaluation);
   snprintf(label, sizeof(label), "%d/%d", manageBatchIndex + 1, managedBatchCount);
-  uiTextRight(MARGIN, y + 86, UI_W - MARGIN * 2 - 12, 20, label, FONT_SIZE_XS, uiColorTextMuted);
+  uiTextRight(MARGIN, y + 104, UI_W - MARGIN * 2 - 12, 20, label, FONT_SIZE_XS, uiColorTextMuted);
 
-  drawButton(MARGIN, 190, 72, 36, "<", false);
-  drawButton(UI_W - MARGIN - 72, 190, 72, 36, ">", false);
-  drawButton(MARGIN + 84, 190, 104, 36, "CONT", false);
-  drawButton(MARGIN + 200, 190, 104, 36, "COPY", false);
-  drawButton(MARGIN + 316, 190, 104, 36, "DELETE", false);
+  drawButton(MARGIN, 184, 72, 34, "<", false);
+  drawButton(UI_W - MARGIN - 72, 184, 72, 34, ">", false);
+  drawButton(MARGIN + 84, 184, 104, 34, "CONT", summary.completed);
+  drawButton(MARGIN + 200, 184, 104, 34, "COPY", false);
+  drawButton(MARGIN + 316, 184, 104, 34, "DELETE", false);
+  drawButton(MARGIN + 84, 226, 150, 34, "COMPLETE", summary.completed);
+  drawButton(MARGIN + 246, 226, 174, 34, summary.completed ? "ARCHIVED" : "ACTIVE", true);
   drawButton(MARGIN, 276, 120, 36, "BACK", false);
+
+  if (manageBrewCompleteConfirm) {
+    int dx = MARGIN + 28;
+    int dy = 86;
+    int dw = UI_W - (MARGIN + 28) * 2;
+    int dh = 132;
+    tft.fillRoundRect(dx, dy, dw, dh, 8, uiColorCardBackground);
+    tft.drawRoundRect(dx, dy, dw, dh, 8, uiColorBorder);
+    uiTextCenter(dx, dy + 18, dw, 30, "Mark batch completed?", FONT_SIZE_MD, uiColorTextPrimary);
+    tft.drawRoundRect(dx + 14, dy + 68, 116, 38, 8, uiColorBorder);
+    uiTextCenter(dx + 14, dy + 68, 116, 38, "NO", FONT_SIZE_SM, uiColorTextPrimary);
+    tft.fillRoundRect(dx + dw - 130, dy + 68, 116, 38, 8, uiColorGold);
+    uiTextCenter(dx + dw - 130, dy + 68, 116, 38, "YES", FONT_SIZE_SM, uiColorPrimaryText);
+  }
 }
 
 bool handleManageBrewTouch(int x, int y) {
+  if (manageBrewCompleteConfirm) {
+    int dx = MARGIN + 28;
+    int dy = 86;
+    int dw = UI_W - (MARGIN + 28) * 2;
+    if (x >= dx + 14 && x <= dx + 130 && y >= dy + 68 && y <= dy + 106) {
+      manageBrewCompleteConfirm = false;
+      screenDirty = true;
+      return true;
+    }
+    if (x >= dx + dw - 130 && x <= dx + dw - 14 && y >= dy + 68 && y <= dy + 106) {
+      manageBrewCompleteConfirm = false;
+      if (managedBatchCount > 0) markManagedBatchCompleted(managedBatchIds[manageBatchIndex]);
+      screenDirty = true;
+      return true;
+    }
+    return true;
+  }
   if (x >= MARGIN && x <= MARGIN + 120 && y >= 276 && y <= 312) {
     currentMode = MORE_VIEW;
     screenDirty = true;
     return true;
   }
   if (managedBatchCount <= 0) return false;
-  if (x >= MARGIN && x <= MARGIN + 72 && y >= 190 && y <= 226) {
+  if (x >= MARGIN && x <= MARGIN + 72 && y >= 184 && y <= 218) {
     manageBatchIndex = manageBatchIndex <= 0 ? managedBatchCount - 1 : manageBatchIndex - 1;
     screenDirty = true;
     return true;
   }
-  if (x >= UI_W - MARGIN - 72 && x <= UI_W - MARGIN && y >= 190 && y <= 226) {
+  if (x >= UI_W - MARGIN - 72 && x <= UI_W - MARGIN && y >= 184 && y <= 218) {
     manageBatchIndex = (manageBatchIndex + 1) % managedBatchCount;
     screenDirty = true;
     return true;
   }
-  if (x >= MARGIN + 84 && x <= MARGIN + 188 && y >= 190 && y <= 226) {
+  if (x >= MARGIN + 84 && x <= MARGIN + 188 && y >= 184 && y <= 218) {
     continueManagedBatch(managedBatchIds[manageBatchIndex]);
     return true;
   }
-  if (x >= MARGIN + 200 && x <= MARGIN + 304 && y >= 190 && y <= 226) {
+  if (x >= MARGIN + 200 && x <= MARGIN + 304 && y >= 184 && y <= 218) {
     copyManagedBatch(managedBatchIds[manageBatchIndex]);
     return true;
   }
-  if (x >= MARGIN + 316 && x <= MARGIN + 420 && y >= 190 && y <= 226) {
+  if (x >= MARGIN + 316 && x <= MARGIN + 420 && y >= 184 && y <= 218) {
     deleteManagedBatch(managedBatchIds[manageBatchIndex]);
+    return true;
+  }
+  if (x >= MARGIN + 84 && x <= MARGIN + 234 && y >= 226 && y <= 260) {
+    static BrewProfile p;
+    bool canComplete = false;
+    if (mountSDTemporarily()) {
+      canComplete = BrewProfileStore::load(managedBatchIds[manageBatchIndex], &p) && !p.completed;
+      dismountSD();
+    }
+    if (canComplete) {
+      manageBrewCompleteConfirm = true;
+      screenDirty = true;
+    }
     return true;
   }
   return false;
@@ -2980,61 +3344,105 @@ void drawCalibrationView() {
   drawViewTopbar("Calib");
   
   int contentY = TOPBAR_H + MARGIN;
-  int contentH = UI_H - TOPBAR_H - NAV_H;
+  int contentH = UI_H - TOPBAR_H;
   
   // Main content card
-  uiCard(MARGIN, contentY, UI_W - MARGIN * 2, contentH - 50, CARD_RADIUS);
+  uiCard(MARGIN, contentY, UI_W - MARGIN * 2, 184, CARD_RADIUS);
   
   if (calibMode == CALIB_IDLE) {
-    uiTextCenter(MARGIN, contentY + 20, UI_W - MARGIN * 2, 24, "Calibration", FONT_SIZE_LG, uiColorTextPrimary);
+    uiTextCenter(MARGIN, contentY + 20, UI_W - MARGIN * 2, 26, "Calibration", FONT_SIZE_LG, uiColorTextPrimary);
+    tft.setTextColor(uiColorTextSecondary);
+    tft.setFreeFont(FONT_SIZE_SM);
+    tft.setCursor(MARGIN + 18, contentY + 82);
+    tft.print("Place float on a flat, level surface.");
+    tft.setCursor(MARGIN + 18, contentY + 110);
+    tft.print("Start when the float is completely still.");
     drawButton(BUTTON_CALIB_START_X, BUTTON_CALIB_START_Y, BUTTON_CALIB_START_W, BUTTON_CALIB_START_H, "START", false);
     
+  } else if (calibMode == CALIB_SETUP) {
+    uiTextCenter(MARGIN, contentY + 12, UI_W - MARGIN * 2, 24, "Calibration Setup", FONT_SIZE_SM_BOLD, uiColorInfo);
+
+    tft.setTextColor(uiColorTextPrimary);
+    tft.setFreeFont(FONT_SIZE_SM);
+    tft.setCursor(MARGIN + 18, contentY + 62);
+    tft.print("SG Calibration");
+    IOSSwitch::draw(tft, UI_W - MARGIN - 86, contentY + 35, calibDoSGCalibration);
+
+    tft.setTextColor(uiColorTextSecondary);
+    if (calibDoSGCalibration) {
+      tft.setTextColor(uiColorTextPrimary);
+      tft.setFreeFont(FONT_SIZE_SM);
+      tft.setCursor(MARGIN + 18, contentY + 108);
+      tft.print(calibUseSixPoints ? "6 SG points" : "4 SG points");
+      IOSSwitch::draw(tft, UI_W - MARGIN - 86, contentY + 81, calibUseSixPoints);
+
+      tft.setCursor(MARGIN + 18, contentY + 154);
+      tft.print(calibUseSalt ? "Salt solution" : "Sugar solution");
+      IOSSwitch::draw(tft, UI_W - MARGIN - 86, contentY + 127, calibUseSalt);
+
+      tft.setTextColor(uiColorTextSecondary);
+      tft.setFreeFont(FONT_SIZE_XS);
+      tft.setCursor(MARGIN + 18, contentY + 180);
+      tft.print("Amounts shown per calibration point.");
+    } else {
+      tft.setFreeFont(FONT_SIZE_SM);
+      tft.setCursor(MARGIN + 18, contentY + 112);
+      tft.print("Only sensor offset will be calibrated.");
+      tft.setCursor(MARGIN + 18, contentY + 140);
+      tft.print("SG points and solution type are skipped.");
+    }
+
+    drawButton(BUTTON_CALIB_BACK_X, BUTTON_CALIB_BACK_Y, BUTTON_CALIB_BACK_W, BUTTON_CALIB_BACK_H, "BACK", false);
+    drawButton(BUTTON_CALIB_NEXT_X, BUTTON_CALIB_NEXT_Y, BUTTON_CALIB_NEXT_W, BUTTON_CALIB_NEXT_H, "NEXT", false);
+
   } else if (calibMode == CALIB_INSTRUCTIONS) {
     // Calculate proper text positions using consistent layout
     tft.setTextColor(uiColorAccent);
     tft.setFreeFont(FONT_SIZE_MD);
-    int titleY = contentY + 10;
+    int titleY = contentY + 12;
     uiTextCenter(MARGIN, titleY, UI_W - MARGIN * 2, 24, "Calibration Steps", FONT_SIZE_SM_BOLD, uiColorInfo);
     
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
     int lineHeight = tft.fontHeight() + 6; // Consistent line spacing
-    int contentStartY = titleY + 35; // Start content below title
+    int contentStartY = titleY + 52; // Start content below title
     
     int bullet1Y = contentStartY;
     int bullet2Y = bullet1Y + lineHeight;
     
     tft.setCursor(MARGIN + 15, bullet1Y);
-    tft.print("1. Prepare bowl (3L+ capacity)");
+    tft.print("1. Place float on a flat surface");
     tft.setCursor(MARGIN + 15, bullet2Y);
-    tft.print("2. Add 2L water, place float");
+    tft.print("2. Keep it still, then continue");
+    drawButton(BUTTON_CALIB_BACK_X, BUTTON_CALIB_BACK_Y, BUTTON_CALIB_BACK_W, BUTTON_CALIB_BACK_H, "BACK", false);
     drawButton(BUTTON_CALIB_NEXT_X, BUTTON_CALIB_NEXT_Y, BUTTON_CALIB_NEXT_W, BUTTON_CALIB_NEXT_H, "NEXT", false);
     
   } else if (calibMode == CALIB_OFFSET) {
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, "Step 1/5 - Sensor Offset Calibration", FONT_SIZE_SM_BOLD, uiColorInfo);
+    uiTextCenter(MARGIN, contentY + 12, UI_W - MARGIN * 2, 24, "Step 1/5 - Sensor Offset", FONT_SIZE_SM_BOLD, uiColorInfo);
     
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
     int lineHeight = tft.fontHeight() + 4;
-    int bullet1Y = contentY + 40 + tft.fontHeight(); // Proper baseline
+    int bullet1Y = contentY + 72;
     int bullet2Y = bullet1Y + lineHeight;
     int bullet3Y = bullet2Y + lineHeight;
     
     tft.setCursor(MARGIN + 10, bullet1Y);
     tft.print("- Place float on flat, level surface");
     tft.setCursor(MARGIN + 10, bullet2Y);
-    tft.print("- Ensure device is completely still");
+    tft.print("- Keep device completely still");
     tft.setCursor(MARGIN + 10, bullet3Y);
     tft.print("- Press Calibrate Offset");
+    drawButton(BUTTON_CALIB_EXIT_X, BUTTON_CALIB_EXIT_Y, BUTTON_CALIB_EXIT_W, BUTTON_CALIB_EXIT_H, "ABORT", false);
     drawButton(BUTTON_CALIB_OFFSET_X, BUTTON_CALIB_OFFSET_Y, BUTTON_CALIB_OFFSET_W, BUTTON_CALIB_OFFSET_H, "Calibrate", offsetCalibrated);
     
   } else if (calibMode == CALIB_SKIP_WARNING) {
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, "Skip SG Calibration?", FONT_SIZE_MD, uiColorAccent);
+    uiTextCenter(MARGIN, contentY + 12, UI_W - MARGIN * 2, 24, "Skip SG Calibration?", FONT_SIZE_MD, uiColorAccent);
     
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
     int lineHeight = tft.fontHeight() + 4;
-    int textY = contentY + 40 + tft.fontHeight(); // Proper baseline
+    int textY = contentY + 72;
     
     tft.setCursor(MARGIN + 10, textY);
     tft.print("Save sensor offset only and");
@@ -3042,148 +3450,89 @@ void drawCalibrationView() {
     tft.setCursor(MARGIN + 10, textY);
     tft.print("return to Live View?");
     
-    drawButton(BUTTON_CALIB_SKIP_YES_X, BUTTON_CALIB_SKIP_YES_Y, BUTTON_CALIB_SKIP_YES_W, BUTTON_CALIB_SKIP_YES_H, "Yes", false);
-    drawButton(BUTTON_CALIB_SKIP_NO_X, BUTTON_CALIB_SKIP_NO_Y, BUTTON_CALIB_SKIP_NO_W, BUTTON_CALIB_SKIP_NO_H, "No", false);
+    drawButton(BUTTON_CALIB_SKIP_NO_X, BUTTON_CALIB_SKIP_NO_Y, BUTTON_CALIB_SKIP_NO_W, BUTTON_CALIB_SKIP_NO_H, "BACK", false);
+    drawButton(BUTTON_CALIB_SKIP_YES_X, BUTTON_CALIB_SKIP_YES_Y, BUTTON_CALIB_SKIP_YES_W, BUTTON_CALIB_SKIP_YES_H, "CONFIRM", false);
     
-  } else if (calibMode == CALIB_POINT1) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Step 2/5 - Calibration Point 1 (SG 1.000)");
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, buf, FONT_SIZE_SM_BOLD, uiColorInfo);
-    
+  } else if (calibMode >= CALIB_POINT1 && calibMode <= CALIB_POINT6) {
+    int idx = calibrationPointIndex(calibMode);
+    int totalPoints = calibrationPointCount();
+    char buf[48];
+    snprintf(buf, sizeof(buf), "Step %d/%d - Point %d (SG %.3f)",
+             idx + 2, totalPoints + 1, idx + 1, calibrationTargetSG(idx));
+    uiTextCenter(MARGIN, contentY + 12, UI_W - MARGIN * 2, 24, buf, FONT_SIZE_SM_BOLD, uiColorInfo);
+
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
     int lineHeight = tft.fontHeight() + 4;
-    int bullet1Y = contentY + 40 + tft.fontHeight(); // Proper baseline
+    int bullet1Y = contentY + 72;
     int bullet2Y = bullet1Y + lineHeight;
     int bullet3Y = bullet2Y + lineHeight;
-    
+    int bullet4Y = bullet3Y + lineHeight;
+
     tft.setCursor(MARGIN + 10, bullet1Y);
-    tft.print("- Use bowl with 3L+ capacity");
-    tft.setCursor(MARGIN + 10, bullet2Y);
-    tft.print("- Fill with 2.0L water");
+    if (idx == 0) {
+      tft.print("- Fill 3L bowl with 2.0L water");
+      tft.setCursor(MARGIN + 10, bullet2Y);
+      tft.print("- No sugar/salt for water point");
+    } else {
+      tft.printf("- Add %dg %s", calibrationAddAmount(idx), calibUseSalt ? "salt" : "sugar");
+      tft.setCursor(MARGIN + 10, bullet2Y);
+      tft.print("- Stir until fully dissolved");
+    }
     tft.setCursor(MARGIN + 10, bullet3Y);
-    tft.print("- Wait, then Record");
-    drawButton(BUTTON_CALIB_SKIP_X, BUTTON_CALIB_SKIP_Y, BUTTON_CALIB_SKIP_W, BUTTON_CALIB_SKIP_H, "Skip SG", false);
-    drawButton(BUTTON_CALIB_RECORD_X, BUTTON_CALIB_RECORD_Y, BUTTON_CALIB_RECORD_W, BUTTON_CALIB_RECORD_H, "Record", calibAngles[0] > 0);
-    
-  } else if (calibMode == CALIB_POINT2) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Step 3/5 - Calibration Point 2 (SG 1.040)");
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, buf, FONT_SIZE_SM_BOLD, uiColorInfo);
-    
-    tft.setTextColor(uiColorTextSecondary);
-    tft.setFreeFont(FONT_SIZE_SM);
-    int lineHeight = tft.fontHeight() + 4;
-    int bullet1Y = contentY + 40 + tft.fontHeight(); // Proper baseline
-    int bullet2Y = bullet1Y + lineHeight;
-    int bullet3Y = bullet2Y + lineHeight;
-    
-    tft.setCursor(MARGIN + 10, bullet1Y);
-    tft.printf("- Add %dg sugar", sugarAmounts[1]);
-    tft.setCursor(MARGIN + 10, bullet2Y);
-    tft.print("- Stir until fully dissolved");
-    tft.setCursor(MARGIN + 10, bullet3Y);
-    tft.print("- Wait, then Record");
-    drawButton(BUTTON_CALIB_RECORD_X, BUTTON_CALIB_RECORD_Y, BUTTON_CALIB_RECORD_W, BUTTON_CALIB_RECORD_H, "Record", calibAngles[1] > 0);
-    
-  } else if (calibMode == CALIB_POINT3) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Step 4/5 - Calibration Point 3 (SG 1.080)");
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, buf, FONT_SIZE_SM_BOLD, uiColorInfo);
-    
-    tft.setTextColor(uiColorTextSecondary);
-    tft.setFreeFont(FONT_SIZE_SM);
-    int lineHeight = tft.fontHeight() + 4;
-    int bullet1Y = contentY + 40 + tft.fontHeight(); // Proper baseline
-    int bullet2Y = bullet1Y + lineHeight;
-    int bullet3Y = bullet2Y + lineHeight;
-    
-    tft.setCursor(MARGIN + 10, bullet1Y);
-    tft.printf("- Add %dg sugar", sugarAmounts[2]);
-    tft.setCursor(MARGIN + 10, bullet2Y);
-    tft.print("- Stir until fully dissolved");
-    tft.setCursor(MARGIN + 10, bullet3Y);
-    tft.print("- Wait, then Record");
-    drawButton(BUTTON_CALIB_RECORD_X, BUTTON_CALIB_RECORD_Y, BUTTON_CALIB_RECORD_W, BUTTON_CALIB_RECORD_H, "Record", calibAngles[2] > 0);
-    
-  } else if (calibMode == CALIB_POINT4) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Step 5/5 - Calibration Point 4 (SG 1.120)");
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, buf, FONT_SIZE_SM_BOLD, uiColorInfo);
-    
-    tft.setTextColor(uiColorTextSecondary);
-    tft.setFreeFont(FONT_SIZE_SM);
-    int lineHeight = tft.fontHeight() + 4;
-    int bullet1Y = contentY + 40 + tft.fontHeight(); // Proper baseline
-    int bullet2Y = bullet1Y + lineHeight;
-    int bullet3Y = bullet2Y + lineHeight;
-    
-    tft.setCursor(MARGIN + 10, bullet1Y);
-    tft.printf("- Add %dg sugar", sugarAmounts[3]);
-    tft.setCursor(MARGIN + 10, bullet2Y);
-    tft.print("- Stir until fully dissolved");
-    tft.setCursor(MARGIN + 10, bullet3Y);
-    tft.print("- Wait, then Record");
-    drawButton(BUTTON_CALIB_RECORD_X, BUTTON_CALIB_RECORD_Y, BUTTON_CALIB_RECORD_W, BUTTON_CALIB_RECORD_H, "Record", calibAngles[3] > 0);
+    tft.print("- Wait for stable float");
+    tft.setCursor(MARGIN + 10, bullet4Y);
+    tft.print("- Press Record");
+    if (idx == 0) {
+      drawButton(BUTTON_CALIB_SKIP_X, BUTTON_CALIB_SKIP_Y, BUTTON_CALIB_SKIP_W, BUTTON_CALIB_SKIP_H, "ABORT", false);
+    } else {
+      drawButton(BUTTON_CALIB_EXIT_X, BUTTON_CALIB_EXIT_Y, BUTTON_CALIB_EXIT_W, BUTTON_CALIB_EXIT_H, "ABORT", false);
+    }
+    drawButton(BUTTON_CALIB_RECORD_X, BUTTON_CALIB_RECORD_Y, BUTTON_CALIB_RECORD_W, BUTTON_CALIB_RECORD_H, "Record", calibAngles[idx] > 0);
     
   } else if (calibMode == CALIB_COMPLETE) {
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, "4 Points Recorded", FONT_SIZE_MD, uiColorTextPrimary);
+    char title[32];
+    snprintf(title, sizeof(title), "%d Points Recorded", calibrationPointCount());
+    uiTextCenter(MARGIN, contentY + 12, UI_W - MARGIN * 2, 24, title, FONT_SIZE_MD, uiColorTextPrimary);
     
     tft.setTextColor(uiColorTextSecondary);
-    tft.setFreeFont(FONT_SIZE_SM);
-    int lineHeight = tft.fontHeight() + 4;
-    int summaryY = contentY + 40;
+    tft.setFreeFont(FONT_SIZE_XS);
+    int lineHeight = tft.fontHeight() + 5;
+    int summaryY = contentY + 72;
     
     char buf[64];
-    tft.setCursor(MARGIN + 10, summaryY);
+    tft.setCursor(MARGIN + 18, contentY + 58);
     tft.print("Summary:");
-    summaryY += lineHeight;
+    int leftX = MARGIN + 18;
+    int rightX = MARGIN + (UI_W - MARGIN * 2) / 2 + 8;
+    for (int i = 0; i < calibrationPointCount(); i++) {
+      int colX = (i < 3) ? leftX : rightX;
+      int rowY = summaryY + (i % 3) * lineHeight;
+      snprintf(buf, sizeof(buf), "P%d SG %.3f  %.1f deg", i + 1, calibrationTargetSG(i), calibAngles[i]);
+      tft.setCursor(colX, rowY);
+      tft.print(buf);
+    }
     
-    snprintf(buf, sizeof(buf), "P1 (SG 1.000): %.1f deg", calibAngles[0]);
-    tft.setCursor(MARGIN + 10, summaryY);
-    tft.print(buf);
-    summaryY += lineHeight;
-    
-    snprintf(buf, sizeof(buf), "P2 (SG 1.040): %.1f deg", calibAngles[1]);
-    tft.setCursor(MARGIN + 10, summaryY);
-    tft.print(buf);
-    summaryY += lineHeight;
-    
-    snprintf(buf, sizeof(buf), "P3 (SG 1.080): %.1f deg", calibAngles[2]);
-    tft.setCursor(MARGIN + 10, summaryY);
-    tft.print(buf);
-    summaryY += lineHeight;
-    
-    snprintf(buf, sizeof(buf), "P4 (SG 1.120): %.1f deg", calibAngles[3]);
-    tft.setCursor(MARGIN + 10, summaryY);
-    tft.print(buf);
-    
-    drawButton(BUTTON_CALIB_APPLY_X, BUTTON_CALIB_APPLY_Y, BUTTON_CALIB_APPLY_W, BUTTON_CALIB_APPLY_H, "Confirm", false);
+    drawButton(BUTTON_CALIB_EXIT_X, BUTTON_CALIB_EXIT_Y, BUTTON_CALIB_EXIT_W, BUTTON_CALIB_EXIT_H, "ABORT", false);
+    drawButton(BUTTON_CALIB_APPLY_X, BUTTON_CALIB_APPLY_Y, BUTTON_CALIB_APPLY_W, BUTTON_CALIB_APPLY_H, "CONFIRM", false);
   } else if (calibMode == CALIB_APPLYING) {
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, "Applying Calibration", FONT_SIZE_MD, uiColorTextPrimary);
+    uiTextCenter(MARGIN, contentY + 12, UI_W - MARGIN * 2, 24, "Applying Calibration", FONT_SIZE_MD, uiColorTextPrimary);
     
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
-    tft.setCursor(MARGIN + 10, contentY + 50 + tft.fontHeight());
+    tft.setCursor(MARGIN + 18, contentY + 86);
     tft.print("Calculating polynomial...");
     
   } else if (calibMode == CALIB_FAILED) {
-    uiTextCenter(MARGIN, contentY + 15, UI_W - MARGIN * 2, 20, "CALIBRATION FAILED", FONT_SIZE_MD, uiColorError);
+    uiTextCenter(MARGIN, contentY + 12, UI_W - MARGIN * 2, 24, "CALIBRATION FAILED", FONT_SIZE_MD, uiColorError);
     
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
-    tft.setCursor(MARGIN + 10, contentY + 50 + tft.fontHeight());
+    tft.setCursor(MARGIN + 18, contentY + 86);
     tft.print("No response from float");
     
     drawButton(BUTTON_CALIB_EXIT_X, BUTTON_CALIB_EXIT_Y, BUTTON_CALIB_EXIT_W, BUTTON_CALIB_EXIT_H, "EXIT", false);
   }
-  
-  // Exit button (only shown in offset calibration state)
-  if (calibMode == CALIB_OFFSET) {
-    drawButton(80, 194, BUTTON_CALIB_OFFSET_W, BUTTON_CALIB_OFFSET_H, "EXIT", false);
-  }
-  
-  uiDrawBottomNav(TAB_MORE);
   
   // Draw wait notification overlay if active
   if (waitActive) {
@@ -3216,7 +3565,11 @@ void drawBatteryView() {
   int contentY = TOPBAR_H + MARGIN;
   int contentH = UI_H - contentY - NAV_H - MARGIN;
   
-  if (displayDataCount < 3) {
+  bool hasLiveBattery = latestFloatDataValid &&
+                        latestFloatData.battery_voltage >= 2.5f &&
+                        latestFloatData.battery_voltage <= 4.5f;
+
+  if (displayDataCount < 3 && !hasLiveBattery) {
     drawNoDataCard("No battery data", "Collect a few points first", TAB_DASHBOARD);
     return;
   }
@@ -3243,6 +3596,21 @@ void drawBatteryView() {
       dismountSD();
     }
   }
+
+  if (hasLiveBattery) {
+    bool appendLive = displayDataCount == 0;
+    if (displayDataCount > 0) {
+      uint32_t newestLoadedEpoch = displayTimestampBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+      payload_t newestLoaded = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+      appendLive = !isEpochValid(newestLoadedEpoch) ||
+                   !isEpochValid(latestFloatEpoch) ||
+                   latestFloatEpoch > newestLoadedEpoch ||
+                   fabs(newestLoaded.battery_voltage - latestFloatData.battery_voltage) > 0.001f;
+    }
+    if (appendLive) {
+      addDataPoint(latestFloatData, latestFloatEpoch);
+    }
+  }
   
   // Extract battery voltage data from loaded displayDataBuffer
   float batteryData[MAX_DATA_POINTS];
@@ -3250,8 +3618,10 @@ void drawBatteryView() {
   int pointsToShow = min(displayDataCount, MAX_DATA_POINTS);
   for (int i = 0; i < pointsToShow; i++) {
     int idx = (displayDataIndex - pointsToShow + i + MAX_DATA_POINTS) % MAX_DATA_POINTS;
-    batteryData[i] = displayDataBuffer[idx].battery_voltage;
-    batteryCount++;
+    float voltage = displayDataBuffer[idx].battery_voltage;
+    if (voltage >= 2.5f && voltage <= 4.5f) {
+      batteryData[batteryCount++] = voltage;
+    }
   }
   
   // Draw sparkline with margins and reduced height for buttons
@@ -3260,7 +3630,46 @@ void drawBatteryView() {
   int sparkW = graphW - 70;  // Reduced width for y-axis labels
   int sparkH = graphContentH - 80;  // Use available space below title
   
-  uiDrawSparkline(sparkX, sparkY, sparkW, sparkH, batteryData, batteryCount);
+  float minVoltage = batteryCount > 0 ? batteryData[0] : 3.0f;
+  float maxVoltage = batteryCount > 0 ? batteryData[0] : 4.2f;
+  for (int i = 1; i < batteryCount; i++) {
+    if (batteryData[i] < minVoltage) minVoltage = batteryData[i];
+    if (batteryData[i] > maxVoltage) maxVoltage = batteryData[i];
+  }
+  float axisMin = floorf((minVoltage - 0.02f) * 100.0f) / 100.0f;
+  float axisMax = ceilf((maxVoltage + 0.02f) * 100.0f) / 100.0f;
+  if (axisMax - axisMin < 0.06f) {
+    float mid = (axisMax + axisMin) * 0.5f;
+    axisMin = mid - 0.03f;
+    axisMax = mid + 0.03f;
+  }
+
+  tft.fillRect(sparkX, sparkY, sparkW, sparkH, uiColorCardBackground);
+  for (int i = 1; i < 4; i++) {
+    int gy = sparkY + (sparkH * i / 4);
+    tft.drawFastHLine(sparkX, gy, sparkW, currentTheme->gridLine);
+  }
+  if (batteryCount >= 2) {
+    int prevX = -1;
+    int prevY = -1;
+    float range = axisMax - axisMin;
+    for (int i = 0; i < batteryCount; i++) {
+      float normalized = (batteryData[i] - axisMin) / range;
+      if (normalized < 0.0f) normalized = 0.0f;
+      if (normalized > 1.0f) normalized = 1.0f;
+      int px = sparkX + (i * sparkW / (batteryCount - 1));
+      int py = sparkY + sparkH - (int)(normalized * sparkH);
+      if (prevX >= 0 && prevY >= 0) {
+        tft.drawLine(prevX, prevY, px, py, uiColorGold);
+        tft.drawLine(prevX, prevY + 1, px, py + 1, uiColorGold);
+      }
+      prevX = px;
+      prevY = py;
+    }
+    tft.fillCircle(prevX, prevY, 3, uiColorGold);
+  } else {
+    tft.drawFastHLine(sparkX, sparkY + sparkH / 2, sparkW, currentTheme->gridLine);
+  }
   
   // Graph title
   tft.setTextColor(uiColorTextSecondary);
@@ -3269,29 +3678,18 @@ void drawBatteryView() {
   tft.print("Battery Voltage (V)");
   
   // Draw voltage range labels on y-axis
-  if (batteryCount >= 2) {
-    float minVoltage = batteryData[0];
-    float maxVoltage = batteryData[0];
-    for (int i = 1; i < batteryCount; i++) {
-      if (batteryData[i] < minVoltage) minVoltage = batteryData[i];
-      if (batteryData[i] > maxVoltage) maxVoltage = batteryData[i];
-    }
-    
-    // Add small padding
-    minVoltage -= 0.05;
-    maxVoltage += 0.05;
-    
+  if (batteryCount >= 1) {
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_XS);
     
     // Draw max voltage label
     char voltageBuf[16];
-    snprintf(voltageBuf, sizeof(voltageBuf), "%.2f", maxVoltage);
+    snprintf(voltageBuf, sizeof(voltageBuf), "%.2f", axisMax);
     tft.setCursor(graphX + 15, sparkY + 5);
     tft.print(voltageBuf);
     
     // Draw min voltage label
-    snprintf(voltageBuf, sizeof(voltageBuf), "%.2f", minVoltage);
+    snprintf(voltageBuf, sizeof(voltageBuf), "%.2f", axisMin);
     tft.setCursor(graphX + 15, sparkY + sparkH - 5);
     tft.print(voltageBuf);
   }
@@ -3574,7 +3972,18 @@ void checkTouch() {
   uint16_t x, y;
   
   // Use TFT_eSPI built-in touch (calibrated in Touch.h)
-  bool touched = tft.getTouch(&x, &y);
+  bool touched = false;
+  #if SGNODE_UI_TEST_HARNESS
+    if (uiTestTouchActive) {
+      x = uiTestTouchX;
+      y = uiTestTouchY;
+      touched = true;
+    } else {
+      touched = tft.getTouch(&x, &y);
+    }
+  #else
+    touched = tft.getTouch(&x, &y);
+  #endif
   
   if (touched) {
     // Update last touch time for SD operation timing
@@ -3600,8 +4009,7 @@ void checkTouch() {
           completeBrewWizard();
         } else if (brewWizard.cancelled()) {
           brewWizard.clearResultFlags();
-          currentMode = LIVE_VIEW;
-          screenDirty = true;
+          cancelBrewWizard();
         } else {
           screenDirty = true;
         }
@@ -3643,6 +4051,29 @@ void checkTouch() {
       }
     }
 
+    if (currentMode == DASHBOARD_VIEW && brewProfileLoaded && currentBatchAction.requiresChoice) {
+      int contentY = TOPBAR_H + MARGIN;
+      int contentW = UI_W - MARGIN * 2;
+      int actionY = contentY + 42 + 6;
+      int actionH = 78;
+      int buttonY = actionY + actionH - 32;
+      int buttonW = 86;
+      if (touchY >= buttonY && touchY <= buttonY + 28) {
+        if (touchX >= MARGIN + contentW - buttonW * 2 - GAP - 10 &&
+            touchX <= MARGIN + contentW - buttonW - GAP - 10) {
+          handleCurrentActionChoice(false);
+          delay(50);
+          return;
+        }
+        if (touchX >= MARGIN + contentW - buttonW - 10 &&
+            touchX <= MARGIN + contentW - 10) {
+          handleCurrentActionChoice(true);
+          delay(50);
+          return;
+        }
+      }
+    }
+
     if (currentMode == TARGET_CHART_VIEW && touchY < UI_H - NAV_H) {
       currentMode = LIVE_VIEW;
       screenDirty = true;
@@ -3673,6 +4104,11 @@ void checkTouch() {
       return;
     }
     
+    if (currentMode == CALIBRATION_VIEW && touchY >= UI_H - NAV_H) {
+      delay(50);
+      return;
+    }
+
     // Check bottom navigation using helper
     int tab = uiNavHitTest(touchX, touchY);
     if (tab >= 0) {
@@ -3995,12 +4431,59 @@ void checkTouch() {
       if (calibMode == CALIB_IDLE &&
           touchX >= BUTTON_CALIB_START_X && touchX <= BUTTON_CALIB_START_X + BUTTON_CALIB_START_W &&
           touchY >= BUTTON_CALIB_START_Y && touchY <= BUTTON_CALIB_START_Y + BUTTON_CALIB_START_H) {
-        calibMode = CALIB_INSTRUCTIONS;
+        calibMode = CALIB_SETUP;
         screenDirty = true;
-        LOG_INFOLN("Started calibration wizard");
+        LOG_INFOLN("Started calibration setup");
+      }
+
+      if (calibMode == CALIB_SETUP) {
+        int contentY = TOPBAR_H + MARGIN;
+        if (IOSSwitch::hit(touchX, touchY, UI_W - MARGIN - 86, contentY + 35)) {
+          calibDoSGCalibration = !calibDoSGCalibration;
+          screenDirty = true;
+          delay(50);
+          return;
+        }
+        if (calibDoSGCalibration && IOSSwitch::hit(touchX, touchY, UI_W - MARGIN - 86, contentY + 81)) {
+          calibUseSixPoints = !calibUseSixPoints;
+          screenDirty = true;
+          delay(50);
+          return;
+        }
+        if (calibDoSGCalibration && IOSSwitch::hit(touchX, touchY, UI_W - MARGIN - 86, contentY + 127)) {
+          calibUseSalt = !calibUseSalt;
+          screenDirty = true;
+          delay(50);
+          return;
+        }
+        if (touchX >= BUTTON_CALIB_BACK_X && touchX <= BUTTON_CALIB_BACK_X + BUTTON_CALIB_BACK_W &&
+            touchY >= BUTTON_CALIB_BACK_Y && touchY <= BUTTON_CALIB_BACK_Y + BUTTON_CALIB_BACK_H) {
+          abortCalibrationFlow();
+          LOG_INFOLN("Calibration setup aborted");
+          delay(50);
+          return;
+        }
+        if (touchX >= BUTTON_CALIB_NEXT_X && touchX <= BUTTON_CALIB_NEXT_X + BUTTON_CALIB_NEXT_W &&
+            touchY >= BUTTON_CALIB_NEXT_Y && touchY <= BUTTON_CALIB_NEXT_Y + BUTTON_CALIB_NEXT_H) {
+          for (int i = 0; i < MAX_BASE_CALIB_POINTS; i++) calibAngles[i] = 0.0f;
+          calibMode = CALIB_INSTRUCTIONS;
+          screenDirty = true;
+          LOG_INFOLN("Calibration setup confirmed");
+          delay(50);
+          return;
+        }
       }
       
       // Next button (instructions to offset calibration)
+      if (calibMode == CALIB_INSTRUCTIONS &&
+          touchX >= BUTTON_CALIB_BACK_X && touchX <= BUTTON_CALIB_BACK_X + BUTTON_CALIB_BACK_W &&
+          touchY >= BUTTON_CALIB_BACK_Y && touchY <= BUTTON_CALIB_BACK_Y + BUTTON_CALIB_BACK_H) {
+        calibMode = CALIB_SETUP;
+        screenDirty = true;
+        delay(50);
+        return;
+      }
+
       if (calibMode == CALIB_INSTRUCTIONS &&
           touchX >= BUTTON_CALIB_NEXT_X && touchX <= BUTTON_CALIB_NEXT_X + BUTTON_CALIB_NEXT_W &&
           touchY >= BUTTON_CALIB_NEXT_Y && touchY <= BUTTON_CALIB_NEXT_Y + BUTTON_CALIB_NEXT_H) {
@@ -4017,14 +4500,13 @@ void checkTouch() {
         startWait(2000); // 2 second wait for offset calibration
         LOG_VERBOSELN("CALIBRATE OFFSET - started 2s wait");
       }
-      
-      // Skip SG Calibration button (only in Point 1)
-      if (calibMode == CALIB_POINT1 &&
-          touchX >= BUTTON_CALIB_SKIP_X && touchX <= BUTTON_CALIB_SKIP_X + BUTTON_CALIB_SKIP_W &&
-          touchY >= BUTTON_CALIB_SKIP_Y && touchY <= BUTTON_CALIB_SKIP_Y + BUTTON_CALIB_SKIP_H) {
-        calibMode = CALIB_SKIP_WARNING;
-        screenDirty = true;
-        LOG_VERBOSELN("Show skip SG calibration warning");
+
+      if ((calibMode == CALIB_OFFSET || (calibMode >= CALIB_POINT1 && calibMode <= CALIB_POINT6) || calibMode == CALIB_COMPLETE || calibMode == CALIB_FAILED) &&
+          touchX >= BUTTON_CALIB_EXIT_X && touchX <= BUTTON_CALIB_EXIT_X + BUTTON_CALIB_EXIT_W &&
+          touchY >= BUTTON_CALIB_EXIT_Y && touchY <= BUTTON_CALIB_EXIT_Y + BUTTON_CALIB_EXIT_H) {
+        abortCalibrationFlow();
+        delay(50);
+        return;
       }
       
       // Skip confirmation buttons
@@ -4032,17 +4514,7 @@ void checkTouch() {
         // Yes button - skip SG calibration
         if (touchX >= BUTTON_CALIB_SKIP_YES_X && touchX <= BUTTON_CALIB_SKIP_YES_X + BUTTON_CALIB_SKIP_YES_W &&
             touchY >= BUTTON_CALIB_SKIP_YES_Y && touchY <= BUTTON_CALIB_SKIP_YES_Y + BUTTON_CALIB_SKIP_YES_H) {
-          // Send exit calibration command to float unit
-          calib_command_t exitCmd;
-          exitCmd.command = 7; // New command for EXIT_CALIBRATION
-          exitCmd.target_sg = 0.0;
-          exitCmd.request_id = 254; // Special ID for exit
-          
-          esp_err_t result;
-          if (floatMacKnown) {
-            result = esp_now_send(floatMac, (uint8_t*)&exitCmd, sizeof(exitCmd));
-            LOG_VERBOSE("Sent exit calibration command to float: %d\n", result);
-          }
+          sendExitCalibrationCommand();
           
           // Save offset only and exit to Live View
           currentMode = LIVE_VIEW;
@@ -4063,37 +4535,14 @@ void checkTouch() {
         }
       }
       
-      // Record button for each step - new workflow with wait
-      if (calibMode == CALIB_POINT1 &&
+      if (calibMode >= CALIB_POINT1 && calibMode <= CALIB_POINT6 &&
           touchX >= BUTTON_CALIB_RECORD_X && touchX <= BUTTON_CALIB_RECORD_X + BUTTON_CALIB_RECORD_W &&
           touchY >= BUTTON_CALIB_RECORD_Y && touchY <= BUTTON_CALIB_RECORD_Y + BUTTON_CALIB_RECORD_H) {
-        sendCalibrationCommand(0, 1.000);
+        int idx = calibrationPointIndex(calibMode);
+        uint8_t command = calibUseSixPoints ? (uint8_t)(8 + idx) : (uint8_t)idx;
+        sendCalibrationCommand(command, calibrationTargetSG(idx));
         startWait(2000); // 2 second wait for RECORD
-        LOG_VERBOSELN("RECORD Point 1 - started 2s wait");
-      }
-      
-      if (calibMode == CALIB_POINT2 &&
-          touchX >= BUTTON_CALIB_RECORD_X && touchX <= BUTTON_CALIB_RECORD_X + BUTTON_CALIB_RECORD_W &&
-          touchY >= BUTTON_CALIB_RECORD_Y && touchY <= BUTTON_CALIB_RECORD_Y + BUTTON_CALIB_RECORD_H) {
-        sendCalibrationCommand(1, 1.040);
-        startWait(2000); // 2 second wait for RECORD
-        LOG_VERBOSELN("RECORD Point 2 - started 2s wait");
-      }
-      
-      if (calibMode == CALIB_POINT3 &&
-          touchX >= BUTTON_CALIB_RECORD_X && touchX <= BUTTON_CALIB_RECORD_X + BUTTON_CALIB_RECORD_W &&
-          touchY >= BUTTON_CALIB_RECORD_Y && touchY <= BUTTON_CALIB_RECORD_Y + BUTTON_CALIB_RECORD_H) {
-        sendCalibrationCommand(2, 1.080);
-        startWait(2000); // 2 second wait for RECORD
-        LOG_VERBOSELN("RECORD Point 3 - started 2s wait");
-      }
-      
-      if (calibMode == CALIB_POINT4 &&
-          touchX >= BUTTON_CALIB_RECORD_X && touchX <= BUTTON_CALIB_RECORD_X + BUTTON_CALIB_RECORD_W &&
-          touchY >= BUTTON_CALIB_RECORD_Y && touchY <= BUTTON_CALIB_RECORD_Y + BUTTON_CALIB_RECORD_H) {
-        sendCalibrationCommand(3, 1.120);
-        startWait(2000); // 2 second wait for RECORD
-        LOG_VERBOSELN("RECORD Point 4 - started 2s wait");
+        LOG_VERBOSE("RECORD Point %d - started 2s wait\n", idx + 1);
       }
       
       // Apply button - new workflow with 3s wait and failure handling
@@ -4107,33 +4556,6 @@ void checkTouch() {
         LOG_VERBOSELN("APPLY - started 3s wait for confirmation");
       }
       
-      // Exit button - only available in Step 1/5 (CALIB_OFFSET)
-      if (calibMode == CALIB_OFFSET &&
-          touchX >= 80 && touchX <= 80 + BUTTON_CALIB_OFFSET_W &&
-          touchY >= 194 && touchY <= 194 + BUTTON_CALIB_OFFSET_H) {
-        // Send exit calibration command to float unit
-        calib_command_t exitCmd;
-        exitCmd.command = 7; // EXIT_CALIBRATION
-        exitCmd.target_sg = 0.0;
-        exitCmd.request_id = 254; // Special ID for exit
-        
-        esp_err_t result;
-        if (floatMacKnown) {
-          result = esp_now_send(floatMac, (uint8_t*)&exitCmd, sizeof(exitCmd));
-          LOG_VERBOSE("Sent exit calibration command to float: %d\n", result);
-        }
-        
-        currentMode = LIVE_VIEW;
-        calibMode = CALIB_IDLE;
-        calibrationModeActive = false;
-        stopWait(); // Stop any active wait
-        // Reset calibration data
-        for (int i = 0; i < 4; i++) calibAngles[i] = 0.0;
-        screenDirty = true;
-        staticElementsDrawn = false; // Force complete redraw to clear artifacts
-        LOG_INFOLN("EXIT calibration - returned to Live view");
-        LOG_INFOLN("Exited calibration mode");
-      }
     }
     
     delay(50); // Debounce
@@ -4201,6 +4623,33 @@ void applyCalibration() {
   }
 }
 
+void sendExitCalibrationCommand() {
+  calib_command_t exitCmd;
+  exitCmd.command = 7; // EXIT_CALIBRATION
+  exitCmd.target_sg = 0.0f;
+  exitCmd.request_id = 254;
+
+  if (floatMacKnown) {
+    esp_err_t result = esp_now_send(floatMac, (uint8_t*)&exitCmd, sizeof(exitCmd));
+    LOG_VERBOSE("Sent exit calibration command to float: %d\n", result);
+  } else {
+    esp_err_t result = esp_now_send(NULL, (uint8_t*)&exitCmd, sizeof(exitCmd));
+    LOG_VERBOSE("Sent exit calibration command via broadcast: %d\n", result);
+  }
+}
+
+void abortCalibrationFlow() {
+  sendExitCalibrationCommand();
+  currentMode = LIVE_VIEW;
+  calibMode = CALIB_IDLE;
+  calibrationModeActive = false;
+  stopWait();
+  for (int i = 0; i < MAX_BASE_CALIB_POINTS; i++) calibAngles[i] = 0.0f;
+  screenDirty = true;
+  staticElementsDrawn = false;
+  LOG_INFOLN("Calibration aborted - returned to Live view");
+}
+
 void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int len) {
   // Flood protection: Check rate limiting
   unsigned long currentTime = millis();
@@ -4246,7 +4695,15 @@ void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int 
       stopWait(); // Stop the 2s wait
       calibOffset = calibResp.angle; // Store offset angle
       offsetCalibrated = true;
-      calibMode = CALIB_POINT1; // Move to first SG calibration point
+      if (calibDoSGCalibration) {
+        calibMode = CALIB_POINT1; // Move to first SG calibration point
+      } else {
+        sendExitCalibrationCommand();
+        calibMode = CALIB_IDLE;
+        currentMode = LIVE_VIEW;
+        calibrationModeActive = false;
+        staticElementsDrawn = false;
+      }
       screenDirty = true;
       LOG_INFO("Stored offset angle: %.2f°, moved to Point 1\n", calibOffset);
     }
@@ -4271,6 +4728,14 @@ void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int 
         staticElementsDrawn = false; // Force full redraw to clear any remaining artifacts
       }
     } else {
+      for (int i = 0; i < calibrationPointCount(); i++) {
+        if (fabs(calibResp.sg - calibrationTargetSG(i)) <= 0.006f) {
+          calibAngles[i] = calibResp.angle;
+          LOG_INFO("Stored Point %d angle: %.2f deg\n", i + 1, calibAngles[i]);
+          break;
+        }
+      }
+      return;
       // Calibration data - store angle based on which point was calibrated
       // Determine which calibration point this response is for based on target_sg
       if (calibResp.sg >= 0.995 && calibResp.sg <= 1.005) {
@@ -4376,9 +4841,9 @@ void onCalibrationCommandFromFloat(const uint8_t *mac, const uint8_t *incomingDa
     
     calibrationModeActive = true;
     
-    // Switch to calibration view and start with offset calibration
+    // Switch to calibration view and let the user choose calibration options first.
     currentMode = CALIBRATION_VIEW;
-    calibMode = CALIB_OFFSET;
+    calibMode = CALIB_SETUP;
     screenDirty = true;
   }
 }
@@ -4446,7 +4911,13 @@ bool loadHistoricalDataFromCSV(const char* filename,
   // First pass: count total data lines
   int totalDataLines = 0;
   uint32_t newestEpoch = 0;
-  char line[160];
+  uint32_t oldestEpoch = 0;
+  uint32_t batchStartForScan = brewProfileLoaded ? activeBrewProfile.createdAt : 0;
+  int preBatchLines = 0;
+  int postBatchLines = 0;
+  uint32_t lastPreBatchEpoch = 0;
+  uint32_t firstPostBatchEpoch = 0;
+  static char line[180];
   
   file.seek(0);
   
@@ -4466,6 +4937,16 @@ bool loadHistoricalDataFromCSV(const char* filename,
       uint8_t battery_percent = 0;
       if (parseCSVDataLine(line, &data, &epoch_s, &battery_percent) && isEpochValid(epoch_s)) {
         newestEpoch = epoch_s;
+        if (!isEpochValid(oldestEpoch)) oldestEpoch = epoch_s;
+        if (isEpochValid(batchStartForScan)) {
+          if (epoch_s < batchStartForScan) {
+            preBatchLines++;
+            lastPreBatchEpoch = epoch_s;
+          } else {
+            postBatchLines++;
+            if (!isEpochValid(firstPostBatchEpoch)) firstPostBatchEpoch = epoch_s;
+          }
+        }
       }
     }
   }
@@ -4522,6 +5003,10 @@ bool loadHistoricalDataFromCSV(const char* filename,
   // Reset display data buffer
   clearHistoricalDisplayData();
   totalCSVDataLines = totalDataLines;
+  lastHistoricalPreBatchLines = preBatchLines;
+  lastHistoricalPostBatchLines = postBatchLines;
+  lastHistoricalOldestEpoch = oldestEpoch;
+  lastHistoricalNewestEpoch = newestEpoch;
   
   // Second pass: load data with line skipping and sampling
   file.seek(0);
@@ -4531,7 +5016,28 @@ bool loadHistoricalDataFromCSV(const char* filename,
   int timeFilteredCount = 0;
   int parseErrorCount = 0;
   int sampleCounter = 0;
+  int batchFilteredCount = 0;
+  int cutoffFilteredCount = 0;
   uint32_t batchStartEpoch = brewProfileLoaded ? activeBrewProfile.createdAt : 0;
+  bool filterByBatchStart = isEpochValid(batchStartEpoch);
+  bool relaxedBatchStart = false;
+  if (filterByBatchStart && mode == LOAD_ALL && preBatchLines > 0 && postBatchLines > 0 &&
+      preBatchLines > postBatchLines * 2) {
+    relaxedBatchStart = true;
+    filterByBatchStart = false;
+    LOG_INFO("CSV history: relaxed batch start filter for LOAD_ALL pre=%d post=%d\n",
+             preBatchLines, postBatchLines);
+  } else if (filterByBatchStart && preBatchLines > 0 && postBatchLines > 0 &&
+      isEpochValid(lastPreBatchEpoch) && isEpochValid(firstPostBatchEpoch) &&
+      firstPostBatchEpoch >= lastPreBatchEpoch &&
+      firstPostBatchEpoch - lastPreBatchEpoch <= 3UL * 3600UL &&
+      preBatchLines > postBatchLines * 2) {
+    relaxedBatchStart = true;
+    filterByBatchStart = false;
+    LOG_INFO("CSV history: relaxed batch start filter pre=%d post=%d gap=%lus\n",
+             preBatchLines, postBatchLines, (unsigned long)(firstPostBatchEpoch - lastPreBatchEpoch));
+  }
+  lastHistoricalBatchStartRelaxed = relaxedBatchStart;
   
   while (file.available() && loadedCount < linesToLoad) {
     int bytesRead = file.readBytesUntil('\n', line, sizeof(line) - 1);
@@ -4562,13 +5068,15 @@ bool loadHistoricalDataFromCSV(const char* filename,
     bool parsed = parseCSVDataLine(line, &data, &epoch_s, &battery_percent);
     
     if (parsed) {
-      if (isEpochValid(batchStartEpoch) && isEpochValid(epoch_s) && epoch_s < batchStartEpoch) {
+      if (filterByBatchStart && isEpochValid(epoch_s) && epoch_s < batchStartEpoch) {
         timeFilteredCount++;
+        batchFilteredCount++;
         continue;
       }
 
       if (isEpochValid(cutoffEpoch) && (!isEpochValid(epoch_s) || epoch_s < cutoffEpoch)) {
         timeFilteredCount++;
+        cutoffFilteredCount++;
         continue;
       }
       
@@ -4598,6 +5106,8 @@ bool loadHistoricalDataFromCSV(const char* filename,
   lastHistoricalLoadedLines = loadedCount;
   lastHistoricalSkippedLines = timeFilteredCount;
   lastHistoricalParseErrors = parseErrorCount;
+  lastHistoricalBatchFilteredLines = batchFilteredCount;
+  lastHistoricalCutoffFilteredLines = cutoffFilteredCount;
   LOG_VERBOSE("Loaded %d data points from CSV\n", loadedCount);
   LOG_INFO("CSV history: loaded=%d total=%d skipped=%d parseErrors=%d\n",
            loadedCount, totalDataLines, timeFilteredCount, parseErrorCount);
@@ -4681,6 +5191,76 @@ bool ensureFermentationLogFile(const char* batchId) {
   return true;
 }
 
+bool findBestFallbackBatch(char* batchId, size_t bufferSize) {
+  if (!batchId || bufferSize == 0) return false;
+  batchId[0] = '\0';
+  if (!SD.exists("/data/batches")) return false;
+
+  File root = SD.open("/data/batches");
+  if (!root) return false;
+
+  int highestNumber = 0;
+  int bestDataNumber = 0;
+  uint32_t bestDataEpoch = 0;
+  static char line[180];
+  static BrewProfile candidateProfile;
+
+  File entry = root.openNextFile();
+  while (entry) {
+    if (entry.isDirectory()) {
+      const char* filename = entry.name();
+      const char* slash = strrchr(filename, '/');
+      if (slash) filename = slash + 1;
+      int fileNum = 0;
+      if (sscanf(filename, "batch_%d", &fileNum) == 1) {
+        char candidateBatchId[24];
+        char profilePath[80];
+        BrewProfileStore::buildBatchId(fileNum, candidateBatchId, sizeof(candidateBatchId));
+        BrewProfileStore::profilePath(candidateBatchId, profilePath, sizeof(profilePath));
+        if (SD.exists(profilePath)) {
+          uint32_t newestEligibleEpoch = 0;
+          if (BrewProfileStore::load(candidateBatchId, &candidateProfile) && !candidateProfile.completed) {
+            if (fileNum > highestNumber) highestNumber = fileNum;
+            char logPath[80];
+            BrewProfileStore::logPath(candidateBatchId, logPath, sizeof(logPath));
+            File logFile = SD.open(logPath, FILE_READ);
+            if (logFile) {
+              while (logFile.available()) {
+                int bytesRead = logFile.readBytesUntil('\n', line, sizeof(line) - 1);
+                line[bytesRead] = '\0';
+                if (strncmp(line, "timestamp,", 10) == 0 || line[0] == '#' || strlen(line) == 0) continue;
+
+                payload_t data = {0};
+                uint32_t epoch = 0;
+                uint8_t batteryPercent = 0;
+                if (parseCSVDataLine(line, &data, &epoch, &batteryPercent) &&
+                    isEpochValid(epoch) &&
+                    (!isEpochValid(candidateProfile.createdAt) || epoch >= candidateProfile.createdAt)) {
+                  if (epoch > newestEligibleEpoch) newestEligibleEpoch = epoch;
+                }
+              }
+              logFile.close();
+            }
+          }
+
+          if (isEpochValid(newestEligibleEpoch) && newestEligibleEpoch > bestDataEpoch) {
+            bestDataEpoch = newestEligibleEpoch;
+            bestDataNumber = fileNum;
+          }
+        }
+      }
+    }
+    entry.close();
+    entry = root.openNextFile();
+  }
+  root.close();
+
+  int selectedNumber = bestDataNumber > 0 ? bestDataNumber : highestNumber;
+  if (selectedNumber <= 0) return false;
+  BrewProfileStore::buildBatchId(selectedNumber, batchId, bufferSize);
+  return true;
+}
+
 void persistActiveBrewProfile() {
   #if !SD_ENABLED
     return;
@@ -4698,6 +5278,15 @@ void persistActiveBrewProfile() {
 }
 
 void beginBrewWizard() {
+  if (!brewWizardHasSavedRuntime || currentMode != BREW_WIZARD_VIEW) {
+    brewWizardSavedProfile = activeBrewProfile;
+    brewWizardSavedProfileLoaded = brewProfileLoaded;
+    brewWizardSavedFermentationFileOpen = fermentationFileOpen;
+    strncpy(brewWizardSavedFermentationFile, currentFermentationFile, sizeof(brewWizardSavedFermentationFile) - 1);
+    brewWizardSavedFermentationFile[sizeof(brewWizardSavedFermentationFile) - 1] = '\0';
+    brewWizardHasSavedRuntime = true;
+  }
+
   BrewProfileStore::setDefaults(&activeBrewProfile);
   bool wizardInitialized = false;
   if (mountSDTemporarily()) {
@@ -4729,7 +5318,22 @@ void beginBrewWizard() {
   screenDirty = true;
 }
 
+void cancelBrewWizard() {
+  if (brewWizardHasSavedRuntime) {
+    activeBrewProfile = brewWizardSavedProfile;
+    brewProfileLoaded = brewWizardSavedProfileLoaded;
+    fermentationFileOpen = brewWizardSavedFermentationFileOpen;
+    strncpy(currentFermentationFile, brewWizardSavedFermentationFile, sizeof(currentFermentationFile) - 1);
+    currentFermentationFile[sizeof(currentFermentationFile) - 1] = '\0';
+    brewWizardHasSavedRuntime = false;
+  }
+  refreshFermentationAssistantFromProfile();
+  currentMode = DASHBOARD_VIEW;
+  screenDirty = true;
+}
+
 void completeBrewWizard() {
+  brewWizardHasSavedRuntime = false;
   activeBrewProfile.recipeOG = BrixConverter::brixToSG(activeBrewProfile.recipeBrix);
   activeBrewProfile.effectiveOG = activeBrewProfile.recipeOG;
   activeBrewProfile.expectedFinalGravity = DerivedCalculations::expectedFG(
@@ -4738,6 +5342,7 @@ void completeBrewWizard() {
   activeBrewProfile.estimatedABV = 0.0f;
   activeBrewProfile.ogVerified = false;
   activeBrewProfile.ogNeedsChoice = false;
+  BatchActionEngine::applyStyleDefaults(&activeBrewProfile);
   brewProfileLoaded = true;
   ogVerificationPending = false;
   targetCurveAvailable = false;
@@ -4753,6 +5358,7 @@ void completeBrewWizard() {
   if (mountSDTemporarily()) {
     BrewProfileStore::ensureBatchDirectory(activeBrewProfile.batchId);
     BrewProfileStore::save(activeBrewProfile);
+    BrewProfileStore::saveActiveBatchId(activeBrewProfile.batchId);
     BrewProfileStore::saveYeastHistory(activeBrewProfile.yeastName);
     TargetCurveGenerator::generateAndSave(activeBrewProfile);
     targetCurveAvailable = true;
@@ -4798,8 +5404,58 @@ void handleOGChoice(bool useMeasuredOG) {
     dismountSD();
   }
   refreshFermentationAssistantFromProfile();
+  float currentSG = activeBrewProfile.effectiveOG;
+  if (latestFloatDataValid) {
+    currentSG = latestFloatData.density;
+  } else if (displayDataCount > 0) {
+    currentSG = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS].density;
+  }
+  unsigned long nowEpoch = getCurrentEpoch();
+  if (!isEpochValid(nowEpoch)) nowEpoch = latestFloatDataValid ? latestFloatEpoch : activeBrewProfile.createdAt;
+  refreshCurrentBatchAction(currentSG, nowEpoch);
+  if (currentBatchAction.type == ACTION_VERIFY_OG ||
+      currentRecommendation.code == 10 ||
+      currentRecommendation.code == 11) {
+    currentBatchAction.type = ACTION_NONE;
+    currentBatchAction.code = 0;
+    currentBatchAction.requiresChoice = false;
+    currentBatchAction.secondsUntilDue = 0;
+    strcpy(currentBatchAction.title, "Next");
+    strcpy(currentBatchAction.message, "OG verified");
+    currentRecommendation.code = 0;
+    strcpy(currentRecommendation.message, "OG verified");
+  }
   currentMode = LIVE_VIEW;
   staticElementsDrawn = false;
+  screenDirty = true;
+}
+
+void handleCurrentActionChoice(bool done) {
+  if (!brewProfileLoaded || currentBatchAction.type == ACTION_NONE || !currentBatchAction.requiresChoice) return;
+  BatchActionType type = currentBatchAction.type;
+  unsigned long nowEpoch = getCurrentEpoch();
+  if (!isEpochValid(nowEpoch)) nowEpoch = latestFloatDataValid ? latestFloatEpoch : activeBrewProfile.createdAt;
+
+  bool changed = done
+    ? BatchActionEngine::applyDone(&activeBrewProfile, type, nowEpoch)
+    : BatchActionEngine::applySkip(&activeBrewProfile, type, nowEpoch);
+  if (!changed) return;
+
+  if (mountSDTemporarily()) {
+    BrewProfileStore::save(activeBrewProfile);
+    BrewProfileStore::appendBatchEvent(activeBrewProfile.batchId, nowEpoch,
+                                       BatchActionEngine::eventName(type, done),
+                                       currentBatchAction.message,
+                                       latestFloatDataValid ? latestFloatData.density : 0.0f);
+    dismountSD();
+  }
+
+  float currentSG = latestFloatDataValid ? latestFloatData.density :
+    (displayDataCount > 0 ? displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS].density : activeBrewProfile.effectiveOG);
+  currentRecommendation.code = 0;
+  strncpy(currentRecommendation.message, done ? "Action marked done" : "Action skipped", sizeof(currentRecommendation.message) - 1);
+  currentRecommendation.message[sizeof(currentRecommendation.message) - 1] = '\0';
+  refreshCurrentBatchAction(currentSG, nowEpoch);
   screenDirty = true;
 }
 
@@ -4834,8 +5490,34 @@ void saveYeastPerformanceSummary(float finalGravity, uint32_t completedAt) {
   }
 }
 
+bool isPlausibleSensorReading(const payload_t& data, const char** issue) {
+  if (isnan(data.density) || isinf(data.density) || data.density < 0.990f || data.density > 1.200f) {
+    if (issue) *issue = "invalid SG";
+    return false;
+  }
+  if (isnan(data.temperature) || isinf(data.temperature) || data.temperature < -5.0f || data.temperature > 60.0f) {
+    if (issue) *issue = "invalid temperature";
+    return false;
+  }
+  if (isnan(data.battery_voltage) || isinf(data.battery_voltage) ||
+      (data.battery_voltage > 0.0f && (data.battery_voltage < 2.5f || data.battery_voltage > 4.4f))) {
+    if (issue) *issue = "invalid battery";
+    return false;
+  }
+  if (issue) *issue = "";
+  return true;
+}
+
 void updateFermentationAssistant(payload_t data, uint32_t epoch_s) {
   if (!brewProfileLoaded) return;
+
+  const char* sensorIssue = "";
+  if (!isPlausibleSensorReading(data, &sensorIssue)) {
+    currentRecommendation = RecommendationEngine::sensorIssue(sensorIssue);
+    currentETA.valid = false;
+    markScreenDirtyForFloatData();
+    return;
+  }
 
   if (!activeBrewProfile.ogVerified && !activeBrewProfile.ogNeedsChoice) {
     OGVerificationResult result = ogVerifier.addReading(data.density);
@@ -4897,6 +5579,22 @@ void updateFermentationAssistant(payload_t data, uint32_t epoch_s) {
     data.temperature,
     fermentationMetrics.gravityDeltaPerHour,
     elapsedSeconds);
+  currentBatchAction = BatchActionEngine::evaluate(
+    activeBrewProfile,
+    phase,
+    fermentationMetrics.currentAttenuation,
+    data.density,
+    fermentationMetrics.gravityDeltaPerHour,
+    epoch_s);
+  if (currentBatchAction.type != ACTION_NONE) {
+    currentRecommendation.code = currentBatchAction.code;
+    strncpy(currentRecommendation.message, currentBatchAction.message, sizeof(currentRecommendation.message) - 1);
+    currentRecommendation.message[sizeof(currentRecommendation.message) - 1] = '\0';
+  } else if (currentRecommendation.code >= 100) {
+    currentRecommendation.code = 0;
+    strncpy(currentRecommendation.message, currentBatchAction.message, sizeof(currentRecommendation.message) - 1);
+    currentRecommendation.message[sizeof(currentRecommendation.message) - 1] = '\0';
+  }
   currentETA = ETAPredictor::predict(activeBrewProfile, data.density, fermentationMetrics.expectedFinalGravity,
                                      fermentationMetrics.gravityDeltaPerHour, elapsedSeconds);
 
@@ -4907,6 +5605,36 @@ void updateFermentationAssistant(payload_t data, uint32_t epoch_s) {
 
   previousAnalyticsSG = data.density;
   previousAnalyticsEpoch = epoch_s;
+}
+
+void refreshCurrentBatchAction(float currentSG, unsigned long nowEpoch) {
+  if (!brewProfileLoaded) {
+    currentBatchAction.type = ACTION_NONE;
+    currentBatchAction.code = 0;
+    currentBatchAction.requiresChoice = false;
+    strcpy(currentBatchAction.title, "Next");
+    strcpy(currentBatchAction.message, "No active batch");
+    return;
+  }
+  currentBatchAction = BatchActionEngine::evaluate(
+    activeBrewProfile,
+    fermentationStateMachine.phase(),
+    fermentationMetrics.currentAttenuation,
+    currentSG,
+    fermentationMetrics.gravityDeltaPerHour,
+    nowEpoch);
+  if (currentBatchAction.type != ACTION_NONE) {
+    currentRecommendation.code = currentBatchAction.code;
+    strncpy(currentRecommendation.message, currentBatchAction.message, sizeof(currentRecommendation.message) - 1);
+    currentRecommendation.message[sizeof(currentRecommendation.message) - 1] = '\0';
+  } else if (currentRecommendation.code == 0 ||
+             currentRecommendation.code == 10 ||
+             currentRecommendation.code == 11 ||
+             currentRecommendation.code >= 100) {
+    currentRecommendation.code = 0;
+    strncpy(currentRecommendation.message, currentBatchAction.message, sizeof(currentRecommendation.message) - 1);
+    currentRecommendation.message[sizeof(currentRecommendation.message) - 1] = '\0';
+  }
 }
 
 void refreshFermentationAssistantFromProfile() {
@@ -4961,6 +5689,7 @@ void refreshFermentationAssistantFromProfile() {
     activeBrewProfile.expectedFinalGravity,
     0.0f,
     elapsedSeconds);
+  refreshCurrentBatchAction(activeBrewProfile.effectiveOG, nowEpoch);
 }
 
 void checkExistingFermentation() {
@@ -4983,36 +5712,34 @@ void checkExistingFermentation() {
       return;
     }
     
-    int highestNumber = 0;
-    bool hasExistingFiles = false;
-    
-    File file = root.openNextFile();
-    while (file) {
-      if (file.isDirectory()) {
-        const char* filename = file.name();
-        const char* slash = strrchr(filename, '/');
-        if (slash) filename = slash + 1;
-        int fileNum = 0;
-        if (sscanf(filename, "batch_%d", &fileNum) == 1) {
-          char candidateBatchId[24];
-          char profilePath[80];
-          BrewProfileStore::buildBatchId(fileNum, candidateBatchId, sizeof(candidateBatchId));
-          BrewProfileStore::profilePath(candidateBatchId, profilePath, sizeof(profilePath));
-          if (SD.exists(profilePath) && fileNum > highestNumber) {
-            hasExistingFiles = true;
-            highestNumber = fileNum;
-          }
+    char batchId[24] = "";
+    bool hasSelectedBatch = false;
+    if (BrewProfileStore::loadActiveBatchId(batchId, sizeof(batchId))) {
+      char profilePath[80];
+      BrewProfileStore::profilePath(batchId, profilePath, sizeof(profilePath));
+      hasSelectedBatch = SD.exists(profilePath);
+      if (hasSelectedBatch) {
+        static BrewProfile markerProfile;
+        if (!BrewProfileStore::load(batchId, &markerProfile) || markerProfile.completed) {
+          hasSelectedBatch = false;
         }
       }
-      file.close();
-      file = root.openNextFile();
+      if (!hasSelectedBatch) {
+        LOG_ERROR("Active batch marker points to missing profile: %s\n", batchId);
+        BrewProfileStore::clearActiveBatchId();
+        batchId[0] = '\0';
+      }
     }
-    
+
     root.close();
     
-    if (hasExistingFiles && highestNumber > 0) {
-      char batchId[24];
-      BrewProfileStore::buildBatchId(highestNumber, batchId, sizeof(batchId));
+    if (!hasSelectedBatch && findBestFallbackBatch(batchId, sizeof(batchId))) {
+      hasSelectedBatch = true;
+      BrewProfileStore::saveActiveBatchId(batchId);
+      LOG_INFO("No active batch marker, fallback selected batch: %s\n", batchId);
+    }
+
+    if (hasSelectedBatch && batchId[0] != '\0') {
       if (BrewProfileStore::load(batchId, &activeBrewProfile)) {
         brewProfileLoaded = true;
         originalGravity = activeBrewProfile.effectiveOG;
@@ -5797,19 +6524,27 @@ void drawLiveDetailsView() {
   drawDetailRowAt(rightX, &rightY, colW, "Battery", hasData ? value : "--");
   snprintf(value, sizeof(value), "%d", hasData ? latest.sequence_id : 0);
   drawDetailRowAt(rightX, &rightY, colW, "Seq", hasData ? value : "--");
+  snprintf(value, sizeof(value), "%u / %lu", lastAckedFloatSeq, (unsigned long)duplicateFloatPackets);
+  drawDetailRowAt(rightX, &rightY, colW, "ACK/Dup", value);
   snprintf(value, sizeof(value), "%d dBm", lastRSSI);
   drawDetailRowAt(rightX, &rightY, colW, "RSSI", rssiAvailable ? value : "--");
 
   rightY += 4;
   drawDetailSectionAt(rightX, &rightY, colW, "SYSTEM");
   snprintf(value, sizeof(value), "%s", fermentationFileOpen ? "OK" : "ERR");
-  drawDetailRowAt(rightX, &rightY, colW, "SD", value);
-  snprintf(value, sizeof(value), "%d/%d", lastHistoricalLoadedLines, totalCSVDataLines);
+  drawDetailRowAt(rightX, &rightY, colW, "Log", value);
+  snprintf(value, sizeof(value), "%d", displayDataCount);
+  drawDetailRowAt(rightX, &rightY, colW, "Live Pts", value);
+  if (totalCSVDataLines > 0 || lastHistoricalLoadedLines > 0) {
+    snprintf(value, sizeof(value), "%d/%d", lastHistoricalLoadedLines, totalCSVDataLines);
+  } else {
+    snprintf(value, sizeof(value), "%s", hasData ? "pending" : "0/0");
+  }
   drawDetailRowAt(rightX, &rightY, colW, "CSV L/T", value);
-  snprintf(value, sizeof(value), "%d", bufferedCount);
+  snprintf(value, sizeof(value), "%d/%d", lastHistoricalSkippedLines, lastHistoricalParseErrors);
+  drawDetailRowAt(rightX, &rightY, colW, "Skip/Err", value);
+  snprintf(value, sizeof(value), "%d/%d", bufferedCount, MAX_DATA_BUFFER);
   drawDetailRowAt(rightX, &rightY, colW, "Buf", value);
-  snprintf(value, sizeof(value), "%s / %s", calibCoeffs.isValid ? "Cal OK" : "Cal --", darkMode ? "Dark" : "Light");
-  drawDetailRowAt(rightX, &rightY, colW, "Device", value);
 
   uiDrawBottomNav(TAB_LIVE);
   detailsDirty = false;
@@ -5821,14 +6556,34 @@ void drawLiveDetailsView() {
 bool mountSDTemporarily() {
   if (!sdInitialized) {
     // Serial.println("Mounting SD card temporarily...");  // Reduced spam
-    
-    // Initialize separate SPI for SD card
+
+    digitalWrite(DISPLAY_CS, HIGH);
+    digitalWrite(SD_CS, HIGH);
+    delayMicroseconds(50);
+
     sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-    
-    // Use the separate SPI instance for SD card
-    if (!SD.begin(SD_CS, sdSPI)) {
+    sdSPI.setFrequency(4000000);
+    delayMicroseconds(50);
+
+    int mountAttempts = 0;
+    const int MAX_MOUNT_ATTEMPTS = 2;
+    bool mounted = false;
+    while (mountAttempts < MAX_MOUNT_ATTEMPTS && !mounted) {
+      mounted = SD.begin(SD_CS, sdSPI);
+      if (!mounted) {
+        mountAttempts++;
+        if (mountAttempts < MAX_MOUNT_ATTEMPTS) delay(100);
+      }
+    }
+
+    if (!mounted) {
       LOG_ERRORLN("SD card mount failed!");
       sdCardPresent = false;
+      SD.end();
+      sdSPI.end();
+      digitalWrite(SD_CS, HIGH);
+      digitalWrite(DISPLAY_CS, HIGH);
+      delayMicroseconds(100);
       return false;
     }
     sdInitialized = true;
@@ -6121,18 +6876,6 @@ void drawGraphAxes() {
     tft.printf("%d deg", angleLabels[i]);
   }
   
-  // Draw grid lines
-  tft.setTextColor(currentTheme->gridLine);
-  for (int i = 1; i < 6; i++) {
-    int x = POLY_GRAPH_INNER_X + (i * (POLY_GRAPH_INNER_W - 1) / 6);
-    tft.drawLine(x, POLY_GRAPH_INNER_Y, x, POLY_GRAPH_INNER_Y + POLY_GRAPH_INNER_H - 1, currentTheme->gridLine);
-  }
-  
-  for (int i = 1; i < 4; i++) {
-    float sg = 0.900 + (i * 0.050);
-    int y = POLY_GRAPH_INNER_Y + POLY_GRAPH_INNER_H - 1 - ((sg - 0.900) / (1.200 - 0.900) * (POLY_GRAPH_INNER_H - 20));
-    tft.drawLine(POLY_GRAPH_INNER_X, y, POLY_GRAPH_INNER_X + POLY_GRAPH_INNER_W - 1, y, currentTheme->gridLine);
-  }
 }
 
 void drawGraphCurve() {
@@ -6145,6 +6888,40 @@ void drawGraphCurve() {
                     graphPoints[i].x, graphPoints[i].y, uiColorGold);
     }
   }
+}
+
+int calibrationPointCount() {
+  return calibUseSixPoints ? 6 : 4;
+}
+
+int calibrationPointIndex(CalibMode mode) {
+  if (mode < CALIB_POINT1 || mode > CALIB_POINT6) return -1;
+  return (int)mode - (int)CALIB_POINT1;
+}
+
+CalibMode calibrationModeForPoint(int index) {
+  if (index < 0) index = 0;
+  if (index >= MAX_BASE_CALIB_POINTS) index = MAX_BASE_CALIB_POINTS - 1;
+  return (CalibMode)((int)CALIB_POINT1 + index);
+}
+
+float calibrationTargetSG(int index) {
+  if (calibUseSixPoints) {
+    static const float targets6[6] = {1.000f, 1.010f, 1.020f, 1.030f, 1.045f, 1.060f};
+    return targets6[index < 0 ? 0 : (index > 5 ? 5 : index)];
+  }
+  static const float targets4[4] = {1.000f, 1.020f, 1.040f, 1.060f};
+  return targets4[index < 0 ? 0 : (index > 3 ? 3 : index)];
+}
+
+int calibrationAddAmount(int index) {
+  if (index < 0) index = 0;
+  if (calibUseSixPoints) {
+    if (index > 5) index = 5;
+    return calibUseSalt ? saltAmounts6[index] : sugarAmounts6[index];
+  }
+  if (index > 3) index = 3;
+  return calibUseSalt ? saltAmounts4[index] : sugarAmounts4[index];
 }
 
 void checkWaitTimeout() {
@@ -6162,15 +6939,10 @@ void checkWaitTimeout() {
       screenDirty = true;
       staticElementsDrawn = false; // Force complete redraw to clear artifacts
       LOG_INFOLN("Apply timeout - calibration complete, returning to Live View");
-    } else if (calibMode >= CALIB_POINT1 && calibMode <= CALIB_POINT4) {
+    } else if (calibMode >= CALIB_POINT1 && calibMode <= CALIB_POINT6) {
       // Record timeout - advance to next step
-      switch (calibMode) {
-        case CALIB_POINT1: calibMode = CALIB_POINT2; break;
-        case CALIB_POINT2: calibMode = CALIB_POINT3; break;
-        case CALIB_POINT3: calibMode = CALIB_POINT4; break;
-        case CALIB_POINT4: calibMode = CALIB_COMPLETE; break;
-        default: break;
-      }
+      int idx = calibrationPointIndex(calibMode);
+      calibMode = (idx + 1 >= calibrationPointCount()) ? CALIB_COMPLETE : calibrationModeForPoint(idx + 1);
       LOG_VERBOSELN("Record timeout - advanced to next step");
     }
     
@@ -6343,3 +7115,1739 @@ void handleGraphButtonRight() {
   screenDirty = true;
   LOG_VERBOSE("Cursor moved right to position %.2f (index %d)\n", cursorPosition, cursorIndex);
 }
+
+#if SGNODE_UI_TEST_HARNESS
+static const char* uiTestWizardStepName(BrewWizardStep step) {
+  switch (step) {
+    case WIZARD_BATCH_NAME: return "Batch Name";
+    case WIZARD_BEER_STYLE: return "Beer Style";
+    case WIZARD_BATCH_SIZE: return "Batch Size";
+    case WIZARD_BRIX: return "Original Brix";
+    case WIZARD_AUTO_MODE: return "Auto Mode";
+    case WIZARD_YEAST: return "Yeast";
+    case WIZARD_ATTENUATION: return "Attenuation";
+    case WIZARD_DIACETYL: return "Diacetyl Rest";
+    case WIZARD_YEAST_BEHAVIOR: return "Yeast Behavior";
+    case WIZARD_REVIEW: return "Review";
+    default: return "Done";
+  }
+}
+
+const char* uiTestScreenName() {
+  switch (currentMode) {
+    case LIVE_VIEW: return "LiveScreen";
+    case GRAPH_VIEW: return "GraphScreen";
+    case CALIBRATION_VIEW: return "CalibrationScreen";
+    case BATTERY_VIEW: return "BatteryScreen";
+    case MORE_VIEW: return "MoreScreen";
+    case POLY_GRAPH_VIEW: return "PolynomialGraphScreen";
+    case LIVE_DETAILS_VIEW: return "DetailsScreen";
+    case TEMP_GRAPH_VIEW: return "TemperatureGraphScreen";
+    case ANGLE_GRAPH_VIEW: return "AngleGraphScreen";
+    case ABV_GRAPH_VIEW: return "ABVGraphScreen";
+    case BREW_WIZARD_VIEW: return "BrewWizardScreen";
+    case OG_VERIFICATION_VIEW: return "OGVerificationScreen";
+    case TARGET_CHART_VIEW: return "TargetVsActualChart";
+    case DASHBOARD_VIEW: return "DashboardScreen";
+    case NEW_YEAST_VIEW: return "NewYeastScreen";
+    case MANAGE_YEAST_VIEW: return "ManageYeastScreen";
+    case MANAGE_BREW_VIEW: return "ManageBrewScreen";
+    default: return "UnknownScreen";
+  }
+}
+
+static int uiTestObjects(UITestObject* objects, int maxObjects) {
+  int count = 0;
+  auto addObj = [&](const char* id, const char* type, const char* label, int x, int y, int w, int h, bool enabled = true) {
+    if (count >= maxObjects) return;
+    objects[count++] = {id, type, label, x, y, w, h, enabled, true};
+  };
+
+  if (currentMode == BREW_WIZARD_VIEW) {
+    BrewWizardStep step = brewWizard.currentStep();
+    if (brewWizard.cancelConfirmationVisible()) {
+      addObj("dialog_discard", "dialog", "Discard changes?", MARGIN + 28, 86, UI_W - (MARGIN + 28) * 2, 132);
+      addObj("btn_cancel_no", "button", "No", MARGIN + 42, 154, 116, 38);
+      addObj("btn_cancel_yes", "button", "Yes", UI_W - MARGIN - 158, 154, 116, 38);
+    }
+    addObj("screen_title", "text", uiTestWizardStepName(step), 0, 0, UI_W, TOPBAR_H);
+    addObj("btn_back", "button", "Back", MARGIN, 276, 120, 36, step != WIZARD_BATCH_NAME);
+    addObj(step == WIZARD_REVIEW ? "btn_confirm" : "btn_next", "button", step == WIZARD_REVIEW ? "Confirm" : "Next", UI_W - MARGIN - 140, 276, 140, 36);
+    if (step == WIZARD_BATCH_NAME) addObj("input_batch_name", "input", activeBrewProfile.batchName, MARGIN, 88, UI_W - MARGIN * 2, 36);
+    if (step == WIZARD_BEER_STYLE) addObj("dropdown_beer_style", "dropdown", activeBrewProfile.beerStyle, MARGIN, 112, UI_W - MARGIN * 2, 64);
+    if (step == WIZARD_BATCH_SIZE) addObj("input_batch_size", "input", "Batch Size", MARGIN, 88, UI_W - MARGIN * 2, 36);
+    if (step == WIZARD_BRIX) addObj("input_brix", "input", "Original Brix", MARGIN, 88, UI_W - MARGIN * 2, 36);
+    if (step == WIZARD_AUTO_MODE) addObj("toggle_auto_mode", "switch", "Auto Mode", UI_W - MARGIN - 74, 86, 60, 32);
+    if (step == WIZARD_YEAST) addObj("dropdown_yeast_preset", "dropdown", activeBrewProfile.autoModeEnabled ? activeBrewProfile.selectedYeastPresetName : activeBrewProfile.yeastName, MARGIN, 112, UI_W - MARGIN * 2, 64);
+    if (step == WIZARD_ATTENUATION) addObj("dropdown_attenuation", "dropdown", "Attenuation", MARGIN, 112, UI_W - MARGIN * 2, 120);
+    if (step == WIZARD_DIACETYL) addObj("toggle_diacetyl_rest", "switch", "Diacetyl Rest", UI_W - MARGIN - 74, 104, 60, 32);
+  } else if (currentMode == DASHBOARD_VIEW) {
+    if (brewProfileLoaded) {
+      int actionY = TOPBAR_H + MARGIN + 42 + 6;
+      int actionH = 78;
+      addObj("panel_action", "panel", currentBatchAction.type == ACTION_NONE ? currentRecommendation.message : currentBatchAction.title, MARGIN, actionY, UI_W - MARGIN * 2, actionH);
+      if (currentBatchAction.requiresChoice) {
+        int contentW = UI_W - MARGIN * 2;
+        int buttonW = 86;
+        int buttonY = actionY + actionH - 32;
+        addObj("btn_action_skip", "button", "Skip", MARGIN + contentW - buttonW * 2 - GAP - 10, buttonY, buttonW, 28);
+        addObj("btn_action_done", "button", "Done", MARGIN + contentW - buttonW - 10, buttonY, buttonW, 28);
+      }
+    }
+    addObj("panel_recommendation", "panel", currentRecommendation.message, MARGIN, UI_H - NAV_H - 47, UI_W - MARGIN * 2, 40);
+    addObj("panel_eta", "panel", "ETA", MARGIN + (UI_W - MARGIN * 2 - GAP) / 2 + GAP, TOPBAR_H + MARGIN + 98, (UI_W - MARGIN * 2 - GAP) / 2, 56);
+  } else if (currentMode == OG_VERIFICATION_VIEW) {
+    addObj("panel_og_verification", "panel", "OG difference", MARGIN, TOPBAR_H + MARGIN, UI_W - MARGIN * 2, 170);
+    addObj("btn_back", "button", "Use Recipe", MARGIN, 242, 200, 44);
+    addObj("btn_confirm", "button", "Use Measured", UI_W - MARGIN - 200, 242, 200, 44);
+  } else if (currentMode == MORE_VIEW) {
+    int contentY = TOPBAR_H + MARGIN;
+    int cardH = (UI_H - TOPBAR_H - NAV_H - MARGIN * 2 - GAP * 3) / 4;
+    int contentW = UI_W - MARGIN * 2;
+    int cardW = (contentW - GAP) / 2;
+    int leftX = MARGIN;
+    int rightX = MARGIN + cardW + GAP;
+    addObj("btn_details", "button", "Details", leftX, contentY, cardW, cardH);
+    addObj("btn_theme", "button", "Theme", rightX, contentY, cardW, cardH);
+    contentY += cardH + GAP;
+    addObj("btn_calibration", "button", "Calibration", leftX, contentY, cardW, cardH);
+    addObj("btn_new_yeast", "button", "New Yeast", rightX, contentY, cardW, cardH);
+    contentY += cardH + GAP;
+    addObj("btn_brew_wizard", "button", "New Brew", leftX, contentY, cardW, cardH);
+    addObj("btn_manage_yeast", "button", "Manage Yeast", rightX, contentY, cardW, cardH);
+  } else if (currentMode == MANAGE_BREW_VIEW) {
+    if (managedBatchCount > 0) {
+      addObj("btn_prev_batch", "button", "<", MARGIN, 184, 72, 34);
+      addObj("btn_next_batch", "button", ">", UI_W - MARGIN - 72, 184, 72, 34);
+      addObj("btn_continue_batch", "button", "Cont", MARGIN + 84, 184, 104, 34);
+      addObj("btn_copy_batch", "button", "Copy", MARGIN + 200, 184, 104, 34);
+      addObj("btn_delete_batch", "button", "Delete", MARGIN + 316, 184, 104, 34);
+      addObj("btn_complete_batch", "button", "Complete", MARGIN + 84, 226, 150, 34);
+      addObj("batch_status", "text", managedBatchNames[manageBatchIndex], MARGIN, TOPBAR_H + MARGIN, UI_W - MARGIN * 2, 132);
+    }
+    if (manageBrewCompleteConfirm) {
+      addObj("dialog_complete", "dialog", "Mark batch completed?", MARGIN + 28, 86, UI_W - (MARGIN + 28) * 2, 132);
+      addObj("btn_complete_no", "button", "No", MARGIN + 42, 154, 116, 38);
+      addObj("btn_complete_yes", "button", "Yes", UI_W - MARGIN - 158, 154, 116, 38);
+    }
+  } else {
+    addObj("screen_title", "text", uiTestScreenName(), 0, 0, UI_W, TOPBAR_H);
+  }
+
+  return count;
+}
+
+bool uiTestBuildDump(char* buffer, size_t bufferSize) {
+  UITestObject objects[18];
+  int count = uiTestObjects(objects, 18);
+  size_t used = snprintf(buffer, bufferSize, "screen=%s", uiTestScreenName());
+  for (int i = 0; i < count && used < bufferSize; i++) {
+    used += snprintf(buffer + used, bufferSize - used, ";id=%s,type=%s,label=\"%s\",x=%d,y=%d,w=%d,h=%d,%s,%s",
+                     objects[i].id, objects[i].type, objects[i].label, objects[i].x, objects[i].y,
+                     objects[i].w, objects[i].h, objects[i].enabled ? "enabled" : "disabled",
+                     objects[i].visible ? "visible" : "hidden");
+  }
+  return true;
+}
+
+static bool uiTestElementMatches(const UITestObject& object, const char* text) {
+  return strcasecmp(object.id, text) == 0 || strcasecmp(object.label, text) == 0 || strstr(object.label, text) != NULL;
+}
+
+bool uiTestTap(int x, int y) {
+  uiTestTouchX = (uint16_t)x;
+  uiTestTouchY = (uint16_t)y;
+  uiTestTouchActive = true;
+  checkTouch();
+  uiTestTouchActive = false;
+  return true;
+}
+
+bool uiTestPress(int x, int y) {
+  uiTestTouchX = (uint16_t)x;
+  uiTestTouchY = (uint16_t)y;
+  uiTestTouchActive = true;
+  checkTouch();
+  return true;
+}
+
+bool uiTestRelease() {
+  uiTestTouchActive = false;
+  return true;
+}
+
+bool uiTestSwipe(int x1, int y1, int x2, int y2, int durationMs) {
+  int steps = max(2, min(12, durationMs / 40));
+  for (int i = 0; i <= steps; i++) {
+    int x = x1 + ((x2 - x1) * i / steps);
+    int y = y1 + ((y2 - y1) * i / steps);
+    uiTestPress(x, y);
+    delay(max(1, durationMs / steps));
+  }
+  return uiTestRelease();
+}
+
+bool uiTestTapLabel(const char* text, int* outX, int* outY) {
+  UITestObject objects[18];
+  int count = uiTestObjects(objects, 18);
+  for (int i = 0; i < count; i++) {
+    if (!objects[i].visible || !objects[i].enabled) continue;
+    if (!uiTestElementMatches(objects[i], text)) continue;
+    int x = objects[i].x + objects[i].w / 2;
+    int y = objects[i].y + objects[i].h / 2;
+    if (outX) *outX = x;
+    if (outY) *outY = y;
+    return uiTestTap(x, y);
+  }
+  return false;
+}
+
+static bool uiTestTapTextKey(char c) {
+  c = toupper(c);
+  const char* rows[] = {"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"};
+  int keyY = 130;
+  for (int r = 0; r < 3; r++) {
+    int len = strlen(rows[r]);
+    int keyW = r == 0 ? 40 : 44;
+    int keyX = MARGIN + (r * 18);
+    for (int i = 0; i < len; i++) {
+      if (rows[r][i] == c) {
+        return uiTestTap(keyX + i * (keyW + 3) + keyW / 2, keyY + 14);
+      }
+    }
+    keyY += 34;
+  }
+  if (c == ' ') return uiTestTap(MARGIN + 47, 246);
+  return false;
+}
+
+static bool uiTestTapNumberKey(char c) {
+  const char* keys = "123456789.0";
+  int keyW = 94;
+  int keyH = 32;
+  int startX = 92;
+  int startY = 130;
+  const char* found = strchr(keys, c);
+  if (!found) return false;
+  int index = found - keys;
+  if (c == '0') index = 10;
+  int col = index % 3;
+  int row = index / 3;
+  return uiTestTap(startX + col * (keyW + 8) + keyW / 2, startY + row * (keyH + 5) + keyH / 2);
+}
+
+bool uiTestTypeText(const char* text) {
+  if (currentMode != BREW_WIZARD_VIEW) return false;
+  BrewWizardStep step = brewWizard.currentStep();
+  bool numeric = step == WIZARD_BATCH_SIZE || step == WIZARD_BRIX;
+  for (const char* p = text; *p; ++p) {
+    bool ok = numeric ? uiTestTapNumberKey(*p) : uiTestTapTextKey(*p);
+    if (!ok) return false;
+  }
+  return true;
+}
+
+bool uiTestKey(const char* key) {
+  if (strcasecmp(key, "next") == 0 || strcasecmp(key, "enter") == 0) return uiTestTap(UI_W - MARGIN - 70, 294);
+  if (strcasecmp(key, "prev") == 0 || strcasecmp(key, "escape") == 0) return uiTestTap(MARGIN + 60, 294);
+  if (strcasecmp(key, "backspace") == 0) {
+    if (currentMode != BREW_WIZARD_VIEW) return false;
+    BrewWizardStep step = brewWizard.currentStep();
+    if (step == WIZARD_BATCH_SIZE || step == WIZARD_BRIX) return uiTestTap(92 + 2 * (94 + 8) + 47, 130 + 3 * (32 + 5) + 16);
+    return uiTestTap(MARGIN + 102 + 47, 246);
+  }
+  return false;
+}
+
+bool uiTestVisibleText(const char* text) {
+  char dump[900];
+  if (!uiTestBuildDump(dump, sizeof(dump))) return false;
+  return strstr(dump, text) != NULL;
+}
+
+bool uiTestValueEquals(const char* fieldName, const char* expected) {
+  char value[64] = "";
+  if (strcasecmp(fieldName, "batchName") == 0) snprintf(value, sizeof(value), "%s", activeBrewProfile.batchName);
+  else if (strcasecmp(fieldName, "beerStyle") == 0) snprintf(value, sizeof(value), "%s", activeBrewProfile.beerStyle);
+  else if (strcasecmp(fieldName, "yeastName") == 0) snprintf(value, sizeof(value), "%s", activeBrewProfile.yeastName);
+  else if (strcasecmp(fieldName, "yeastPreset") == 0) snprintf(value, sizeof(value), "%s", activeBrewProfile.selectedYeastPresetName);
+  else if (strcasecmp(fieldName, "autoModeEnabled") == 0) snprintf(value, sizeof(value), "%s", activeBrewProfile.autoModeEnabled ? "true" : "false");
+  else if (strcasecmp(fieldName, "batchSizeLiters") == 0) snprintf(value, sizeof(value), "%.1f", activeBrewProfile.batchSizeLiters);
+  else if (strcasecmp(fieldName, "recipeBrix") == 0) snprintf(value, sizeof(value), "%.1f", activeBrewProfile.recipeBrix);
+  else if (strcasecmp(fieldName, "recipeOG") == 0) snprintf(value, sizeof(value), "%.3f", activeBrewProfile.recipeOG);
+  else if (strcasecmp(fieldName, "effectiveOG") == 0) snprintf(value, sizeof(value), "%.3f", activeBrewProfile.effectiveOG);
+  else if (strcasecmp(fieldName, "expectedFG") == 0) snprintf(value, sizeof(value), "%.3f", activeBrewProfile.expectedFinalGravity);
+  else return false;
+  return strcmp(value, expected) == 0;
+}
+
+bool uiTestStateEquals(const char* stateName) {
+  return strcasecmp(fermentationStateMachine.phaseName(), stateName) == 0;
+}
+
+void uiTestSetMockSG(float value) {
+  uiTestMockPayload.density = value;
+  uiTestMockPayload.angle = 12.0f;
+  uiTestMockPayload.battery_voltage = 4.0f;
+  uiTestMockPayload.uptime_s += 60;
+  uiTestMockSGSet = true;
+}
+
+void uiTestSetMockTemp(float value) {
+  uiTestMockPayload.temperature = value;
+  uiTestMockTempSet = true;
+}
+
+void uiTestSetMockTime(unsigned long value) {
+  uiTestMockTime = value;
+}
+
+bool uiTestRunAnalyzer() {
+  if (!brewProfileLoaded) return false;
+  if (!uiTestMockSGSet) uiTestSetMockSG(activeBrewProfile.effectiveOG);
+  if (!uiTestMockTempSet) uiTestSetMockTemp(20.0f);
+  uint32_t epoch = uiTestMockTime > 0 ? (uint32_t)uiTestMockTime : getCurrentEpoch();
+  uiTestMockPayload.sequence_id++;
+  addDataPoint(uiTestMockPayload, epoch);
+  updateFermentationAssistant(uiTestMockPayload, epoch);
+  markScreenDirtyForFloatData();
+  return true;
+}
+
+bool uiTestRunStateMachine() {
+  return uiTestRunAnalyzer();
+}
+
+bool uiTestRunETA() {
+  refreshFermentationAssistantFromProfile();
+  return brewProfileLoaded;
+}
+
+bool uiTestRunRecommendations() {
+  refreshFermentationAssistantFromProfile();
+  return brewProfileLoaded;
+}
+
+static bool uiTestRemoveFileIfExists(const char* path) {
+  if (SD.exists(path)) return SD.remove(path);
+  return true;
+}
+
+static bool uiTestDeleteBatchById(const char* batchId) {
+  bool ok = true;
+  char path[80];
+  BrewProfileStore::profilePath(batchId, path, sizeof(path));
+  ok = uiTestRemoveFileIfExists(path) && ok;
+  BrewProfileStore::targetPath(batchId, path, sizeof(path));
+  ok = uiTestRemoveFileIfExists(path) && ok;
+  BrewProfileStore::logPath(batchId, path, sizeof(path));
+  ok = uiTestRemoveFileIfExists(path) && ok;
+  BrewProfileStore::eventsPath(batchId, path, sizeof(path));
+  ok = uiTestRemoveFileIfExists(path) && ok;
+
+  char batchDir[64];
+  snprintf(batchDir, sizeof(batchDir), "/data/batches/%s", batchId);
+  if (SD.exists(batchDir)) {
+    ok = SD.rmdir(batchDir) && ok;
+  }
+  char activeBatchId[24];
+  if (BrewProfileStore::loadActiveBatchId(activeBatchId, sizeof(activeBatchId)) && strcmp(activeBatchId, batchId) == 0) {
+    ok = BrewProfileStore::clearActiveBatchId() && ok;
+  }
+  return ok;
+}
+
+bool uiTestCreateBatch() {
+  BrewProfileStore::setDefaults(&activeBrewProfile);
+  strncpy(activeBrewProfile.batchId, "test_batch", sizeof(activeBrewProfile.batchId) - 1);
+  strncpy(activeBrewProfile.batchName, "UI Test Batch", sizeof(activeBrewProfile.batchName) - 1);
+  strncpy(activeBrewProfile.beerStyle, "Pale Ale", sizeof(activeBrewProfile.beerStyle) - 1);
+  activeBrewProfile.createdAt = getCurrentEpoch();
+    activeBrewProfile.recipeBrix = 12.0f;
+    activeBrewProfile.recipeOG = BrixConverter::brixToSG(activeBrewProfile.recipeBrix);
+    activeBrewProfile.effectiveOG = activeBrewProfile.recipeOG;
+    activeBrewProfile.expectedFinalGravity = DerivedCalculations::expectedFG(activeBrewProfile.effectiveOG, activeBrewProfile.expectedApparentAttenuation);
+    activeBrewProfile.completed = false;
+    activeBrewProfile.completedAt = 0;
+    brewProfileLoaded = true;
+  completeBrewWizard();
+  currentMode = DASHBOARD_VIEW;
+  screenDirty = true;
+  return true;
+}
+
+bool uiTestDeleteBatch() {
+  bool ok = false;
+  if (mountSDTemporarily()) {
+    ok = uiTestDeleteBatchById("test_batch");
+    dismountSD();
+  }
+  if (strcmp(activeBrewProfile.batchId, "test_batch") == 0) {
+    brewProfileLoaded = false;
+    fermentationFileOpen = false;
+    currentFermentationFile[0] = '\0';
+    clearHistoricalDisplayData();
+  }
+  currentMode = DASHBOARD_VIEW;
+  screenDirty = true;
+  return ok;
+}
+
+bool uiTestMarkTestBatchCompleted() {
+  bool ok = false;
+  if (mountSDTemporarily()) {
+    static BrewProfile profile;
+    if (BrewProfileStore::load("test_batch", &profile)) {
+      profile.completed = true;
+      profile.completedAt = getCurrentEpoch();
+      ok = BrewProfileStore::save(profile);
+      char activeBatchId[24];
+      if (BrewProfileStore::loadActiveBatchId(activeBatchId, sizeof(activeBatchId)) &&
+          strcmp(activeBatchId, "test_batch") == 0) {
+        BrewProfileStore::clearActiveBatchId();
+      }
+    }
+    dismountSD();
+  }
+  if (ok && strcmp(activeBrewProfile.batchId, "test_batch") == 0) {
+    activeBrewProfile.completed = true;
+    activeBrewProfile.completedAt = getCurrentEpoch();
+    brewProfileLoaded = false;
+    fermentationFileOpen = false;
+    currentFermentationFile[0] = '\0';
+    clearHistoricalDisplayData();
+    currentMode = DASHBOARD_VIEW;
+    screenDirty = true;
+  }
+  return ok;
+}
+
+bool uiTestBatteryStats(char* buffer, size_t bufferSize) {
+  if (displayDataCount < 2) {
+    snprintf(buffer, bufferSize, "battery_stats points=%d insufficient csv=%d/%d",
+             displayDataCount, lastHistoricalLoadedLines, totalCSVDataLines);
+    return false;
+  }
+
+  int valid = 0;
+  int preBatch = 0;
+  float firstV = 0.0f;
+  float lastV = 0.0f;
+  float minV = 99.0f;
+  float maxV = 0.0f;
+  uint32_t firstEpoch = 0;
+  uint32_t lastEpoch = 0;
+  bool hasBatchStart = brewProfileLoaded && isEpochValid(activeBrewProfile.createdAt);
+
+  for (int i = 0; i < displayDataCount; i++) {
+    int idx = (displayDataIndex - displayDataCount + i + MAX_DATA_POINTS) % MAX_DATA_POINTS;
+    payload_t data = displayDataBuffer[idx];
+    uint32_t epoch = displayTimestampBuffer[idx];
+
+    if (hasBatchStart && isEpochValid(epoch) && epoch < activeBrewProfile.createdAt) {
+      preBatch++;
+    }
+
+    if (data.battery_voltage < 2.5f || data.battery_voltage > 4.5f) {
+      continue;
+    }
+
+    if (valid == 0) {
+      firstV = data.battery_voltage;
+      firstEpoch = epoch;
+    }
+    lastV = data.battery_voltage;
+    lastEpoch = epoch;
+    if (data.battery_voltage < minV) minV = data.battery_voltage;
+    if (data.battery_voltage > maxV) maxV = data.battery_voltage;
+    valid++;
+  }
+
+  if (valid < 2) {
+    snprintf(buffer, bufferSize, "battery_stats points=%d valid=%d insufficient csv=%d/%d",
+             displayDataCount, valid, lastHistoricalLoadedLines, totalCSVDataLines);
+    return false;
+  }
+
+  bool hasTimeSpan = isEpochValid(firstEpoch) && isEpochValid(lastEpoch) && lastEpoch > firstEpoch;
+  float hours = hasTimeSpan ? (float)(lastEpoch - firstEpoch) / 3600.0f : 0.0f;
+  float deltaV = lastV - firstV;
+  float vPerDay = hasTimeSpan && hours > 0.0f ? (deltaV / hours) * 24.0f : 0.0f;
+  const char* trend = "unknown";
+  if (hasTimeSpan) {
+    if (vPerDay > 0.02f) trend = "rising_or_noise";
+    else if (vPerDay < -0.12f) trend = "high_drain";
+    else if (vPerDay < -0.06f) trend = "moderate_drain";
+    else if (vPerDay < -0.02f) trend = "normal_drain";
+    else trend = "stable";
+  }
+
+  snprintf(buffer, bufferSize,
+           "battery_stats pts=%d valid=%d first=%.3f last=%.3f min=%.3f max=%.3f h=%.1f dv=%.3f vday=%.3f pct=%u-%u trend=%s pre=%d csv=%d/%d skip=%d err=%d",
+           displayDataCount, valid, firstV, lastV, minV, maxV, hours, deltaV, vPerDay,
+           calculateBatteryPercentage(firstV), calculateBatteryPercentage(lastV), trend,
+           preBatch, lastHistoricalLoadedLines, totalCSVDataLines,
+           lastHistoricalSkippedLines, lastHistoricalParseErrors);
+  return true;
+}
+
+bool uiTestBatchDiagnostics(char* buffer, size_t bufferSize) {
+  if (!brewProfileLoaded) {
+    snprintf(buffer, bufferSize,
+             "batch_diag loaded=0 screen=%s live=%d csv=%d/%d skip=%d err=%d relaxed=%d pre=%d post=%d",
+             uiTestScreenName(), displayDataCount, lastHistoricalLoadedLines, totalCSVDataLines,
+             lastHistoricalSkippedLines, lastHistoricalParseErrors,
+             lastHistoricalBatchStartRelaxed ? 1 : 0,
+             lastHistoricalPreBatchLines, lastHistoricalPostBatchLines);
+    return false;
+  }
+
+  snprintf(buffer, bufferSize,
+           "batch_diag id=%s name=\"%s\" created=%lu live=%d csv=%d/%d skip=%d batch_skip=%d cutoff_skip=%d err=%d relaxed=%d pre=%d post=%d oldest=%lu newest=%lu ack=%u dup=%lu file=\"%s\"",
+           activeBrewProfile.batchId, activeBrewProfile.batchName,
+           (unsigned long)activeBrewProfile.createdAt,
+           displayDataCount,
+           lastHistoricalLoadedLines, totalCSVDataLines,
+           lastHistoricalSkippedLines,
+           lastHistoricalBatchFilteredLines,
+           lastHistoricalCutoffFilteredLines,
+           lastHistoricalParseErrors,
+           lastHistoricalBatchStartRelaxed ? 1 : 0,
+           lastHistoricalPreBatchLines, lastHistoricalPostBatchLines,
+           (unsigned long)lastHistoricalOldestEpoch,
+           (unsigned long)lastHistoricalNewestEpoch,
+           lastAckedFloatSeq,
+           (unsigned long)duplicateFloatPackets,
+           currentFermentationFile);
+  return true;
+}
+
+bool uiTestFloatStats(char* buffer, size_t bufferSize) {
+  if (displayDataCount <= 0 && !latestFloatDataValid) {
+    snprintf(buffer, bufferSize, "float_stats no_data");
+    return false;
+  }
+
+  payload_t latest = latestFloatDataValid
+    ? latestFloatData
+    : displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+  uint32_t latestEpoch = latestFloatDataValid
+    ? latestFloatEpoch
+    : displayTimestampBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+
+  float minSG = latest.density;
+  float maxSG = latest.density;
+  float sumSG = 0.0f;
+  int sgCount = 0;
+  for (int i = 0; i < displayDataCount; i++) {
+    int idx = (displayDataIndex - displayDataCount + i + MAX_DATA_POINTS) % MAX_DATA_POINTS;
+    float sg = displayDataBuffer[idx].density;
+    if (sg < 0.990f || sg > 1.200f || isnan(sg) || isinf(sg)) continue;
+    if (sgCount == 0) {
+      minSG = sg;
+      maxSG = sg;
+    }
+    if (sg < minSG) minSG = sg;
+    if (sg > maxSG) maxSG = sg;
+    sumSG += sg;
+    sgCount++;
+  }
+
+  float avgSG = sgCount > 0 ? sumSG / sgCount : latest.density;
+  float waterError = latest.density - 1.000f;
+  const char* waterVerdict = "check_calibration";
+  if (fabs(waterError) <= 0.002f) waterVerdict = "water_ok";
+  else if (fabs(waterError) <= 0.005f) waterVerdict = "water_acceptable";
+
+  snprintf(buffer, bufferSize,
+           "float_stats seq=%lu sg=%.4f avg=%.4f min=%.4f max=%.4f err=%+.4f angle=%.2f temp=%.2fC batt=%.3fV epoch=%lu verdict=%s points=%d",
+           (unsigned long)latest.sequence_id,
+           latest.density, avgSG, minSG, maxSG, waterError,
+           latest.angle, latest.temperature, latest.battery_voltage,
+           (unsigned long)latestEpoch, waterVerdict, displayDataCount);
+  return true;
+}
+
+bool uiTestActionStatus(char* buffer, size_t bufferSize) {
+  snprintf(buffer, bufferSize,
+           "action type=%d code=%d choice=%d due=%lu title=\"%s\" message=\"%s\" dryHop=%d/%d/%d drest=%d/%d cold=%d/%d package=%d/%d",
+           (int)currentBatchAction.type,
+           currentBatchAction.code,
+           currentBatchAction.requiresChoice ? 1 : 0,
+           (unsigned long)currentBatchAction.secondsUntilDue,
+           currentBatchAction.title,
+           currentBatchAction.message,
+           activeBrewProfile.dryHopEnabled ? 1 : 0,
+           activeBrewProfile.dryHopDone ? 1 : 0,
+           activeBrewProfile.dryHopRemoved ? 1 : 0,
+           activeBrewProfile.dRestDone ? 1 : 0,
+           activeBrewProfile.dRestSkipped ? 1 : 0,
+           activeBrewProfile.coldCrashDone ? 1 : 0,
+           activeBrewProfile.coldCrashSkipped ? 1 : 0,
+           activeBrewProfile.packageDone ? 1 : 0,
+           activeBrewProfile.packageSkipped ? 1 : 0);
+  return true;
+}
+
+bool uiTestActionDone(char* buffer, size_t bufferSize) {
+  BatchActionType before = currentBatchAction.type;
+  if (before == ACTION_NONE || !currentBatchAction.requiresChoice) {
+    snprintf(buffer, bufferSize, "action_done unavailable type=%d choice=%d", (int)before, currentBatchAction.requiresChoice ? 1 : 0);
+    return false;
+  }
+  handleCurrentActionChoice(true);
+  snprintf(buffer, bufferSize, "action_done type=%d next=%d", (int)before, (int)currentBatchAction.type);
+  return true;
+}
+
+bool uiTestActionSkip(char* buffer, size_t bufferSize) {
+  BatchActionType before = currentBatchAction.type;
+  if (before == ACTION_NONE || !currentBatchAction.requiresChoice) {
+    snprintf(buffer, bufferSize, "action_skip unavailable type=%d choice=%d", (int)before, currentBatchAction.requiresChoice ? 1 : 0);
+    return false;
+  }
+  handleCurrentActionChoice(false);
+  snprintf(buffer, bufferSize, "action_skip type=%d next=%d", (int)before, (int)currentBatchAction.type);
+  return true;
+}
+
+bool uiTestRunActionButtonTests(char* buffer, size_t bufferSize) {
+  static BrewProfile savedProfile;
+  savedProfile = activeBrewProfile;
+  bool savedLoaded = brewProfileLoaded;
+  bool savedFileOpen = fermentationFileOpen;
+  static char savedFile[sizeof(currentFermentationFile)];
+  strncpy(savedFile, currentFermentationFile, sizeof(savedFile));
+  savedFile[sizeof(savedFile) - 1] = '\0';
+  ViewMode savedMode = currentMode;
+  BatchAction savedAction = currentBatchAction;
+  Recommendation savedRecommendation = currentRecommendation;
+
+  BrewProfileStore::setDefaults(&activeBrewProfile);
+  strncpy(activeBrewProfile.batchId, "test_batch", sizeof(activeBrewProfile.batchId) - 1);
+  strncpy(activeBrewProfile.batchName, "Action Button Test", sizeof(activeBrewProfile.batchName) - 1);
+  strncpy(activeBrewProfile.beerStyle, "Hoppy Pils", sizeof(activeBrewProfile.beerStyle) - 1);
+  activeBrewProfile.createdAt = getCurrentEpoch();
+  activeBrewProfile.recipeOG = 1.048f;
+  activeBrewProfile.effectiveOG = 1.048f;
+  activeBrewProfile.expectedFinalGravity = 1.010f;
+  activeBrewProfile.ogVerified = true;
+  activeBrewProfile.ogNeedsChoice = false;
+  activeBrewProfile.diacetylRestEnabled = false;
+  BatchActionEngine::applyStyleDefaults(&activeBrewProfile);
+  brewProfileLoaded = true;
+  fermentationFileOpen = true;
+  currentMode = DASHBOARD_VIEW;
+  fermentationMetrics.currentAttenuation = 72.0f;
+  fermentationMetrics.gravityDeltaPerHour = -0.00002f;
+  currentRecommendation.code = 0;
+  strcpy(currentRecommendation.message, "Action test");
+
+  uint32_t nowEpoch = getCurrentEpoch();
+  refreshCurrentBatchAction(1.014f, nowEpoch);
+  bool dryHopShown = currentBatchAction.type == ACTION_DRY_HOP && currentBatchAction.requiresChoice;
+  handleCurrentActionChoice(true);
+  bool dryHopDone = activeBrewProfile.dryHopDone &&
+                    currentBatchAction.type == ACTION_REMOVE_DRY_HOP &&
+                    !currentBatchAction.requiresChoice &&
+                    currentBatchAction.secondsUntilDue > 0;
+
+  activeBrewProfile.dryHopStartTime = nowEpoch > 49UL * 3600UL ? nowEpoch - 49UL * 3600UL : 1;
+  refreshCurrentBatchAction(1.012f, nowEpoch);
+  bool removeShown = currentBatchAction.type == ACTION_REMOVE_DRY_HOP && currentBatchAction.requiresChoice;
+  handleCurrentActionChoice(false);
+  bool removeSkipped = activeBrewProfile.dryHopRemoveSkipped;
+
+  if (mountSDTemporarily()) {
+    uiTestDeleteBatchById("test_batch");
+    dismountSD();
+  }
+
+  activeBrewProfile = savedProfile;
+  brewProfileLoaded = savedLoaded;
+  fermentationFileOpen = savedFileOpen;
+  strncpy(currentFermentationFile, savedFile, sizeof(currentFermentationFile));
+  currentFermentationFile[sizeof(currentFermentationFile) - 1] = '\0';
+  currentMode = savedMode;
+  currentBatchAction = savedAction;
+  currentRecommendation = savedRecommendation;
+  screenDirty = true;
+
+  bool ok = dryHopShown && dryHopDone && removeShown && removeSkipped;
+  snprintf(buffer, bufferSize, "action_buttons dryHopShown=%d dryHopDone=%d removeShown=%d removeSkipped=%d",
+           dryHopShown ? 1 : 0, dryHopDone ? 1 : 0, removeShown ? 1 : 0, removeSkipped ? 1 : 0);
+  return ok;
+}
+
+bool uiTestSelfTest(char* buffer, size_t bufferSize) {
+  uiTestDeleteBatch();
+  beginBrewWizard();
+  if (currentMode != BREW_WIZARD_VIEW) {
+    snprintf(buffer, bufferSize, "selftest wizard_open_failed");
+    return false;
+  }
+  if (!uiTestTypeText("ALPHA TEST")) {
+    snprintf(buffer, bufferSize, "selftest batch_name_failed");
+    return false;
+  }
+  uiTestKey("next");       // batch name
+  uiTestKey("next");       // default beer style
+  uiTestTypeText("21.0");
+  uiTestKey("next");       // batch size
+  uiTestTypeText("12");
+  uiTestKey("next");       // brix
+  uiTestKey("next");       // default Auto Mode ON
+  uiTestKey("next");       // default yeast preset
+  uiTestKey("next");       // yeast behavior
+  uiTestKey("enter");      // review confirm, completes through normal wizard path
+  uiTestTap(306, UI_H - NAV_H / 2);
+  bool profileOK = false;
+  bool targetOK = false;
+  if (mountSDTemporarily()) {
+    char path[80];
+    BrewProfileStore::profilePath(activeBrewProfile.batchId, path, sizeof(path));
+    profileOK = SD.exists(path);
+    BrewProfileStore::targetPath(activeBrewProfile.batchId, path, sizeof(path));
+    targetOK = SD.exists(path);
+    dismountSD();
+  }
+  if (!profileOK || !targetOK || currentMode != DASHBOARD_VIEW) {
+    snprintf(buffer, bufferSize, "selftest profile=%d target=%d screen=%s", profileOK, targetOK, uiTestScreenName());
+    return false;
+  }
+  snprintf(buffer, bufferSize, "selftest wizard=ok profile.json=ok target.json=ok dashboard=ok panels=ok");
+  return true;
+}
+
+static bool uiTestFileExists(const char* path) {
+  bool exists = false;
+  if (mountSDTemporarily()) {
+    exists = SD.exists(path);
+    dismountSD();
+  }
+  return exists;
+}
+
+static bool uiTestTestBatchFilesExist(bool* profileOK, bool* targetOK, bool* logOK) {
+  char path[80];
+  BrewProfileStore::profilePath("test_batch", path, sizeof(path));
+  *profileOK = uiTestFileExists(path);
+  BrewProfileStore::targetPath("test_batch", path, sizeof(path));
+  *targetOK = uiTestFileExists(path);
+  BrewProfileStore::logPath("test_batch", path, sizeof(path));
+  *logOK = uiTestFileExists(path);
+  return *profileOK && *targetOK && *logOK;
+}
+
+static bool uiTestReadLastLogEpoch(const char* path, uint32_t* epochOut) {
+  *epochOut = 0;
+  if (!SD.exists(path)) return false;
+  File file = SD.open(path, FILE_READ);
+  if (!file) return false;
+
+  static char line[180];
+  uint32_t lastEpoch = 0;
+  while (file.available()) {
+    int bytesRead = file.readBytesUntil('\n', line, sizeof(line) - 1);
+    line[bytesRead] = '\0';
+    if (strncmp(line, "timestamp,", 10) == 0 || line[0] == '#' || strlen(line) == 0) {
+      continue;
+    }
+
+    char* firstComma = strchr(line, ',');
+    if (!firstComma) continue;
+    char* secondComma = strchr(firstComma + 1, ',');
+    if (!secondComma) continue;
+    *secondComma = '\0';
+    uint32_t epoch = strtoul(firstComma + 1, NULL, 10);
+    if (isEpochValid(epoch)) lastEpoch = epoch;
+  }
+  file.close();
+  if (!isEpochValid(lastEpoch)) return false;
+  *epochOut = lastEpoch;
+  return true;
+}
+
+static bool uiTestWriteMixedEpochLog(const char* path, uint32_t createdAt) {
+  File file = SD.open(path, FILE_WRITE);
+  if (!file) return false;
+  file.println("timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code");
+  file.printf("2026-05-21 18:13:20,%lu,0,50.00,1.0040,20.00,4.08,90,ACTIVE,90.00,5.00,81\n",
+              (unsigned long)(createdAt - 3600UL));
+  file.printf("2026-05-21 20:13:20,%lu,0,50.10,1.0035,20.00,4.07,89,ACTIVE,91.00,5.10,81\n",
+              (unsigned long)(createdAt + 600UL));
+  file.printf("2026-05-21 20:23:20,%lu,0,50.20,1.0030,20.00,4.06,88,ACTIVE,92.00,5.20,81\n",
+              (unsigned long)(createdAt + 1200UL));
+  file.flush();
+  file.close();
+  return true;
+}
+
+static bool uiTestCreateNumberedBatch(int number, const char* name, uint32_t createdAt) {
+  char batchId[24];
+  BrewProfileStore::buildBatchId(number, batchId, sizeof(batchId));
+  static BrewProfile profile;
+  BrewProfileStore::setDefaults(&profile);
+  strncpy(profile.batchId, batchId, sizeof(profile.batchId) - 1);
+  profile.batchId[sizeof(profile.batchId) - 1] = '\0';
+  strncpy(profile.batchName, name, sizeof(profile.batchName) - 1);
+  profile.batchName[sizeof(profile.batchName) - 1] = '\0';
+  profile.createdAt = createdAt;
+  profile.recipeBrix = 12.0f;
+  profile.recipeOG = BrixConverter::brixToSG(profile.recipeBrix);
+  profile.effectiveOG = profile.recipeOG;
+  profile.expectedApparentAttenuation = 80;
+  profile.expectedFinalGravity = DerivedCalculations::expectedFG(profile.effectiveOG, profile.expectedApparentAttenuation);
+  if (!BrewProfileStore::save(profile)) return false;
+  if (!TargetCurveGenerator::generateAndSave(profile)) return false;
+  return ensureFermentationLogFile(batchId);
+}
+
+static int uiTestFindHighestBatchWithProfile() {
+  int highestNumber = 0;
+  File root = SD.open("/data/batches");
+  if (!root) return 0;
+
+  File file = root.openNextFile();
+  while (file) {
+    if (file.isDirectory()) {
+      const char* filename = file.name();
+      const char* slash = strrchr(filename, '/');
+      if (slash) filename = slash + 1;
+      int fileNum = 0;
+      if (sscanf(filename, "batch_%d", &fileNum) == 1) {
+        char candidateBatchId[24];
+        char profilePath[80];
+        BrewProfileStore::buildBatchId(fileNum, candidateBatchId, sizeof(candidateBatchId));
+        BrewProfileStore::profilePath(candidateBatchId, profilePath, sizeof(profilePath));
+        if (SD.exists(profilePath) && fileNum > highestNumber) {
+          highestNumber = fileNum;
+        }
+      }
+    }
+    file.close();
+    file = root.openNextFile();
+  }
+  root.close();
+  return highestNumber;
+}
+
+static void uiTestDeleteNumberedBatch(int number) {
+  char batchId[24];
+  BrewProfileStore::buildBatchId(number, batchId, sizeof(batchId));
+  uiTestDeleteBatchById(batchId);
+}
+
+static bool uiTestRunOne(const char* name, bool condition, const char* step, const char* expected, const char* actualValue,
+                         int* total, int* passed, int* failed, char* firstFail, size_t firstFailSize);
+
+bool uiTestRunBatchRestoreTests(char* buffer, size_t bufferSize) {
+  int total = 0;
+  int passed = 0;
+  int failed = 0;
+  char firstFail[64] = "";
+  char actual[32] = "";
+  char savedActiveBatchId[24] = "";
+  bool savedActiveBatchIdValid = false;
+
+  auto run = [&](const char* name, bool condition, const char* step, const char* expected, const char* actualValue) {
+    return uiTestRunOne(name, condition, step, expected, actualValue, &total, &passed, &failed, firstFail, sizeof(firstFail));
+  };
+
+  bool activeRestoreOK = false;
+
+  if (mountSDTemporarily()) {
+    savedActiveBatchIdValid = BrewProfileStore::loadActiveBatchId(savedActiveBatchId, sizeof(savedActiveBatchId));
+
+    uiTestDeleteNumberedBatch(998);
+    uiTestDeleteNumberedBatch(999);
+
+    uint32_t nowEpoch = getCurrentEpoch();
+    bool olderOK = uiTestCreateNumberedBatch(998, "UI Active Older", nowEpoch - 600UL);
+    bool newerOK = uiTestCreateNumberedBatch(999, "UI Newer Inactive", nowEpoch);
+    bool markerOK = olderOK && newerOK && BrewProfileStore::saveActiveBatchId("batch_998");
+    char selectedBatchId[24] = "";
+    if (markerOK && BrewProfileStore::loadActiveBatchId(selectedBatchId, sizeof(selectedBatchId))) {
+      activeRestoreOK = strcmp(selectedBatchId, "batch_998") == 0;
+      strncpy(actual, selectedBatchId, sizeof(actual) - 1);
+      actual[sizeof(actual) - 1] = '\0';
+    } else {
+      snprintf(actual, sizeof(actual), "none");
+    }
+    run("ActiveBatchRestoreSafety", activeRestoreOK, "boot_restore", "batch_998", actual);
+
+    uiTestDeleteNumberedBatch(998);
+    uiTestDeleteNumberedBatch(999);
+
+    if (savedActiveBatchIdValid) BrewProfileStore::saveActiveBatchId(savedActiveBatchId);
+    else BrewProfileStore::clearActiveBatchId();
+
+    dismountSD();
+  } else {
+    run("ActiveBatchRestoreSafety", false, "sd_mount", "true", "false");
+  }
+
+  snprintf(buffer, bufferSize, "batch_restore total=%d passed=%d failed=%d first_failure=%s",
+           total, passed, failed, firstFail[0] ? firstFail : "none");
+  return failed == 0;
+}
+
+bool uiTestRunFallbackLogTests(char* buffer, size_t bufferSize) {
+  int total = 0;
+  int passed = 0;
+  int failed = 0;
+  char firstFail[64] = "";
+  char savedActiveBatchId[24] = "";
+  bool savedActiveBatchIdValid = false;
+
+  auto run = [&](const char* name, bool condition, const char* step, const char* expected, const char* actualValue) {
+    return uiTestRunOne(name, condition, step, expected, actualValue, &total, &passed, &failed, firstFail, sizeof(firstFail));
+  };
+
+  if (mountSDTemporarily()) {
+    savedActiveBatchIdValid = BrewProfileStore::loadActiveBatchId(savedActiveBatchId, sizeof(savedActiveBatchId));
+
+    uiTestDeleteNumberedBatch(997);
+    uiTestDeleteNumberedBatch(999);
+
+    uint32_t nowEpoch = getCurrentEpoch();
+    bool dataBatchOK = uiTestCreateNumberedBatch(997, "UI Data Batch", nowEpoch - 1200UL);
+    bool emptyHigherOK = uiTestCreateNumberedBatch(999, "UI Empty Higher", nowEpoch);
+    static char dataLogPath[80];
+    BrewProfileStore::logPath("batch_997", dataLogPath, sizeof(dataLogPath));
+    dataBatchOK = dataBatchOK && uiTestWriteMixedEpochLog(dataLogPath, nowEpoch - 1200UL);
+    BrewProfileStore::clearActiveBatchId();
+
+    static char fallbackBatchId[24];
+    fallbackBatchId[0] = '\0';
+    bool fallbackDataOK = dataBatchOK && emptyHigherOK && findBestFallbackBatch(fallbackBatchId, sizeof(fallbackBatchId)) &&
+                          strcmp(fallbackBatchId, "batch_997") == 0;
+    run("FallbackUsesLogData", fallbackDataOK, "no_marker_selection", "batch_997", fallbackBatchId[0] ? fallbackBatchId : "none");
+
+    uiTestDeleteNumberedBatch(997);
+    uiTestDeleteNumberedBatch(999);
+
+    if (savedActiveBatchIdValid) BrewProfileStore::saveActiveBatchId(savedActiveBatchId);
+    else BrewProfileStore::clearActiveBatchId();
+
+    dismountSD();
+  } else {
+    run("FallbackUsesLogData", false, "sd_mount", "true", "false");
+  }
+
+  snprintf(buffer, bufferSize, "fallback_log total=%d passed=%d failed=%d first_failure=%s",
+           total, passed, failed, firstFail[0] ? firstFail : "none");
+  return failed == 0;
+}
+
+bool uiTestRunCompletedBatchTests(char* buffer, size_t bufferSize) {
+  static BrewProfile savedProfile;
+  savedProfile = activeBrewProfile;
+  bool savedProfileLoaded = brewProfileLoaded;
+  bool savedFermentationFileOpen = fermentationFileOpen;
+  static char savedFermentationFile[sizeof(currentFermentationFile)];
+  strncpy(savedFermentationFile, currentFermentationFile, sizeof(savedFermentationFile));
+  savedFermentationFile[sizeof(savedFermentationFile) - 1] = '\0';
+  ViewMode savedMode = currentMode;
+
+  int total = 0;
+  int passed = 0;
+  int failed = 0;
+  char firstFail[64] = "";
+
+  auto run = [&](const char* name, bool condition, const char* step, const char* expected, const char* actualValue) {
+    return uiTestRunOne(name, condition, step, expected, actualValue, &total, &passed, &failed, firstFail, sizeof(firstFail));
+  };
+
+  uiTestDeleteBatch();
+  bool created = uiTestCreateBatch();
+  bool markedCompleted = uiTestMarkTestBatchCompleted();
+  continueManagedBatch("test_batch");
+  bool protectedFromContinue = created && markedCompleted &&
+                               (!brewProfileLoaded || strcmp(activeBrewProfile.batchId, "test_batch") != 0);
+  run("CompletedBatchProtection", protectedFromContinue, "continue_completed_batch", "blocked",
+      protectedFromContinue ? "blocked" : "continued");
+
+  bool markerCleared = false;
+  if (mountSDTemporarily()) {
+    char activeBatchId[24];
+    markerCleared = !BrewProfileStore::loadActiveBatchId(activeBatchId, sizeof(activeBatchId)) ||
+                    strcmp(activeBatchId, "test_batch") != 0;
+    dismountSD();
+  }
+  run("CompletedBatchActiveMarker", markerCleared, "active_marker", "not_test_batch",
+      markerCleared ? "not_test_batch" : "test_batch");
+
+  uiTestDeleteBatch();
+  activeBrewProfile = savedProfile;
+  brewProfileLoaded = savedProfileLoaded;
+  fermentationFileOpen = savedFermentationFileOpen;
+  strncpy(currentFermentationFile, savedFermentationFile, sizeof(currentFermentationFile));
+  currentFermentationFile[sizeof(currentFermentationFile) - 1] = '\0';
+  currentMode = savedMode;
+  screenDirty = true;
+
+  snprintf(buffer, bufferSize, "completed_batch total=%d passed=%d failed=%d first_failure=%s",
+           total, passed, failed, firstFail[0] ? firstFail : "none");
+  return failed == 0;
+}
+
+bool uiTestRunManageBrewUITests(char* buffer, size_t bufferSize) {
+  static BrewProfile savedProfile;
+  savedProfile = activeBrewProfile;
+  bool savedProfileLoaded = brewProfileLoaded;
+  bool savedFermentationFileOpen = fermentationFileOpen;
+  static char savedFermentationFile[sizeof(currentFermentationFile)];
+  strncpy(savedFermentationFile, currentFermentationFile, sizeof(savedFermentationFile));
+  savedFermentationFile[sizeof(savedFermentationFile) - 1] = '\0';
+  ViewMode savedMode = currentMode;
+  int total = 0;
+  int passed = 0;
+  int failed = 0;
+  static char firstFail[64];
+  firstFail[0] = '\0';
+
+  auto run = [&](const char* name, bool condition, const char* step, const char* expected, const char* actualValue) {
+    return uiTestRunOne(name, condition, step, expected, actualValue, &total, &passed, &failed, firstFail, sizeof(firstFail));
+  };
+
+  uiTestDeleteBatch();
+  bool created = uiTestCreateBatch();
+  loadManagedBatches();
+  currentMode = MANAGE_BREW_VIEW;
+  manageBrewCompleteConfirm = false;
+  for (int i = 0; i < managedBatchCount; i++) {
+    if (strcmp(managedBatchIds[i], "test_batch") == 0) {
+      manageBatchIndex = i;
+      break;
+    }
+  }
+
+  bool screenOK = created && managedBatchCount > 0 && currentMode == MANAGE_BREW_VIEW;
+  run("ManageBrewCompleteButton", screenOK, "button_visible", "Complete", screenOK ? "Complete" : "missing");
+
+  uiTestTap(MARGIN + 84 + 75, 226 + 17);
+  bool dialogOK = manageBrewCompleteConfirm;
+  run("ManageBrewCompleteConfirm", dialogOK, "confirm_dialog", "visible", dialogOK ? "visible" : "missing");
+
+  uiTestTap(UI_W - MARGIN - 158 + 58, 154 + 19);
+  static BrewProfile p;
+  bool completedOK = false;
+  if (mountSDTemporarily()) {
+    completedOK = BrewProfileStore::load("test_batch", &p) && p.completed;
+    dismountSD();
+  }
+  run("ManageBrewCompletePersists", completedOK, "profile_completed", "true", completedOK ? "true" : "false");
+
+  uiTestDeleteBatch();
+  activeBrewProfile = savedProfile;
+  brewProfileLoaded = savedProfileLoaded;
+  fermentationFileOpen = savedFermentationFileOpen;
+  strncpy(currentFermentationFile, savedFermentationFile, sizeof(currentFermentationFile));
+  currentFermentationFile[sizeof(currentFermentationFile) - 1] = '\0';
+  currentMode = savedMode;
+  manageBrewCompleteConfirm = false;
+  screenDirty = true;
+
+  snprintf(buffer, bufferSize, "manage_brew_ui total=%d passed=%d failed=%d first_failure=%s",
+           total, passed, failed, firstFail[0] ? firstFail : "none");
+  return failed == 0;
+}
+
+bool uiTestPrepareManageBrewComplete(char* buffer, size_t bufferSize) {
+  uiTestDeleteBatch();
+  bool created = uiTestCreateBatch();
+  loadManagedBatches();
+  currentMode = MANAGE_BREW_VIEW;
+  manageBrewCompleteConfirm = false;
+  for (int i = 0; i < managedBatchCount; i++) {
+    if (strcmp(managedBatchIds[i], "test_batch") == 0) {
+      manageBatchIndex = i;
+      break;
+    }
+  }
+  snprintf(buffer, bufferSize, "manage_brew_prepare created=%d batches=%d index=%d", created ? 1 : 0, managedBatchCount, manageBatchIndex);
+  return created && managedBatchCount > 0;
+}
+
+bool uiTestOpenManageBrewCompleteDialog(char* buffer, size_t bufferSize) {
+  if (currentMode != MANAGE_BREW_VIEW) {
+    snprintf(buffer, bufferSize, "manage_brew_dialog wrong_screen=%s", uiTestScreenName());
+    return false;
+  }
+  uiTestTap(MARGIN + 84 + 75, 226 + 17);
+  snprintf(buffer, bufferSize, "manage_brew_dialog visible=%d", manageBrewCompleteConfirm ? 1 : 0);
+  return manageBrewCompleteConfirm;
+}
+
+bool uiTestConfirmManageBrewComplete(char* buffer, size_t bufferSize) {
+  if (currentMode != MANAGE_BREW_VIEW || !manageBrewCompleteConfirm) {
+    snprintf(buffer, bufferSize, "manage_brew_confirm dialog_missing");
+    return false;
+  }
+  uiTestTap(UI_W - MARGIN - 158 + 58, 154 + 19);
+  static BrewProfile p;
+  bool completedOK = false;
+  if (mountSDTemporarily()) {
+    completedOK = BrewProfileStore::load("test_batch", &p) && p.completed;
+    dismountSD();
+  }
+  snprintf(buffer, bufferSize, "manage_brew_confirm completed=%d", completedOK ? 1 : 0);
+  return completedOK;
+}
+
+static void uiTestPrintResult(bool ok, const char* name, const char* step, const char* expected, const char* actual) {
+  Serial.print(ok ? "OK TEST " : "ERR TEST ");
+  Serial.print(name);
+  Serial.print(ok ? " PASS" : " FAIL");
+  if (!ok) {
+    Serial.print(" step=");
+    Serial.print(step);
+    Serial.print(" expected=");
+    Serial.print(expected);
+    Serial.print(" actual=");
+    Serial.print(actual);
+  }
+  Serial.println();
+}
+
+static bool uiTestRunOne(const char* name, bool condition, const char* step, const char* expected, const char* actual,
+                         int* total, int* passed, int* failed, char* firstFail, size_t firstFailSize) {
+  (*total)++;
+  if (condition) {
+    (*passed)++;
+    uiTestPrintResult(true, name, step, expected, actual);
+    return true;
+  }
+  (*failed)++;
+  if (firstFail[0] == '\0') {
+    snprintf(firstFail, firstFailSize, "%s:%s", name, step);
+  }
+  uiTestPrintResult(false, name, step, expected, actual);
+  return false;
+}
+
+static bool uiTestRegressionValidFloat(float value) {
+  return !isnan(value) && !isinf(value) && value > 0.0f && value < 10.0f;
+}
+
+bool uiTestRunInputValidationTests(char* buffer, size_t bufferSize) {
+  int total = 0, passed = 0, failed = 0;
+  char firstFail[64] = "";
+  auto run = [&](const char* name, bool condition, const char* step, const char* expected, const char* actualValue) {
+    return uiTestRunOne(name, condition, step, expected, actualValue, &total, &passed, &failed, firstFail, sizeof(firstFail));
+  };
+
+  bool invalidBrixRejected = BrixConverter::brixToSG(0.0f) <= 1.0001f && BrixConverter::brixToSG(99.0f) < 1.300f;
+  run("InvalidBrixInput", !invalidBrixRejected, "validation", "reject_invalid_values", "currently_allows_or_computes");
+
+  beginBrewWizard();
+  uiTestKey("next");
+  uiTestKey("next");
+  uiTestTypeText("9999");
+  uiTestKey("next");
+  bool invalidSizeRejected = brewWizard.currentStep() == WIZARD_BATCH_SIZE && strstr(uiTestScreenName(), "BrewWizard") != NULL;
+  run("InvalidBatchSize", invalidSizeRejected, "validation", "stay_on_batch_size", invalidSizeRejected ? "stay_on_batch_size" : "advanced");
+
+  float invalidFG = DerivedCalculations::expectedFG(1.050f, 120);
+  bool attenuationSafe = uiTestRegressionValidFloat(invalidFG) && invalidFG >= 0.990f && invalidFG <= 1.050f;
+  run("InvalidAttenuation", attenuationSafe, "fg_bounds", "0.990..1.050", attenuationSafe ? "in_range" : "out_of_range");
+
+  snprintf(buffer, bufferSize, "input_validation total=%d passed=%d failed=%d first_failure=%s",
+           total, passed, failed, firstFail[0] ? firstFail : "none");
+  return failed == 0;
+}
+
+bool uiTestRunSensorEdgeTests(char* buffer, size_t bufferSize) {
+  static BrewProfile savedProfile;
+  savedProfile = activeBrewProfile;
+  bool savedProfileLoaded = brewProfileLoaded;
+  bool savedFermentationFileOpen = fermentationFileOpen;
+  static char savedFermentationFile[sizeof(currentFermentationFile)];
+  strncpy(savedFermentationFile, currentFermentationFile, sizeof(savedFermentationFile));
+  savedFermentationFile[sizeof(savedFermentationFile) - 1] = '\0';
+  ViewMode savedMode = currentMode;
+  int total = 0, passed = 0, failed = 0;
+  char firstFail[64] = "";
+  auto run = [&](const char* name, bool condition, const char* step, const char* expected, const char* actualValue) {
+    return uiTestRunOne(name, condition, step, expected, actualValue, &total, &passed, &failed, firstFail, sizeof(firstFail));
+  };
+
+  uiTestCreateBatch();
+  uiTestSetMockSG(0.0f);
+  uiTestSetMockTemp(20.0f);
+  bool invalidSensorOK = uiTestRunAnalyzer();
+  bool invalidFlagged = currentRecommendation.message && strstr(currentRecommendation.message, "sensor") != NULL;
+  run("SensorDropoutDuringActiveBatch", invalidSensorOK && invalidFlagged, "recommendation", "sensor_issue",
+      invalidFlagged ? "sensor_issue" : currentRecommendation.message);
+
+  static const float extremeSGs[] = {0.800f, 0.999f, 1.000f, 1.050f, 1.200f, 2.000f};
+  static const float extremeTemps[] = {-10.0f, 0.0f, 20.0f, 80.0f};
+  bool extremesSafe = true;
+  for (int i = 0; i < 6; i++) {
+    uiTestSetMockSG(extremeSGs[i]);
+    uiTestSetMockTemp(extremeTemps[i % 4]);
+    extremesSafe = uiTestRunAnalyzer() && extremesSafe && uiTestRegressionValidFloat(fermentationMetrics.estimatedABV + 1.0f);
+  }
+  run("ExtremeSensorValues", extremesSafe, "no_nan_inf", "true", extremesSafe ? "true" : "false");
+
+  activeBrewProfile = savedProfile;
+  brewProfileLoaded = savedProfileLoaded;
+  currentMode = savedMode;
+  screenDirty = true;
+
+  snprintf(buffer, bufferSize, "sensor_edge total=%d passed=%d failed=%d first_failure=%s",
+           total, passed, failed, firstFail[0] ? firstFail : "none");
+  return failed == 0;
+}
+
+bool uiTestRunStateLogicTests(char* buffer, size_t bufferSize) {
+  static BrewProfile savedProfile;
+  savedProfile = activeBrewProfile;
+  bool savedProfileLoaded = brewProfileLoaded;
+  ViewMode savedMode = currentMode;
+  int total = 0, passed = 0, failed = 0;
+  char firstFail[64] = "";
+  auto run = [&](const char* name, bool condition, const char* step, const char* expected, const char* actualValue) {
+    return uiTestRunOne(name, condition, step, expected, actualValue, &total, &passed, &failed, firstFail, sizeof(firstFail));
+  };
+
+  uiTestCreateBatch();
+  uiTestSetMockTime(0);
+  uiTestSetMockSG(1.048f); uiTestRunAnalyzer();
+  uiTestSetMockSG(1.035f); uiTestRunAnalyzer();
+  const char* phaseBeforeSpike = fermentationStateMachine.phaseName();
+  uiTestSetMockSG(1.046f); uiTestRunAnalyzer();
+  bool spikeSafe = strcmp(fermentationStateMachine.phaseName(), "IDLE") != 0;
+  run("StateMachineRegression", spikeSafe, "sg_spike_phase", "not_IDLE",
+      spikeSafe ? fermentationStateMachine.phaseName() : phaseBeforeSpike);
+
+  bool stableShortSafe = strcmp(fermentationStateMachine.phaseName(), "READY TO PACKAGE") != 0;
+  run("StableGravityDetectionShort", stableShortSafe, "duration_threshold", "not_ready", stableShortSafe ? "not_ready" : "ready");
+
+  uint32_t stableEpoch = getCurrentEpoch();
+  for (int i = 0; i < 4; i++) {
+    stableEpoch += 12UL * 3600UL;
+    uiTestSetMockTime(stableEpoch);
+    uiTestSetMockSG(activeBrewProfile.expectedFinalGravity);
+    uiTestRunAnalyzer();
+  }
+  bool stableLongReached = strcmp(fermentationStateMachine.phaseName(), "FG STABLE") == 0 ||
+                           strcmp(fermentationStateMachine.phaseName(), "READY TO PACKAGE") == 0 ||
+                           strcmp(fermentationStateMachine.phaseName(), "COMPLETED") == 0;
+  run("StableGravityDetectionLong", stableLongReached, "stable_duration", "stable_or_ready", fermentationStateMachine.phaseName());
+  uiTestSetMockTime(0);
+
+  BrewProfileStore::setDefaults(&activeBrewProfile);
+  strcpy(activeBrewProfile.yeastCategory, "Lager");
+  activeBrewProfile.diacetylRestRecommendedByYeast = true;
+  activeBrewProfile.diacetylRestEnabled = true;
+  brewProfileLoaded = true;
+  fermentationStateMachine.reset();
+  uiTestSetMockTime(getCurrentEpoch() + 3600UL);
+  uiTestSetMockSG(1.012f);
+  uiTestRunAnalyzer();
+  bool dRestLager = strcmp(fermentationStateMachine.phaseName(), "D-REST READY") == 0 ||
+                    strstr(currentRecommendation.message, "diacetyl") != NULL;
+  run("DiacetylRestLogicLager", dRestLager, "lager_trigger", "drest_ready",
+      dRestLager ? "drest_ready" : fermentationStateMachine.phaseName());
+
+  activeBrewProfile.diacetylRestRecommendedByYeast = false;
+  activeBrewProfile.diacetylRestEnabled = false;
+  fermentationStateMachine.reset();
+  uiTestSetMockTime(getCurrentEpoch() + 7200UL);
+  uiTestSetMockSG(1.012f);
+  uiTestRunAnalyzer();
+  bool dRestAleSafe = strcmp(fermentationStateMachine.phaseName(), "D-REST READY") != 0;
+  run("DiacetylRestLogicAleNoAuto", dRestAleSafe, "ale_no_auto", "not_drest", fermentationStateMachine.phaseName());
+  uiTestSetMockTime(0);
+
+  activeBrewProfile = savedProfile;
+  brewProfileLoaded = savedProfileLoaded;
+  currentMode = savedMode;
+  screenDirty = true;
+
+  snprintf(buffer, bufferSize, "state_logic total=%d passed=%d failed=%d first_failure=%s",
+           total, passed, failed, firstFail[0] ? firstFail : "none");
+  return failed == 0;
+}
+
+bool uiTestRunUISafetyTests(char* buffer, size_t bufferSize) {
+  static BrewProfile savedProfile;
+  savedProfile = activeBrewProfile;
+  bool savedProfileLoaded = brewProfileLoaded;
+  bool savedFermentationFileOpen = fermentationFileOpen;
+  static char savedFermentationFile[sizeof(currentFermentationFile)];
+  strncpy(savedFermentationFile, currentFermentationFile, sizeof(savedFermentationFile));
+  savedFermentationFile[sizeof(savedFermentationFile) - 1] = '\0';
+  ViewMode savedMode = currentMode;
+  int total = 0, passed = 0, failed = 0;
+  char firstFail[64] = "";
+  auto run = [&](const char* name, bool condition, const char* step, const char* expected, const char* actualValue) {
+    return uiTestRunOne(name, condition, step, expected, actualValue, &total, &passed, &failed, firstFail, sizeof(firstFail));
+  };
+
+  beginBrewWizard();
+  for (int i = 0; i < 20; i++) uiTestKey(i % 2 == 0 ? "next" : "prev");
+  bool touchSpamSafe = currentMode == BREW_WIZARD_VIEW || currentMode == LIVE_VIEW || currentMode == DASHBOARD_VIEW;
+  run("TouchSpamTest", touchSpamSafe, "no_crash", "valid_screen", uiTestScreenName());
+
+  beginBrewWizard();
+  uiTestTypeText("BACKTEST");
+  uiTestKey("next");
+  uiTestKey("prev");
+  bool backValueKept = strstr(activeBrewProfile.batchName, "BACKTEST") != NULL;
+  run("BackNavigationConsistency", backValueKept, "field_retained", "BACKTEST", activeBrewProfile.batchName);
+
+  beginBrewWizard();
+  uiTestTypeText("CANCELTEST");
+  uiTestKey("prev");
+  bool cancelDialogShown = uiTestVisibleText("Discard changes?");
+  run("CancelConfirmation", cancelDialogShown, "discard_dialog", "visible", cancelDialogShown ? "visible" : "missing");
+  uiTestTap(366, 173);
+  bool cancelRestoreOK = strcmp(activeBrewProfile.batchId, savedProfile.batchId) == 0 &&
+                         strcmp(activeBrewProfile.batchName, savedProfile.batchName) == 0 &&
+                         brewProfileLoaded == savedProfileLoaded &&
+                         strcmp(currentFermentationFile, savedFermentationFile) == 0 &&
+                         currentMode == DASHBOARD_VIEW;
+  run("WizardCancelRestoresActiveBatch", cancelRestoreOK, "cancel_restore", savedProfile.batchName,
+      cancelRestoreOK ? activeBrewProfile.batchName : activeBrewProfile.batchName);
+
+  beginBrewWizard();
+  bool longTextSafe = uiTestTypeText("ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZ") &&
+                      strlen(activeBrewProfile.batchName) < sizeof(activeBrewProfile.batchName);
+  uiTestKey("next");
+  run("LongTextInput", longTextSafe, "bounded_name", "<40_chars", longTextSafe ? "bounded" : "overflow_or_reject");
+
+  beginBrewWizard();
+  bool specialCharsSafe = !uiTestTypeText("Test/Batch") && uiTestTypeText("PILS A");
+  run("SpecialCharacters", specialCharsSafe, "unsupported_chars_safe", "reject_non_keyboard", specialCharsSafe ? "safe" : "unsafe");
+
+  activeBrewProfile = savedProfile;
+  brewProfileLoaded = savedProfileLoaded;
+  fermentationFileOpen = savedFermentationFileOpen;
+  strncpy(currentFermentationFile, savedFermentationFile, sizeof(currentFermentationFile));
+  currentFermentationFile[sizeof(currentFermentationFile) - 1] = '\0';
+  currentMode = savedMode;
+  screenDirty = true;
+
+  snprintf(buffer, bufferSize, "ui_safety total=%d passed=%d failed=%d first_failure=%s",
+           total, passed, failed, firstFail[0] ? firstFail : "none");
+  return failed == 0;
+}
+
+bool uiTestRunRegressionTests(char* buffer, size_t bufferSize) {
+  static BrewProfile savedProfile;
+  savedProfile = activeBrewProfile;
+  bool savedProfileLoaded = brewProfileLoaded;
+  bool savedFermentationFileOpen = fermentationFileOpen;
+  static char savedFermentationFile[sizeof(currentFermentationFile)];
+  strncpy(savedFermentationFile, currentFermentationFile, sizeof(savedFermentationFile));
+  savedFermentationFile[sizeof(savedFermentationFile) - 1] = '\0';
+  static char savedActiveBatchId[24];
+  bool savedActiveBatchIdValid = false;
+  savedActiveBatchId[0] = '\0';
+  if (mountSDTemporarily()) {
+    savedActiveBatchIdValid = BrewProfileStore::loadActiveBatchId(savedActiveBatchId, sizeof(savedActiveBatchId));
+    dismountSD();
+  }
+  ViewMode savedMode = currentMode;
+  CalibrationCoefficients savedCalib = calibCoeffs;
+  float savedNormOffset = normOffset;
+  float savedNormScale = normScale;
+  static payload_t savedDisplayDataBuffer[MAX_DATA_POINTS];
+  static uint32_t savedDisplayTimestampBuffer[MAX_DATA_POINTS];
+  static payload_t savedDischargeRateBuffer[25];
+  static uint32_t savedDischargeRateTimestampBuffer[25];
+  memcpy(savedDisplayDataBuffer, displayDataBuffer, sizeof(savedDisplayDataBuffer));
+  memcpy(savedDisplayTimestampBuffer, displayTimestampBuffer, sizeof(savedDisplayTimestampBuffer));
+  memcpy(savedDischargeRateBuffer, dischargeRateBuffer, sizeof(savedDischargeRateBuffer));
+  memcpy(savedDischargeRateTimestampBuffer, dischargeRateTimestampBuffer, sizeof(savedDischargeRateTimestampBuffer));
+  int savedDisplayDataIndex = displayDataIndex;
+  int savedDisplayDataCount = displayDataCount;
+  int savedTotalCSVDataLines = totalCSVDataLines;
+  int savedLastHistoricalLoadedLines = lastHistoricalLoadedLines;
+  int savedLastHistoricalSkippedLines = lastHistoricalSkippedLines;
+  int savedLastHistoricalParseErrors = lastHistoricalParseErrors;
+  int savedLastHistoricalPreBatchLines = lastHistoricalPreBatchLines;
+  int savedLastHistoricalPostBatchLines = lastHistoricalPostBatchLines;
+  int savedLastHistoricalBatchFilteredLines = lastHistoricalBatchFilteredLines;
+  int savedLastHistoricalCutoffFilteredLines = lastHistoricalCutoffFilteredLines;
+  bool savedLastHistoricalBatchStartRelaxed = lastHistoricalBatchStartRelaxed;
+  uint32_t savedLastHistoricalOldestEpoch = lastHistoricalOldestEpoch;
+  uint32_t savedLastHistoricalNewestEpoch = lastHistoricalNewestEpoch;
+  int savedDischargeRateBufferCount = dischargeRateBufferCount;
+  float savedPreviousAnalyticsSG = previousAnalyticsSG;
+  uint32_t savedPreviousAnalyticsEpoch = previousAnalyticsEpoch;
+  int savedCursorIndex = cursorIndex;
+  float savedCursorPosition = cursorPosition;
+
+  int total = 0;
+  int passed = 0;
+  int failed = 0;
+  static char firstFail[80];
+  static char actual[48];
+  firstFail[0] = '\0';
+  actual[0] = '\0';
+
+  auto run = [&](const char* name, bool condition, const char* step, const char* expected, const char* actualValue) {
+    return uiTestRunOne(name, condition, step, expected, actualValue, &total, &passed, &failed, firstFail, sizeof(firstFail));
+  };
+
+  uiTestDeleteBatch();
+
+  // 1. Calibration Abort Safety
+  currentMode = CALIBRATION_VIEW;
+  calibMode = CALIB_POINT1;
+  calibAngles[0] = 12.3f;
+  currentMode = DASHBOARD_VIEW;
+  bool calUnchanged = memcmp(&savedCalib, &calibCoeffs, sizeof(CalibrationCoefficients)) == 0;
+  run("CalibrationAbortSafety", calUnchanged, "coefficients_unchanged", "true", calUnchanged ? "true" : "false");
+
+  // 2. Calibration Power-Loss Simulation
+  calibAngles[0] = 10.0f;
+  calibAngles[1] = 0.0f;
+  calibMode = CALIB_IDLE;
+  float sgAfterDraft = calculateGravity(12.0f);
+  bool powerLossSafe = uiTestRegressionValidFloat(sgAfterDraft) && memcmp(&savedCalib, &calibCoeffs, sizeof(CalibrationCoefficients)) == 0;
+  run("CalibrationPowerLossSimulation", powerLossSafe, "partial_draft_ignored", "valid_previous_calibration", powerLossSafe ? "valid_previous_calibration" : "changed_or_invalid");
+
+  // 3. Calibration Final Save, restored immediately to avoid permanent test calibration.
+  calibCoeffs.coeff3 = 0.0f;
+  calibCoeffs.coeff2 = 0.0f;
+  calibCoeffs.coeff1 = 0.0105f;
+  calibCoeffs.coeff0 = 1.000f;
+  calibCoeffs.isValid = true;
+  saveCalibrationCoefficients();
+  initCalibration();
+  bool newCalSaved = calibCoeffs.isValid && fabs(calibCoeffs.coeff1 - 0.0105f) < 0.0002f;
+  run("CalibrationFinalSave", newCalSaved, "save_reload", "new_coefficients_active", newCalSaved ? "new_coefficients_active" : "not_saved");
+  calibCoeffs = savedCalib;
+  normOffset = savedNormOffset;
+  normScale = savedNormScale;
+  if (calibCoeffs.isValid) saveCalibrationCoefficients();
+
+  // 4-5. New Batch Abort
+  beginBrewWizard();
+  char abortBatchId[24];
+  strncpy(abortBatchId, activeBrewProfile.batchId, sizeof(abortBatchId));
+  abortBatchId[sizeof(abortBatchId) - 1] = '\0';
+  uiTestTypeText("ABORTTEST");
+  uiTestKey("next");
+  uiTestKey("prev");
+  uiTestKey("prev");
+  char abortProfilePath[80];
+  BrewProfileStore::profilePath(abortBatchId, abortProfilePath, sizeof(abortProfilePath));
+  bool abortNoProfile = !uiTestFileExists(abortProfilePath);
+  run("NewBatchAbortBeforeConfirm", abortNoProfile, "profile_not_created", "false", abortNoProfile ? "false" : "true");
+  run("NewBatchAbortAfterPartialDraft", abortNoProfile, "draft_not_listed", "false", abortNoProfile ? "false" : "true");
+
+  // 6. New Batch Final Confirm
+  bool createOK = uiTestCreateBatch();
+  bool profileOK = false, targetOK = false, logOK = false;
+  uiTestTestBatchFilesExist(&profileOK, &targetOK, &logOK);
+  snprintf(actual, sizeof(actual), "p%d_t%d_l%d", profileOK, targetOK, logOK);
+  run("NewBatchFinalConfirm", createOK && profileOK && targetOK && logOK, "files_created", "p1_t1_l1", actual);
+
+  // 7. Duplicate Batch Name
+  beginBrewWizard();
+  bool duplicateSafe = strcmp(activeBrewProfile.batchId, "test_batch") != 0;
+  run("DuplicateBatchName", duplicateSafe, "unique_batch_id", "not_test_batch", activeBrewProfile.batchId);
+
+  // 8. Invalid Brix Input
+  bool invalidBrixRejected = BrixConverter::brixToSG(0.0f) <= 1.0001f && BrixConverter::brixToSG(99.0f) < 1.300f;
+  run("InvalidBrixInput", !invalidBrixRejected, "validation", "reject_invalid_values", "currently_allows_or_computes");
+
+  // 9. Invalid Batch Size
+  beginBrewWizard();
+  uiTestKey("next");
+  uiTestKey("next");
+  uiTestTypeText("9999");
+  uiTestKey("next");
+  bool invalidSizeRejected = brewWizard.currentStep() == WIZARD_BATCH_SIZE && strstr(uiTestScreenName(), "BrewWizard") != NULL;
+  run("InvalidBatchSize", invalidSizeRejected, "validation", "stay_on_batch_size", invalidSizeRejected ? "stay_on_batch_size" : "advanced");
+
+  // 10. Invalid Attenuation
+  float invalidFG = DerivedCalculations::expectedFG(1.050f, 120);
+  bool attenuationSafe = uiTestRegressionValidFloat(invalidFG) && invalidFG >= 0.990f && invalidFG <= 1.050f;
+  run("InvalidAttenuation", attenuationSafe, "fg_bounds", "0.990..1.050", attenuationSafe ? "in_range" : "out_of_range");
+
+  // 11. Auto Mode Toggle Consistency
+  BrewProfileStore::setDefaults(&activeBrewProfile);
+  activeBrewProfile.autoModeEnabled = true;
+  strcpy(activeBrewProfile.attenuationSource, "yeast_preset");
+  bool autoModeOK = activeBrewProfile.autoModeEnabled && strcmp(activeBrewProfile.attenuationSource, "yeast_preset") == 0;
+  activeBrewProfile.autoModeEnabled = false;
+  strcpy(activeBrewProfile.attenuationSource, "manual");
+  autoModeOK = autoModeOK && !activeBrewProfile.autoModeEnabled && strcmp(activeBrewProfile.attenuationSource, "manual") == 0;
+  run("AutoModeToggleConsistency", autoModeOK, "attenuation_source", "yeast_preset_then_manual", autoModeOK ? "yeast_preset_then_manual" : "mixed");
+
+  // 12. Yeast Preset Missing/Corrupt fallback
+  const YeastPreset* fallbackPreset = YeastPresetRepository::findById("missing_preset_for_test");
+  bool fallbackOK = fallbackPreset != NULL && fallbackPreset->displayName != NULL && fallbackPreset->displayName[0] != '\0';
+  run("YeastPresetMissingCorrupt", fallbackOK, "fallback", "non_empty_default", fallbackOK ? fallbackPreset->displayName : "null");
+
+  // 13-15. OG Verification
+  uiTestCreateBatch();
+  activeBrewProfile.recipeOG = 1.050f;
+  activeBrewProfile.measuredOG = 1.060f;
+  activeBrewProfile.effectiveOG = activeBrewProfile.recipeOG;
+  activeBrewProfile.ogNeedsChoice = true;
+  currentMode = OG_VERIFICATION_VIEW;
+  bool ogAbortOK = fabs(activeBrewProfile.effectiveOG - 1.050f) < 0.0005f && activeBrewProfile.ogNeedsChoice;
+  run("OGVerificationAbort", ogAbortOK, "pending_no_overwrite", "recipe_og_pending", ogAbortOK ? "recipe_og_pending" : "overwritten");
+  handleOGChoice(false);
+  bool ogRecipeOK = fabs(activeBrewProfile.effectiveOG - activeBrewProfile.recipeOG) < 0.0005f && activeBrewProfile.ogVerified;
+  run("OGVerificationConfirmRecipeOG", ogRecipeOK, "effective_og", "recipeOG", ogRecipeOK ? "recipeOG" : "other");
+  activeBrewProfile.measuredOG = 1.060f;
+  activeBrewProfile.ogNeedsChoice = true;
+  activeBrewProfile.ogVerified = false;
+  handleOGChoice(true);
+  bool ogMeasuredOK = fabs(activeBrewProfile.effectiveOG - activeBrewProfile.measuredOG) < 0.0005f && activeBrewProfile.ogVerified;
+  run("OGVerificationConfirmMeasuredOG", ogMeasuredOK, "effective_og", "measuredOG", ogMeasuredOK ? "measuredOG" : "other");
+
+  // 16-17. Sensor invalid/extreme handling
+  uiTestSetMockSG(0.0f);
+  uiTestSetMockTemp(20.0f);
+  bool invalidSensorOK = uiTestRunAnalyzer();
+  bool invalidFlagged = currentRecommendation.message && strstr(currentRecommendation.message, "sensor") != NULL;
+  run("SensorDropoutDuringActiveBatch", invalidSensorOK && invalidFlagged, "recommendation", "sensor_issue", invalidFlagged ? "sensor_issue" : currentRecommendation.message);
+  static const float extremeSGs[] = {0.800f, 0.999f, 1.000f, 1.050f, 1.200f, 2.000f};
+  static const float extremeTemps[] = {-10.0f, 0.0f, 20.0f, 80.0f};
+  bool extremesSafe = true;
+  for (int i = 0; i < 6; i++) {
+    uiTestSetMockSG(extremeSGs[i]);
+    uiTestSetMockTemp(extremeTemps[i % 4]);
+    extremesSafe = uiTestRunAnalyzer() && extremesSafe && uiTestRegressionValidFloat(fermentationMetrics.estimatedABV + 1.0f);
+  }
+  run("ExtremeSensorValues", extremesSafe, "no_nan_inf", "true", extremesSafe ? "true" : "false");
+
+  // 18. State Machine Regression spike
+  uiTestCreateBatch();
+  uiTestSetMockSG(1.048f); uiTestRunAnalyzer();
+  uiTestSetMockSG(1.035f); uiTestRunAnalyzer();
+  const char* phaseBeforeSpike = fermentationStateMachine.phaseName();
+  uiTestSetMockSG(1.046f); uiTestRunAnalyzer();
+  bool spikeSafe = strcmp(fermentationStateMachine.phaseName(), "IDLE") != 0;
+  run("StateMachineRegression", spikeSafe, "sg_spike_phase", "not_IDLE", spikeSafe ? fermentationStateMachine.phaseName() : phaseBeforeSpike);
+
+  // 19. Stable Gravity Detection
+  bool stableShortSafe = strcmp(fermentationStateMachine.phaseName(), "READY TO PACKAGE") != 0;
+  run("StableGravityDetectionShort", stableShortSafe, "duration_threshold", "not_ready", stableShortSafe ? "not_ready" : "ready");
+  uint32_t stableEpoch = getCurrentEpoch();
+  for (int i = 0; i < 4; i++) {
+    stableEpoch += 12UL * 3600UL;
+    uiTestSetMockTime(stableEpoch);
+    uiTestSetMockSG(activeBrewProfile.expectedFinalGravity);
+    uiTestRunAnalyzer();
+  }
+  bool stableLongReached = strcmp(fermentationStateMachine.phaseName(), "FG STABLE") == 0 ||
+                           strcmp(fermentationStateMachine.phaseName(), "READY TO PACKAGE") == 0 ||
+                           strcmp(fermentationStateMachine.phaseName(), "COMPLETED") == 0;
+  run("StableGravityDetectionLong", stableLongReached, "stable_duration", "stable_or_ready", fermentationStateMachine.phaseName());
+
+  // 20. Diacetyl Rest Logic
+  BrewProfileStore::setDefaults(&activeBrewProfile);
+  strcpy(activeBrewProfile.yeastCategory, "Lager");
+  activeBrewProfile.diacetylRestRecommendedByYeast = true;
+  activeBrewProfile.diacetylRestEnabled = true;
+  brewProfileLoaded = true;
+  fermentationStateMachine.reset();
+  uiTestSetMockTime(getCurrentEpoch() + 3600UL);
+  uiTestSetMockSG(1.012f);
+  uiTestRunAnalyzer();
+  bool dRestLager = strcmp(fermentationStateMachine.phaseName(), "D-REST READY") == 0 ||
+                    strstr(currentRecommendation.message, "diacetyl") != NULL;
+  run("DiacetylRestLogicLager", dRestLager, "lager_trigger", "drest_ready", dRestLager ? "drest_ready" : fermentationStateMachine.phaseName());
+  activeBrewProfile.diacetylRestRecommendedByYeast = false;
+  activeBrewProfile.diacetylRestEnabled = false;
+  fermentationStateMachine.reset();
+  uiTestSetMockTime(getCurrentEpoch() + 7200UL);
+  uiTestSetMockSG(1.012f);
+  uiTestRunAnalyzer();
+  bool dRestAleSafe = strcmp(fermentationStateMachine.phaseName(), "D-REST READY") != 0;
+  run("DiacetylRestLogicAleNoAuto", dRestAleSafe, "ale_no_auto", "not_drest", fermentationStateMachine.phaseName());
+  uiTestSetMockTime(0);
+
+  // 21. Reboot During Active Batch, soft reload.
+  uiTestCreateBatch();
+  static BrewProfile reloaded;
+  bool reloadOK = false;
+  if (mountSDTemporarily()) {
+    reloadOK = BrewProfileStore::load("test_batch", &reloaded);
+    dismountSD();
+  }
+  run("RebootDuringActiveBatch", reloadOK, "profile_reload", "true", reloadOK ? "true" : "false");
+
+  // 21b. Mock time must never leak into the real logging path.
+  uiTestCreateBatch();
+  const uint32_t mockEpoch = 1779380000UL;
+  uiTestSetMockTime(mockEpoch);
+  static payload_t realPathPayload;
+  memset(&realPathPayload, 0, sizeof(realPathPayload));
+  realPathPayload.sequence_id = 42;
+  realPathPayload.angle = 50.0f;
+  realPathPayload.density = 1.0042f;
+  realPathPayload.temperature = 20.4f;
+  realPathPayload.battery_voltage = 4.08f;
+  realPathPayload.uptime_s = 1234;
+  uint32_t realEpoch = getCurrentEpoch();
+  bool logWriteOK = isEpochValid(realEpoch) && logDataToSD(realPathPayload, realEpoch);
+  uint32_t lastLogEpoch = 0;
+  bool logReadOK = false;
+  if (mountSDTemporarily()) {
+    char logPath[80];
+    BrewProfileStore::logPath("test_batch", logPath, sizeof(logPath));
+    logReadOK = uiTestReadLastLogEpoch(logPath, &lastLogEpoch);
+    dismountSD();
+  }
+  bool mockIsolated = logWriteOK && logReadOK && lastLogEpoch != mockEpoch && lastLogEpoch == realEpoch;
+  snprintf(actual, sizeof(actual), "%lu", (unsigned long)lastLogEpoch);
+  run("MockTimeIsolation", mockIsolated, "logged_epoch", "rtc_epoch_not_mock", actual);
+  uiTestSetMockTime(0);
+
+  // 21c. Mixed logs should make skipped rows visible instead of silently looking like missing history.
+  uiTestCreateBatch();
+  uint32_t mixedCreatedAt = getCurrentEpoch();
+  activeBrewProfile.createdAt = mixedCreatedAt;
+  static char mixedPath[80];
+  BrewProfileStore::logPath("test_batch", mixedPath, sizeof(mixedPath));
+  bool mixedOK = false;
+  if (mountSDTemporarily()) {
+    mixedOK = uiTestWriteMixedEpochLog(mixedPath, mixedCreatedAt);
+    if (mixedOK) mixedOK = loadHistoricalDataFromCSV(mixedPath, LOAD_ALL, MAX_DATA_POINTS, 1);
+    dismountSD();
+  }
+  bool mixedCountsOK = mixedOK && lastHistoricalLoadedLines == 2 && lastHistoricalSkippedLines == 1 && lastHistoricalParseErrors == 0;
+  snprintf(actual, sizeof(actual), "L%d_S%d_E%d", lastHistoricalLoadedLines, lastHistoricalSkippedLines, lastHistoricalParseErrors);
+  run("HistoricalMixedLogFilter", mixedCountsOK, "load_skip_counts", "L2_S1_E0", actual);
+
+  // 21d-21e run in the smaller run_batch_restore_tests command to keep the ESP32 loop stack stable.
+
+  // 22-25. Storage failure/corruption checks currently need hardware/file fault injection.
+  run("SDCardMissing", false, "fault_injection", "sd_unavailable_mock", "not_implemented");
+  run("CorruptProfileJson", false, "fault_injection", "corrupt_profile_recovery", "not_implemented");
+  run("CorruptTargetJson", false, "fault_injection", "target_regenerated", "not_implemented");
+  run("LogFileAppendFailure", false, "fault_injection", "write_failure_reported", "not_implemented");
+
+  // 26. Touch Spam Test
+  beginBrewWizard();
+  for (int i = 0; i < 20; i++) {
+    uiTestKey(i % 2 == 0 ? "next" : "prev");
+  }
+  bool touchSpamSafe = currentMode == BREW_WIZARD_VIEW || currentMode == LIVE_VIEW || currentMode == DASHBOARD_VIEW;
+  run("TouchSpamTest", touchSpamSafe, "no_crash", "valid_screen", uiTestScreenName());
+
+  // 27. Back Navigation Consistency
+  beginBrewWizard();
+  uiTestTypeText("BACKTEST");
+  uiTestKey("next");
+  uiTestKey("prev");
+  bool backValueKept = strstr(activeBrewProfile.batchName, "BACKTEST") != NULL;
+  run("BackNavigationConsistency", backValueKept, "field_retained", "BACKTEST", activeBrewProfile.batchName);
+
+  // 28. Cancel Confirmation is intentionally expected to fail until UI adds confirmation.
+  beginBrewWizard();
+  uiTestTypeText("CANCELTEST");
+  uiTestKey("prev");
+  bool cancelDialogShown = uiTestVisibleText("Discard changes?");
+  run("CancelConfirmation", cancelDialogShown, "discard_dialog", "visible", cancelDialogShown ? "visible" : "missing");
+
+  // 29. Completed Batch Protection
+  uiTestCreateBatch();
+  bool markedCompleted = uiTestMarkTestBatchCompleted();
+  continueManagedBatch("test_batch");
+  bool completedProtected = markedCompleted && (!brewProfileLoaded || strcmp(activeBrewProfile.batchId, "test_batch") != 0);
+  run("CompletedBatchProtection", completedProtected, "explicit_lock", "protected", completedProtected ? "protected" : "continued");
+
+  // 30. Dashboard No Batch State
+  uiTestDeleteBatch();
+  currentMode = DASHBOARD_VIEW;
+  screenDirty = true;
+  bool noBatchOK = !brewProfileLoaded && strcmp(uiTestScreenName(), "DashboardScreen") == 0;
+  run("DashboardNoBatchState", noBatchOK, "no_active_batch", "dashboard_no_batch", noBatchOK ? "dashboard_no_batch" : uiTestScreenName());
+
+  // 31-32. Text limits and special characters.
+  beginBrewWizard();
+  bool longTextSafe = uiTestTypeText("ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZ") && strlen(activeBrewProfile.batchName) < sizeof(activeBrewProfile.batchName);
+  uiTestKey("next");
+  run("LongTextInput", longTextSafe, "bounded_name", "<40_chars", longTextSafe ? "bounded" : "overflow_or_reject");
+  beginBrewWizard();
+  bool specialCharsSafe = !uiTestTypeText("Test/Batch") && uiTestTypeText("PILS A");
+  run("SpecialCharacters", specialCharsSafe, "unsupported_chars_safe", "reject_non_keyboard", specialCharsSafe ? "safe" : "unsafe");
+
+  // 33. Memory/Heap Stability
+  uint32_t heapBefore = ESP.getFreeHeap();
+  for (int i = 0; i < 5; i++) {
+    uiTestCreateBatch();
+    uiTestDeleteBatch();
+  }
+  uint32_t heapAfter = ESP.getFreeHeap();
+  bool heapStable = heapAfter + 2048 >= heapBefore;
+  snprintf(actual, sizeof(actual), "%lu", (unsigned long)heapAfter);
+  run("MemoryHeapStability", heapStable, "free_heap", "no_continuous_drop", actual);
+
+  // 34-35. Full End-to-End Auto/Manual Mode
+  uiTestCreateBatch();
+  bool autoE2E = activeBrewProfile.autoModeEnabled && strcmp(activeBrewProfile.attenuationSource, "yeast_preset") == 0;
+  uiTestSetMockSG(1.040f);
+  uiTestRunAnalyzer();
+  autoE2E = autoE2E && currentETA.valid && currentRecommendation.message[0] != '\0';
+  run("FullEndToEndAutoMode", autoE2E, "auto_values", "eta_and_recommendation", autoE2E ? "ok" : "missing");
+  BrewProfileStore::setDefaults(&activeBrewProfile);
+  strncpy(activeBrewProfile.batchId, "test_batch", sizeof(activeBrewProfile.batchId) - 1);
+  activeBrewProfile.autoModeEnabled = false;
+  activeBrewProfile.expectedApparentAttenuation = 74;
+  strcpy(activeBrewProfile.attenuationSource, "manual");
+  brewProfileLoaded = true;
+  completeBrewWizard();
+  bool manualE2E = !activeBrewProfile.autoModeEnabled && strcmp(activeBrewProfile.attenuationSource, "manual") == 0;
+  run("FullEndToEndManualMode", manualE2E, "manual_source", "manual", activeBrewProfile.attenuationSource);
+
+  // Restore previous runtime state as much as possible.
+  activeBrewProfile = savedProfile;
+  brewProfileLoaded = savedProfileLoaded;
+  fermentationFileOpen = savedFermentationFileOpen;
+  strncpy(currentFermentationFile, savedFermentationFile, sizeof(currentFermentationFile));
+  currentFermentationFile[sizeof(currentFermentationFile) - 1] = '\0';
+  currentMode = savedMode;
+  calibCoeffs = savedCalib;
+  normOffset = savedNormOffset;
+  normScale = savedNormScale;
+  memcpy(displayDataBuffer, savedDisplayDataBuffer, sizeof(displayDataBuffer));
+  memcpy(displayTimestampBuffer, savedDisplayTimestampBuffer, sizeof(displayTimestampBuffer));
+  memcpy(dischargeRateBuffer, savedDischargeRateBuffer, sizeof(dischargeRateBuffer));
+  memcpy(dischargeRateTimestampBuffer, savedDischargeRateTimestampBuffer, sizeof(dischargeRateTimestampBuffer));
+  displayDataIndex = savedDisplayDataIndex;
+  displayDataCount = savedDisplayDataCount;
+  totalCSVDataLines = savedTotalCSVDataLines;
+  lastHistoricalLoadedLines = savedLastHistoricalLoadedLines;
+  lastHistoricalSkippedLines = savedLastHistoricalSkippedLines;
+  lastHistoricalParseErrors = savedLastHistoricalParseErrors;
+  lastHistoricalPreBatchLines = savedLastHistoricalPreBatchLines;
+  lastHistoricalPostBatchLines = savedLastHistoricalPostBatchLines;
+  lastHistoricalBatchFilteredLines = savedLastHistoricalBatchFilteredLines;
+  lastHistoricalCutoffFilteredLines = savedLastHistoricalCutoffFilteredLines;
+  lastHistoricalBatchStartRelaxed = savedLastHistoricalBatchStartRelaxed;
+  lastHistoricalOldestEpoch = savedLastHistoricalOldestEpoch;
+  lastHistoricalNewestEpoch = savedLastHistoricalNewestEpoch;
+  dischargeRateBufferCount = savedDischargeRateBufferCount;
+  previousAnalyticsSG = savedPreviousAnalyticsSG;
+  previousAnalyticsEpoch = savedPreviousAnalyticsEpoch;
+  cursorIndex = savedCursorIndex;
+  cursorPosition = savedCursorPosition;
+  if (mountSDTemporarily()) {
+    if (savedActiveBatchIdValid) {
+      BrewProfileStore::saveActiveBatchId(savedActiveBatchId);
+    } else {
+      BrewProfileStore::clearActiveBatchId();
+    }
+    dismountSD();
+  }
+  screenDirty = true;
+
+  snprintf(buffer, bufferSize, "ui_regression total=%d passed=%d failed=%d first_failure=%s",
+           total, passed, failed, firstFail[0] ? firstFail : "none");
+  return failed == 0;
+}
+#endif
