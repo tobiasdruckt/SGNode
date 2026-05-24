@@ -641,6 +641,10 @@ void drawAbvGraphView();
 void drawBrewWizardScreen();
 void drawOGVerificationScreen();
 void drawTargetVsActualChart();
+void drawChartEventMarkers(int gx, int gy, int gw, int gh, float chartHours, float minSG, float maxSG);
+void drawChartXAxisLabels(int gx, int gy, int gw, int gh, float chartHours);
+float findEventHourBySG(const BrewProfile& profile, float targetSG, float chartHours);
+float findEventHourByAttenuation(const BrewProfile& profile, float attenuationPct, float chartHours);
 void drawDashboardScreen();
 void drawNewYeastScreen();
 void drawManageYeastScreen();
@@ -2732,9 +2736,9 @@ void drawTargetVsActualChart() {
   }
 
   int gx = x + 38;
-  int gy = y + 28;
+  int gy = y + 24;
   int gw = w - 54;
-  int gh = h - 54;
+  int gh = h - 68;  // Extra bottom margin for X-axis labels
   tft.drawRect(gx, gy, gw, gh, uiColorBorder);
 
   float chartHours = activeBrewProfile.autoModeEnabled && activeBrewProfile.typicalDurationHours > 0.0f
@@ -2816,6 +2820,10 @@ void drawTargetVsActualChart() {
     prevY = py;
   }
 
+  // Draw event markers and X-axis labels
+  drawChartEventMarkers(gx, gy, gw, gh, chartHours, minSG, maxSG);
+  drawChartXAxisLabels(gx, gy, gw, gh, chartHours);
+
   tft.setTextColor(uiColorGold);
   tft.setFreeFont(FONT_SIZE_XS);
   tft.setCursor(gx + 6, gy + 14);
@@ -2825,6 +2833,145 @@ void drawTargetVsActualChart() {
   tft.print("actual");
 
   uiDrawBottomNav(TAB_LIVE);
+}
+
+// Find the hour at which the target curve reaches a given SG threshold
+float findEventHourBySG(const BrewProfile& profile, float targetSG, float chartHours) {
+  for (int step = 0; step <= (int)(chartHours * 2); step++) {
+    float hour = step * 0.5f;
+    float sg = TargetCurveGenerator::expectedGravityAtHour(profile, hour);
+    if (sg <= targetSG) return hour;
+  }
+  return -1.0f;
+}
+
+// Find the hour at which the target curve reaches a given apparent attenuation %
+float findEventHourByAttenuation(const BrewProfile& profile, float attenuationPct, float chartHours) {
+  for (int step = 0; step <= (int)(chartHours * 2); step++) {
+    float hour = step * 0.5f;
+    float att = TargetCurveGenerator::expectedAttenuationAtHour(profile, hour);
+    if (att >= attenuationPct) return hour;
+  }
+  return -1.0f;
+}
+
+// Draw a dashed vertical line
+static void drawDashedVLine(int x, int y0, int y1, uint16_t color, int dashLen = 4, int gapLen = 3) {
+  for (int y = y0; y < y1; y += dashLen + gapLen) {
+    int end = y + dashLen;
+    if (end > y1) end = y1;
+    tft.drawFastVLine(x, y, end - y, color);
+  }
+}
+
+// Draw event markers on the Target vs Actual chart
+void drawChartEventMarkers(int gx, int gy, int gw, int gh, float chartHours, float minSG, float maxSG) {
+  if (!brewProfileLoaded) return;
+
+  struct EventMarker {
+    float hour;
+    const char* label;
+    uint16_t color;
+    bool enabled;
+  };
+
+  // D-rest trigger: attenuation threshold depends on yeast type
+  float dRestAtt = 75.0f;
+  bool isLager = strcmp(activeBrewProfile.curveTemplate, "lager") == 0 ||
+                 strstr(activeBrewProfile.yeastCategory, "Lager") != NULL;
+  if (isLager) dRestAtt = 72.0f;
+  else if (activeBrewProfile.diacetylRestRecommendedByYeast) dRestAtt = 78.0f;
+
+  float dRestHour = -1.0f;
+  if (activeBrewProfile.diacetylRestEnabled || activeBrewProfile.diacetylRestRecommendedByYeast) {
+    dRestHour = findEventHourByAttenuation(activeBrewProfile, dRestAtt, chartHours);
+  }
+
+  // Dry hop: when SG drops to trigger
+  float dryHopHour = -1.0f;
+  float dryHopRemoveHour = -1.0f;
+  if (activeBrewProfile.dryHopEnabled) {
+    float triggerSG = activeBrewProfile.dryHopTriggerSG > 0.0f
+                        ? activeBrewProfile.dryHopTriggerSG : 1.014f;
+    dryHopHour = findEventHourBySG(activeBrewProfile, triggerSG, chartHours);
+    if (dryHopHour >= 0.0f) {
+      float contactH = activeBrewProfile.dryHopContactHours > 0
+                          ? (float)activeBrewProfile.dryHopContactHours : 48.0f;
+      dryHopRemoveHour = dryHopHour + contactH;
+    }
+  }
+
+  // Cold crash: after FG stable — approximate as end of typicalDurationHours
+  float coldCrashHour = -1.0f;
+  if (activeBrewProfile.autoModeEnabled && activeBrewProfile.typicalDurationHours > 0.0f) {
+    coldCrashHour = activeBrewProfile.typicalDurationHours;
+  }
+
+  // Package: 48h after cold crash start
+  float packageHour = -1.0f;
+  if (coldCrashHour >= 0.0f) {
+    packageHour = coldCrashHour + 48.0f;
+  }
+
+  EventMarker markers[] = {
+    { dRestHour,        "DR",  uiColorWarning, dRestHour >= 0.0f },
+    { dryHopHour,       "DH",  uiColorSuccess, dryHopHour >= 0.0f },
+    { dryHopRemoveHour, "DHR", uiColorSuccess, dryHopRemoveHour >= 0.0f },
+    { coldCrashHour,    "CC",  uiColorInfo,    coldCrashHour >= 0.0f },
+    { packageHour,      "PKG", uiColorGold,    packageHour >= 0.0f }
+  };
+  int markerCount = sizeof(markers) / sizeof(markers[0]);
+
+  tft.setFreeFont(FONT_SIZE_XS);
+  int labelY = gy + gh + 2;
+
+  for (int i = 0; i < markerCount; i++) {
+    if (!markers[i].enabled) continue;
+    if (markers[i].hour > chartHours) continue;
+
+    int px = gx + (int)((markers[i].hour / chartHours) * gw);
+    if (px <= gx || px >= gx + gw) continue;
+
+    drawDashedVLine(px, gy + 1, gy + gh - 1, markers[i].color);
+
+    // Draw label above the line at the top of graph
+    tft.setTextColor(markers[i].color);
+    int textW = tft.textWidth(markers[i].label);
+    int labelX = px - textW / 2;
+    if (labelX < gx + 2) labelX = gx + 2;
+    if (labelX + textW > gx + gw - 2) labelX = gx + gw - 2 - textW;
+    tft.setCursor(labelX, gy + gh - 4);
+    tft.print(markers[i].label);
+  }
+}
+
+// Draw X-axis time labels on the Target vs Actual chart
+void drawChartXAxisLabels(int gx, int gy, int gw, int gh, float chartHours) {
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setTextColor(uiColorTextMuted);
+
+  // Choose interval: aim for 4-6 labels
+  float interval;
+  if (chartHours <= 96.0f) interval = 24.0f;
+  else if (chartHours <= 192.0f) interval = 48.0f;
+  else interval = 72.0f;
+
+  int labelY = gy + gh + 12;
+  char buf[8];
+
+  for (float hour = 0.0f; hour <= chartHours; hour += interval) {
+    int px = gx + (int)((hour / chartHours) * gw);
+
+    int days = (int)(hour / 24.0f);
+    snprintf(buf, sizeof(buf), "%dd", days);
+    int tw = tft.textWidth(buf);
+    int tx = px - tw / 2;
+    if (tx < gx) tx = gx;
+    if (tx + tw > gx + gw) tx = gx + gw - tw;
+
+    tft.setCursor(tx, labelY);
+    tft.print(buf);
+  }
 }
 
 void drawGrid(int graphX, int graphY, int graphW, int graphH, float minDensity, float maxDensity) {
