@@ -43,6 +43,21 @@ uint16_t uiColorWarning;
 uint16_t uiColorInfo;
 uint16_t uiColorGold;
 
+static uint16_t mix565(uint16_t a, uint16_t b, uint8_t weightB) {
+  // weightB: 0..255
+  uint8_t ar = (a >> 11) & 0x1F;
+  uint8_t ag = (a >> 5) & 0x3F;
+  uint8_t ab = a & 0x1F;
+  uint8_t br = (b >> 11) & 0x1F;
+  uint8_t bg = (b >> 5) & 0x3F;
+  uint8_t bb = b & 0x1F;
+
+  uint8_t r = (uint8_t)(((uint16_t)ar * (255 - weightB) + (uint16_t)br * weightB) / 255);
+  uint8_t g = (uint8_t)(((uint16_t)ag * (255 - weightB) + (uint16_t)bg * weightB) / 255);
+  uint8_t bl = (uint8_t)(((uint16_t)ab * (255 - weightB) + (uint16_t)bb * weightB) / 255);
+  return (uint16_t)((r << 11) | (g << 5) | bl);
+}
+
 void uiInitColors() {
   // Initialize UI color tokens from current theme
   uiColorPrimary = currentTheme->primary;
@@ -118,12 +133,6 @@ int uiNavHitTest(int x, int y) {
 void uiDrawBottomNav(int activeTab) {
   int navY = UI_H - NAV_H;
   int tabWidth = UI_W / TAB_COUNT;
-  int labelCenters[TAB_COUNT] = {
-    tabWidth / 2,
-    tabWidth + 50,
-    tabWidth * 2 + 66,
-    tabWidth * 3 + tabWidth / 2
-  };
   
   // Draw navigation background
   tft.fillRect(0, navY, UI_W, NAV_H, uiColorCardBackground);
@@ -133,7 +142,9 @@ void uiDrawBottomNav(int activeTab) {
   
   for (int i = 0; i < TAB_COUNT; i++) {
     int tabX = i * tabWidth;
-    int centerX = labelCenters[i];
+    int centerX = tabX + tabWidth / 2;
+    if (i == 1) centerX -= 8;   // Keep visual breathing room to DASHBOARD
+    if (i == 2) centerX += 10;  // Keep visual breathing room from GRAPH
     
     // Remove icon circles - cleaner look
     
@@ -154,7 +165,7 @@ void uiDrawBottomNav(int activeTab) {
       tft.setFreeFont(FONT_SIZE_SM);
       int labelWidth = tft.textWidth(tabLabels[i]);
       int labelX = centerX - labelWidth / 2;
-      tft.setCursor(labelX, navY + 28);  // Adjust for FreeFont baseline
+      tft.setCursor(labelX, navY + 29);  // shared baseline for all three labels
       tft.print(tabLabels[i]);
     }
     
@@ -168,8 +179,23 @@ void uiDrawBottomNav(int activeTab) {
 void uiCard(int x, int y, int w, int h, int r) {
   // Draw rounded card background
   tft.fillRoundRect(x, y, w, h, r, uiColorCardBackground);
-  // Draw rounded border
-  tft.drawRoundRect(x, y, w, h, r, uiColorBorder);
+  // Modern flat surface with subtle L-accent (top + left) and soft corner.
+  if (w > 10 && h > 10) {
+    uint16_t accent = mix565(uiColorCardBackground, uiColorTextPrimary, 28);
+    uint16_t bottomShade = mix565(uiColorCardBackground, uiColorBackground, 30);
+    int inset = 3;
+    int corner = r > 3 ? r - 2 : 2;
+
+    // Top accent
+    tft.drawFastHLine(x + inset + corner, y + inset, w - (inset + corner) - inset, accent);
+    // Left accent
+    tft.drawFastVLine(x + inset, y + inset + corner, h - (inset + corner) - inset, accent);
+    // Rounded top-left join (quarter arc) instead of 45-degree angle
+    tft.drawCircleHelper(x + inset + corner, y + inset + corner, corner, 0x1, accent);
+
+    // Subtle grounding shadow at bottom edge
+    tft.drawFastHLine(x + 5, y + h - 3, w - 10, bottomShade);
+  }
 }
 
 void uiTile(int x, int y, int w, int h, int icon, const char* label, 
@@ -180,14 +206,15 @@ void uiTile(int x, int y, int w, int h, int icon, const char* label,
   // Draw label (small, above value) - adjusted +6px to compensate for tile lift
   tft.setTextColor(muted ? uiColorTextMuted : uiColorTextSecondary);
   tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(x + 20, y + 24);  // Adjusted for FreeFont baseline and tile lift
+  tft.setCursor(x + 16, y + 25);
   tft.print(label);
   
-  // Draw value (larger, prominent) - centered in tile - adjusted +6px to compensate for tile lift
+  // Draw value (larger, prominent) centered against its own font baseline
   tft.setTextColor(muted ? uiColorTextMuted : uiColorTextPrimary);
   tft.setFreeFont(FONT_SIZE_MD);
-  int valueY = y + h / 2 + 12;  // Center vertically, adjusted for tile lift
-  tft.setCursor(x + 20, valueY);
+  int valueFontH = tft.fontHeight();
+  int valueBaselineY = y + h / 2 + valueFontH / 2 - 2;
+  tft.setCursor(x + 16, valueBaselineY);
   tft.print(value);
   
   // Draw unit (small, right-aligned using textWidth)
@@ -195,7 +222,9 @@ void uiTile(int x, int y, int w, int h, int icon, const char* label,
     tft.setTextColor(muted ? uiColorTextMuted : uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
     int unitWidth = tft.textWidth(unit);
-    tft.setCursor(x + w - unitWidth - 10, valueY);  // Align with value
+    int unitFontH = tft.fontHeight();
+    int unitBaselineY = y + h / 2 + unitFontH / 2 - 1;
+    tft.setCursor(x + w - unitWidth - 10, unitBaselineY);
     tft.print(unit);
   }
 }
@@ -226,19 +255,27 @@ void uiHeroSG(int x, int y, int w, int h, float sgValue, const char* trendText,
     if (trendText[0] == '-') {
       trendColor = uiColorSuccess;  // Green for negative (down slope)
     }
-    
+
     // Calculate trend text position (below SG value, aligned left)
+    tft.setFreeFont(FONT_SIZE_SM);
+    int trendTextW = tft.textWidth(trendText);
+    int trendTextH = tft.fontHeight();
     int trendX = x + 20;
-    int trendY = y + 75;
-    
+    int padX = 8;
+    int pillH = 26;
+    int pillW = trendTextW + padX * 2;
+    if (pillW < 64) pillW = 64;
+    int pillX = trendX - padX;
+    int pillY = y + 68;  // fixed anchor below SG value
+
     // Draw trend background pill
-    tft.fillRoundRect(trendX - 5, trendY - 12, 70, 24, 4, uiColorCardBackground);
-    tft.drawRoundRect(trendX - 5, trendY - 12, 70, 24, 4, trendColor);
-    
+    tft.fillRoundRect(pillX, pillY, pillW, pillH, 5, uiColorCardBackground);
+    tft.drawRoundRect(pillX, pillY, pillW, pillH, 5, trendColor);
+
     // Draw trend text
     tft.setTextColor(trendColor);
-    tft.setFreeFont(FONT_SIZE_SM);
-    tft.setCursor(trendX, trendY + 4);
+    int trendBaselineY = pillY + ((pillH - trendTextH) / 2) + trendTextH - 5;
+    tft.setCursor(trendX, trendBaselineY);
     tft.print(trendText);
   }
   
@@ -277,7 +314,13 @@ void uiDrawSparkline(int x, int y, int w, int h, float* data, int count) {
   }
   
   float range = maxVal - minVal;
-  if (range == 0) range = 1;
+  const float minVisualRange = 0.006f;
+  if (range < minVisualRange) {
+    float mid = (maxVal + minVal) * 0.5f;
+    minVal = mid - minVisualRange * 0.5f;
+    maxVal = mid + minVisualRange * 0.5f;
+    range = minVisualRange;
+  }
   
   // Draw sparkline
   int prevX = -1, prevY = -1;

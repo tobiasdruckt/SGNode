@@ -1,6 +1,9 @@
 # Arduino IDE
 .arduino/
 build/
+.build_*/
+sd_backups/
+DeepSleepProbe/
 *.tmp
 *.log
 

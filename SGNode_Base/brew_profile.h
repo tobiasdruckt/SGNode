@@ -37,6 +37,26 @@ struct BrewProfile {
   char curveTemplate[32];
   bool diacetylRestRecommendedByYeast;
   char attenuationSource[18];
+  bool completed;
+  unsigned long completedAt;
+  bool dryHopEnabled;
+  float dryHopTriggerSG;
+  unsigned long dryHopContactHours;
+  bool dryHopDone;
+  bool dryHopSkipped;
+  unsigned long dryHopStartTime;
+  bool dryHopRemoved;
+  bool dryHopRemoveSkipped;
+  unsigned long dryHopRemovedAt;
+  bool dRestDone;
+  bool dRestSkipped;
+  unsigned long dRestStartedAt;
+  bool coldCrashDone;
+  bool coldCrashSkipped;
+  unsigned long coldCrashStartedAt;
+  bool packageDone;
+  bool packageSkipped;
+  unsigned long packagedAt;
 };
 
 struct YeastPerformanceSummary {
@@ -58,13 +78,20 @@ public:
   static void profilePath(const char* batchId, char* buffer, size_t bufferSize);
   static void targetPath(const char* batchId, char* buffer, size_t bufferSize);
   static void logPath(const char* batchId, char* buffer, size_t bufferSize);
+  static void eventsPath(const char* batchId, char* buffer, size_t bufferSize);
+  static void activeBatchPath(char* buffer, size_t bufferSize);
   static bool ensureBatchDirectory(const char* batchId);
   static bool save(const BrewProfile& profile);
   static bool load(const char* batchId, BrewProfile* profile);
   static bool loadFromPath(const char* path, BrewProfile* profile);
+  static bool saveActiveBatchId(const char* batchId);
+  static bool loadActiveBatchId(char* batchId, size_t bufferSize);
+  static bool clearActiveBatchId();
   static void saveYeastHistory(const char* yeastName);
   static int loadYeastHistory(char names[][32], int maxNames);
   static bool appendYeastPerformance(const YeastPerformanceSummary& summary);
+  static bool appendBatchEvent(const char* batchId, unsigned long epoch, const char* eventType,
+                               const char* message, float value);
 };
 
 #endif

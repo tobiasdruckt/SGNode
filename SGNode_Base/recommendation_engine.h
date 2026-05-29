@@ -11,6 +11,7 @@ struct Recommendation {
 
 class RecommendationEngine {
 public:
+  static Recommendation sensorIssue(const char* detail);
   static Recommendation build(FermentationPhase phase, bool ogVerified, bool ogWarning,
                               float attenuation, float expectedFG, float currentSG);
   static Recommendation build(const BrewProfile& profile, FermentationPhase phase,

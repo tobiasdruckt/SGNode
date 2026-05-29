@@ -27,11 +27,14 @@ FermentationPhase FermentationStateMachine::update(float currentSG, float expect
   if (currentPhase == FERMENTATION_PITCHED && nowEpoch - firstDataEpoch >= 1800UL) currentPhase = FERMENTATION_LAG_PHASE;
   if ((currentPhase == FERMENTATION_PITCHED || currentPhase == FERMENTATION_LAG_PHASE) && activelyDropping) currentPhase = FERMENTATION_ACTIVE;
 
-  if (currentPhase == FERMENTATION_ACTIVE && diacetylRestEnabled && attenuation >= 70.0f) {
+  if (diacetylRestEnabled && attenuation >= 70.0f) {
     currentPhase = FERMENTATION_DIACETYL_REST_READY;
   }
 
-  if ((currentPhase == FERMENTATION_ACTIVE || currentPhase == FERMENTATION_DIACETYL_REST_READY) && nearFG && stable) {
+  bool canBecomeStable = currentPhase == FERMENTATION_ACTIVE ||
+                         currentPhase == FERMENTATION_DIACETYL_REST_READY ||
+                         (attenuation >= 60.0f && nearFG);
+  if (canBecomeStable && nearFG && stable) {
     if (stableSinceEpoch == 0) stableSinceEpoch = nowEpoch;
     if (nowEpoch - stableSinceEpoch >= 24UL * 3600UL) currentPhase = FERMENTATION_FINAL_GRAVITY_STABLE;
   } else if (!stable || !nearFG) {
@@ -82,11 +85,14 @@ FermentationPhase FermentationStateMachine::update(const BrewProfile& profile, f
   if ((currentPhase == FERMENTATION_PITCHED || currentPhase == FERMENTATION_LAG_PHASE) && activelyDropping) currentPhase = FERMENTATION_ACTIVE;
 
   bool shouldAutoRest = profile.diacetylRestRecommendedByYeast || profile.diacetylRestEnabled;
-  if (currentPhase == FERMENTATION_ACTIVE && shouldAutoRest && attenuation >= dRestTrigger) {
+  if (shouldAutoRest && attenuation >= dRestTrigger) {
     currentPhase = FERMENTATION_DIACETYL_REST_READY;
   }
 
-  if ((currentPhase == FERMENTATION_ACTIVE || currentPhase == FERMENTATION_DIACETYL_REST_READY) && nearFG && stable) {
+  bool canBecomeStable = currentPhase == FERMENTATION_ACTIVE ||
+                         currentPhase == FERMENTATION_DIACETYL_REST_READY ||
+                         (attenuation >= 60.0f && nearFG);
+  if (canBecomeStable && nearFG && stable) {
     if (stableSinceEpoch == 0) stableSinceEpoch = nowEpoch;
     if (nowEpoch - stableSinceEpoch >= 24UL * 3600UL) currentPhase = FERMENTATION_FINAL_GRAVITY_STABLE;
   } else if (!stable || !nearFG) {
