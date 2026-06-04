@@ -9,6 +9,8 @@ void FermentationStateMachine::reset() {
   currentPhase = FERMENTATION_IDLE;
   stableSinceEpoch = 0;
   firstDataEpoch = 0;
+  activePeakSG = 0.0f;
+  activeDropCount = 0;
 }
 
 FermentationPhase FermentationStateMachine::update(float currentSG, float expectedFG, float attenuation,
@@ -22,10 +24,16 @@ FermentationPhase FermentationStateMachine::update(float currentSG, float expect
   bool nearFG = currentSG <= expectedFG + 0.004f;
   bool stable = absSlope <= 0.00008f;
   bool activelyDropping = gravityDeltaPerHour < -0.00015f;
+  if (activePeakSG <= 1.0f || currentSG > activePeakSG) activePeakSG = currentSG;
+  float dropFromPeak = activePeakSG - currentSG;
 
   if (currentPhase == FERMENTATION_IDLE) currentPhase = FERMENTATION_PITCHED;
   if (currentPhase == FERMENTATION_PITCHED && nowEpoch - firstDataEpoch >= 1800UL) currentPhase = FERMENTATION_LAG_PHASE;
-  if ((currentPhase == FERMENTATION_PITCHED || currentPhase == FERMENTATION_LAG_PHASE) && activelyDropping) currentPhase = FERMENTATION_ACTIVE;
+  if (currentPhase == FERMENTATION_PITCHED || currentPhase == FERMENTATION_LAG_PHASE) {
+    if (activelyDropping && dropFromPeak >= 0.0012f) activeDropCount++;
+    else if (gravityDeltaPerHour > -0.00003f) activeDropCount = 0;
+    if (activeDropCount >= 2 || (activelyDropping && dropFromPeak >= 0.0025f)) currentPhase = FERMENTATION_ACTIVE;
+  }
 
   if (diacetylRestEnabled && attenuation >= 70.0f) {
     currentPhase = FERMENTATION_DIACETYL_REST_READY;
@@ -77,12 +85,18 @@ FermentationPhase FermentationStateMachine::update(const BrewProfile& profile, f
   bool nearFG = currentSG <= expectedFG + 0.004f;
   bool stable = absSlope <= 0.00008f;
   bool activelyDropping = gravityDeltaPerHour < -activeThreshold;
+  if (activePeakSG <= 1.0f || currentSG > activePeakSG) activePeakSG = currentSG;
+  float dropFromPeak = activePeakSG - currentSG;
   unsigned long lagSeconds = (unsigned long)(profile.lagPhaseHours * 3600.0f);
   if (lagSeconds < 1800UL) lagSeconds = 1800UL;
 
   if (currentPhase == FERMENTATION_IDLE) currentPhase = FERMENTATION_PITCHED;
   if (currentPhase == FERMENTATION_PITCHED && nowEpoch - firstDataEpoch >= lagSeconds) currentPhase = FERMENTATION_LAG_PHASE;
-  if ((currentPhase == FERMENTATION_PITCHED || currentPhase == FERMENTATION_LAG_PHASE) && activelyDropping) currentPhase = FERMENTATION_ACTIVE;
+  if (currentPhase == FERMENTATION_PITCHED || currentPhase == FERMENTATION_LAG_PHASE) {
+    if (activelyDropping && dropFromPeak >= 0.0012f) activeDropCount++;
+    else if (gravityDeltaPerHour > -0.00003f) activeDropCount = 0;
+    if (activeDropCount >= 2 || (activelyDropping && dropFromPeak >= 0.0025f)) currentPhase = FERMENTATION_ACTIVE;
+  }
 
   bool shouldAutoRest = profile.diacetylRestRecommendedByYeast || profile.diacetylRestEnabled;
   if (shouldAutoRest && attenuation >= dRestTrigger) {

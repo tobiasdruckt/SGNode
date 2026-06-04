@@ -1,7 +1,7 @@
 #ifndef ETA_PREDICTOR_H
 #define ETA_PREDICTOR_H
 
-#include "brew_profile.h"
+#include "../domain/brew_profile.h"
 #include <stdint.h>
 
 struct ETAResult {

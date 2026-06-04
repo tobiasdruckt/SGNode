@@ -3,8 +3,8 @@
 
 #include <Arduino.h>
 #include <TFT_eSPI.h>
-#include "brew_profile.h"
-#include "yeast_preset.h"
+#include "../domain/brew_profile.h"
+#include "../domain/yeast_preset.h"
 
 enum BrewWizardStep {
   WIZARD_BATCH_NAME,

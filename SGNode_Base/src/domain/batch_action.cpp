@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+static const unsigned long COLD_CRASH_DURATION_SECONDS = 48UL * 3600UL;
+
 static bool styleIsHoppy(const char* style) {
   if (!style) return false;
   return strcmp(style, "IPA") == 0 ||
@@ -76,11 +78,16 @@ BatchAction BatchActionEngine::evaluate(const BrewProfile& profile, Fermentation
     }
     if (currentSG > triggerSG && gravityDeltaPerHour < -0.00001f) {
       float hours = (currentSG - triggerSG) / (-gravityDeltaPerHour);
-      if (hours > 0.0f && hours < 240.0f) {
+      if (hours > 0.0f && hours <= 12.0f && currentSG - triggerSG <= 0.012f) {
         char msg[80];
         snprintf(msg, sizeof(msg), "Dry hop at SG %.3f", triggerSG);
         return makeFutureAction(ACTION_DRY_HOP, 100, "Dry Hop", msg, (unsigned long)(hours * 3600.0f));
       }
+    }
+    if (currentSG > triggerSG) {
+      char msg[80];
+      snprintf(msg, sizeof(msg), "Dry hop later at SG %.3f", triggerSG);
+      return makeFutureAction(ACTION_DRY_HOP, 100, "Dry Hop", msg, 0);
     }
   }
 
@@ -104,9 +111,18 @@ BatchAction BatchActionEngine::evaluate(const BrewProfile& profile, Fermentation
     return makeAction(ACTION_COLD_CRASH, 110, "Cold Crash", "Gravity is stable");
   }
 
-  if (!profile.packageDone && !profile.packageSkipped &&
-      (phase == FERMENTATION_READY_TO_PACKAGE || profile.coldCrashDone || profile.coldCrashSkipped)) {
-    return makeAction(ACTION_PACKAGE, 120, "Package", "Ready for packaging");
+  if (!profile.packageDone && !profile.packageSkipped) {
+    if (profile.coldCrashDone && profile.coldCrashStartedAt > 0 &&
+        nowEpoch > 0 && nowEpoch < profile.coldCrashStartedAt + COLD_CRASH_DURATION_SECONDS) {
+      return makeFutureAction(ACTION_PACKAGE, 120, "Package", "Cold crash in progress",
+                              profile.coldCrashStartedAt + COLD_CRASH_DURATION_SECONDS - nowEpoch);
+    }
+    bool coldCrashElapsed = profile.coldCrashDone &&
+                            profile.coldCrashStartedAt > 0 &&
+                            nowEpoch >= profile.coldCrashStartedAt + COLD_CRASH_DURATION_SECONDS;
+    if (profile.coldCrashSkipped || coldCrashElapsed) {
+      return makeAction(ACTION_PACKAGE, 120, "Package", "Ready for packaging");
+    }
   }
 
   BatchAction none = makeAction(ACTION_NONE, 0, "Next", "No action required");
@@ -175,7 +191,7 @@ const char* BatchActionEngine::eventName(BatchActionType type, bool done) {
     case ACTION_D_REST: return done ? "D_REST_DONE" : "D_REST_SKIPPED";
     case ACTION_DRY_HOP: return done ? "DRY_HOP_DONE" : "DRY_HOP_SKIPPED";
     case ACTION_REMOVE_DRY_HOP: return done ? "DRY_HOP_REMOVED" : "DRY_HOP_REMOVE_SKIPPED";
-    case ACTION_COLD_CRASH: return done ? "COLD_CRASH_DONE" : "COLD_CRASH_SKIPPED";
+    case ACTION_COLD_CRASH: return done ? "COLD_CRASH_STARTED" : "COLD_CRASH_SKIPPED";
     case ACTION_PACKAGE: return done ? "PACKAGE_DONE" : "PACKAGE_SKIPPED";
     default: return done ? "ACTION_DONE" : "ACTION_SKIPPED";
   }

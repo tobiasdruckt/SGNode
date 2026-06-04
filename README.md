@@ -54,16 +54,12 @@ See [hardware.md](hardware.md) and [WIRING_DIAGRAM.md](WIRING_DIAGRAM.md) for pi
 ```text
 SGNode_Base/
   SGNode_Base.ino                 Base station firmware and UI orchestration
-  brew_profile.*                  Batch model and SD persistence
-  brew_wizard_controller.*         Native Brew Wizard flow
-  yeast_preset*                   Built-in and custom yeast presets
-  target_curve.*                  Expected fermentation curves
-  fermentation_state_machine.*     Phase detection
-  recommendation_engine.*         On-device recommendations
-  eta_predictor.*                 Packaging ETA
-  derived_calculations.*          FG, attenuation, ABV, rates
-  og_verifier.*                   Recipe vs measured OG logic
-  ui_*                            Shared touchscreen UI helpers
+  src/
+    assets/                       Boot logo data
+    calculations/                 Brix, gravity, ETA, OG, and target curve logic
+    domain/                       Batch model, yeast presets, state, and recommendations
+    test/                         Optional serial UI test harness
+    ui/                           Brew Wizard and shared touchscreen UI helpers
 
 SGNode_Float/
   SGNode_Float.ino                Float firmware

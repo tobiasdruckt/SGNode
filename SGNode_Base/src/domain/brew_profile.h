@@ -20,6 +20,7 @@ struct BrewProfile {
   float estimatedABV;
   bool diacetylRestEnabled;
   unsigned long createdAt;
+  unsigned long fermentationStartAt;
   bool ogVerified;
   bool ogNeedsChoice;
   bool autoModeEnabled;

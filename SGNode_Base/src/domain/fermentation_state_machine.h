@@ -32,6 +32,8 @@ private:
   FermentationPhase currentPhase;
   unsigned long stableSinceEpoch;
   unsigned long firstDataEpoch;
+  float activePeakSG;
+  int activeDropCount;
 };
 
 #endif

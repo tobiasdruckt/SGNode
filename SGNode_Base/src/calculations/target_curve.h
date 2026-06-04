@@ -1,7 +1,7 @@
 #ifndef TARGET_CURVE_H
 #define TARGET_CURVE_H
 
-#include "brew_profile.h"
+#include "../domain/brew_profile.h"
 
 class TargetCurveGenerator {
 public:

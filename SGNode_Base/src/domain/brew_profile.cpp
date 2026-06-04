@@ -80,6 +80,7 @@ void BrewProfileStore::setDefaults(BrewProfile* profile) {
   profile->estimatedABV = 0.0f;
   profile->diacetylRestEnabled = false;
   profile->createdAt = 0;
+  profile->fermentationStartAt = 0;
   profile->ogVerified = false;
   profile->ogNeedsChoice = false;
   profile->autoModeEnabled = true;
@@ -213,6 +214,7 @@ bool BrewProfileStore::save(const BrewProfile& profile) {
   file.printf("  \"estimatedABV\":%.2f,\n", profile.estimatedABV);
   file.printf("  \"diacetylRestEnabled\":%s,\n", profile.diacetylRestEnabled ? "true" : "false");
   file.printf("  \"createdAt\":%lu,\n", profile.createdAt);
+  file.printf("  \"fermentationStartAt\":%lu,\n", profile.fermentationStartAt);
   file.printf("  \"ogVerified\":%s,\n", profile.ogVerified ? "true" : "false");
   file.printf("  \"ogNeedsChoice\":%s,\n", profile.ogNeedsChoice ? "true" : "false");
   file.printf("  \"autoModeEnabled\":%s,\n", profile.autoModeEnabled ? "true" : "false");
@@ -287,6 +289,7 @@ bool BrewProfileStore::loadFromPath(const char* path, BrewProfile* profile) {
   profile->estimatedABV = extractFloat(json, "estimatedABV", profile->estimatedABV);
   profile->diacetylRestEnabled = extractBool(json, "diacetylRestEnabled", profile->diacetylRestEnabled);
   profile->createdAt = extractULong(json, "createdAt", profile->createdAt);
+  profile->fermentationStartAt = extractULong(json, "fermentationStartAt", profile->fermentationStartAt);
   profile->ogVerified = extractBool(json, "ogVerified", profile->ogVerified);
   profile->ogNeedsChoice = extractBool(json, "ogNeedsChoice", profile->ogNeedsChoice);
   profile->autoModeEnabled = extractBool(json, "autoModeEnabled", profile->autoModeEnabled);

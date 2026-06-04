@@ -1,8 +1,8 @@
 #include "brew_wizard_controller.h"
-#include "brix_converter.h"
-#include "derived_calculations.h"
-#include "yeast_preset_repository.h"
-#include "batch_action.h"
+#include "../calculations/brix_converter.h"
+#include "../calculations/derived_calculations.h"
+#include "../domain/yeast_preset_repository.h"
+#include "../domain/batch_action.h"
 #include "ui_tokens.h"
 #include "ui_components.h"
 #include <string.h>

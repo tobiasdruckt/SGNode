@@ -8,6 +8,22 @@ static float clamp01(float v) {
   return v;
 }
 
+static float fermentationStartOffsetHours(const BrewProfile& profile) {
+  if (profile.createdAt == 0 || profile.fermentationStartAt == 0 ||
+      profile.fermentationStartAt <= profile.createdAt) {
+    return 0.0f;
+  }
+  float offset = (profile.fermentationStartAt - profile.createdAt) / 3600.0f;
+  if (offset < 0.0f) offset = 0.0f;
+  if (offset > 168.0f) offset = 168.0f;
+  return offset;
+}
+
+static float modelHourForChartHour(const BrewProfile& profile, float chartHour) {
+  float modelHour = chartHour - fermentationStartOffsetHours(profile);
+  return modelHour > 0.0f ? modelHour : 0.0f;
+}
+
 static void curveParams(const BrewProfile& profile, float* lagH, float* activeH, float* finishH, float* activeShare) {
   *lagH = profile.autoModeEnabled && profile.lagPhaseHours > 0.0f ? profile.lagPhaseHours : 8.0f;
   float totalH = profile.autoModeEnabled && profile.typicalDurationHours > 0.0f ? profile.typicalDurationHours : 144.0f;
@@ -85,18 +101,22 @@ bool TargetCurveGenerator::generateAndSave(const BrewProfile& profile) {
   file.print("  \"curveTemplate\":\""); file.print(profile.curveTemplate); file.println("\",");
   file.printf("  \"lagPhaseHours\":%.1f,\n", profile.lagPhaseHours);
   file.printf("  \"typicalDurationHours\":%.1f,\n", profile.typicalDurationHours);
+  file.printf("  \"fermentationStartAt\":%lu,\n", profile.fermentationStartAt);
+  file.printf("  \"startOffsetHours\":%.2f,\n", fermentationStartOffsetHours(profile));
   file.println("  \"model\":[\"lag\",\"active\",\"slow_finish\",\"stable_fg\"],");
   file.println("  \"points\":[");
+  float startOffset = fermentationStartOffsetHours(profile);
   int maxHour = profile.autoModeEnabled && profile.typicalDurationHours > 0.0f
-    ? (int)(profile.typicalDurationHours + 48.0f)
+    ? (int)(profile.typicalDurationHours + 48.0f + startOffset)
     : 240;
   if (maxHour < 96) maxHour = 96;
   if (maxHour > 384) maxHour = 384;
   for (int hour = 0; hour <= maxHour; hour += 6) {
+    float modelHour = modelHourForChartHour(profile, (float)hour);
     file.printf("    {\"hour\":%d,\"gravity\":%.5f,\"apparentAttenuation\":%.2f}%s\n",
                 hour,
-                expectedGravityAtHour(profile, (float)hour),
-                expectedAttenuationAtHour(profile, (float)hour),
+                expectedGravityAtHour(profile, modelHour),
+                expectedAttenuationAtHour(profile, modelHour),
                 hour + 6 <= maxHour ? "," : "");
   }
   file.println("  ]");

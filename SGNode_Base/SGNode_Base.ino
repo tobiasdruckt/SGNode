@@ -20,20 +20,20 @@
 #include <EEPROM.h>
 #include <time.h>
 #include <sys/time.h>
-#include "Logo2_Optimized.h"
-#include "ui_tokens.h"
-#include "ui_components.h"
-#include "brew_profile.h"
-#include "brew_wizard_controller.h"
-#include "brix_converter.h"
-#include "og_verifier.h"
-#include "derived_calculations.h"
-#include "target_curve.h"
-#include "fermentation_state_machine.h"
-#include "recommendation_engine.h"
-#include "eta_predictor.h"
-#include "batch_action.h"
-#include "yeast_preset_repository.h"
+#include "src/assets/Logo2_Optimized.h"
+#include "src/ui/ui_tokens.h"
+#include "src/ui/ui_components.h"
+#include "src/domain/brew_profile.h"
+#include "src/ui/brew_wizard_controller.h"
+#include "src/calculations/brix_converter.h"
+#include "src/calculations/og_verifier.h"
+#include "src/calculations/derived_calculations.h"
+#include "src/calculations/target_curve.h"
+#include "src/domain/fermentation_state_machine.h"
+#include "src/domain/recommendation_engine.h"
+#include "src/calculations/eta_predictor.h"
+#include "src/domain/batch_action.h"
+#include "src/domain/yeast_preset_repository.h"
 #ifndef SGNODE_UI_TEST_HARNESS
 #define SGNODE_UI_TEST_HARNESS 0  // Debug-only serial UI harness. Keep disabled for production builds.
 #endif
@@ -44,9 +44,9 @@
 #ifndef SGNODE_BATTERY_DEBUG
 #define SGNODE_BATTERY_DEBUG 0  // Tiny serial diagnostics for battery/history checks. Disabled in production.
 #endif
-#include "ui_test_harness.h"
+#include "src/test/ui_test_harness.h"
 #include "../SGNode_Shared/sg_protocol.h"
-#include "../SGNode_Base/polynomial_calibration.h"
+#include "src/calculations/polynomial_calibration.h"
 
 #define ACK_PACKET_TYPE 0xA5
 
@@ -426,6 +426,8 @@ bool uiTestMockTempSet = false;
 unsigned long lastUpdate = 0;
 unsigned long lastTouchCheck = 0;
 const unsigned long TOUCH_CHECK_INTERVAL = 50; // ms
+unsigned long lastTopbarRefresh = 0;
+const unsigned long TOPBAR_REFRESH_INTERVAL = 10000; // ms
 
 // Button areas for touch interface
 #define BUTTON_LIVE_X 10
@@ -655,6 +657,12 @@ void drawBrewWizardScreen();
 void drawOGVerificationScreen();
 void drawTargetVsActualChart();
 float targetChartHours();
+float targetStartOffsetHours();
+unsigned long fermentationElapsedSecondsAt(unsigned long epoch);
+float targetModelHourForChartHour(float chartHour);
+float targetChartHourForModelHour(float modelHour);
+float expectedTargetSGAtChartHour(float chartHour);
+float currentTemperatureTargetC(unsigned long nowEpoch);
 float targetHourForSG(float targetSG, float chartHours);
 float targetHourForAttenuation(float attenuationPercent, float chartHours);
 float eventHourFromEpoch(unsigned long eventEpoch);
@@ -726,6 +734,8 @@ void loadManagedBatches();
 bool handleManageBrewTouch(int x, int y);
 void updateFermentationAssistant(payload_t data, uint32_t epoch_s);
 void refreshFermentationAssistantFromProfile();
+float smoothedGravityDeltaPerHour(int maxReadings);
+bool migrateActiveBrewProfileFromHistory(const char* logPath);
 void finalizeHistoricalDataLoad();
 void markScreenDirtyForFloatData();
 void clearHistoricalDisplayData();
@@ -736,6 +746,13 @@ void formatDurationShort(unsigned long seconds, char* buffer, size_t bufferSize)
 void handleOGChoice(bool useMeasuredOG);
 void saveYeastPerformanceSummary(float finalGravity, uint32_t completedAt);
 void refreshCurrentBatchAction(float currentSG, unsigned long nowEpoch);
+BatchAction evaluateBatchActionWithHysteresis(FermentationPhase phase, float attenuation,
+                                              float currentSG, float gravityDeltaPerHour,
+                                              unsigned long nowEpoch);
+bool shouldKeepDryHopActionLatched(const BatchAction& previousAction,
+                                   const BatchAction& nextAction,
+                                   float currentSG, float gravityDeltaPerHour);
+BatchAction makeLatchedDryHopAction(float currentSG);
 void handleCurrentActionChoice(bool done);
 void formatActionHeader(char* buffer, size_t bufferSize);
 uint8_t calculateBatteryPercentage(float voltage);
@@ -852,6 +869,11 @@ void loop() {
   
   // Check wait timeout for calibration
   checkWaitTimeout();
+
+  if (millis() - lastTopbarRefresh >= TOPBAR_REFRESH_INTERVAL) {
+    topbarDirty = true;
+    lastTopbarRefresh = millis();
+  }
   
   // Check if it's safe to perform SD operations (no recent touch activity)
   if (isSafeForSDOperation() && (millis() - lastSDWrite) > SD_WRITE_INTERVAL) {
@@ -863,8 +885,8 @@ void loop() {
   if (screenDirty) {
     drawCurrentScreen();
     screenDirty = false;
-  } else if (displayDataCount > 0) {
-    // Update topbar if battery changed for all views
+  } else {
+    // Update topbar periodically so date/time and status stay current.
     if (topbarDirty) {
       uint8_t battPercent = 0;
       float latestVoltage = 0.0f;
@@ -877,7 +899,7 @@ void loop() {
       switch (currentMode) {
         case LIVE_VIEW:
           title = "Live";
-          updateLiveViewDynamic();
+          if (displayDataCount > 0) updateLiveViewDynamic();
           break;
         case GRAPH_VIEW:
           title = "Graph";
@@ -1948,8 +1970,9 @@ void drawDashboardScreen() {
   tft.setFreeFont(FONT_SIZE_XS);
   tft.setCursor(tempX + 10, contextY + 14);
   tft.print("Temp");
-  if (hasData) snprintf(text, sizeof(text), "%.1f C  |  ETA %d%%", latest.temperature, currentETA.confidencePercent);
-  else snprintf(text, sizeof(text), "--  |  ETA --");
+  float tempTarget = currentTemperatureTargetC(getCurrentEpoch());
+  if (hasData) snprintf(text, sizeof(text), "%.1f C | Set %.1f C", latest.temperature, tempTarget);
+  else snprintf(text, sizeof(text), "-- | Set %.1f C", tempTarget);
   tft.setTextColor(uiColorTextPrimary);
   tft.setCursor(tempX + 10, contextY + 30);
   tft.print(text);
@@ -2471,6 +2494,7 @@ void copyManagedBatch(const char* batchId) {
     strncpy(p.batchName, copiedName, sizeof(p.batchName) - 1);
     p.batchName[sizeof(p.batchName) - 1] = '\0';
     p.createdAt = getCurrentEpoch();
+    p.fermentationStartAt = 0;
     p.completed = false;
     p.completedAt = 0;
     p.dryHopDone = false;
@@ -2763,20 +2787,94 @@ void drawOGVerificationScreen() {
 }
 
 float targetChartHours() {
+  float startOffset = targetStartOffsetHours();
   float chartHours = activeBrewProfile.autoModeEnabled && activeBrewProfile.typicalDurationHours > 0.0f
-    ? activeBrewProfile.typicalDurationHours + 48.0f
+    ? activeBrewProfile.typicalDurationHours + 48.0f + startOffset
     : 240.0f;
   if (chartHours < 96.0f) chartHours = 96.0f;
   if (chartHours > 384.0f) chartHours = 384.0f;
   return chartHours;
 }
 
+float targetStartOffsetHours() {
+  if (!brewProfileLoaded) return 0.0f;
+  if (!isEpochValid(activeBrewProfile.createdAt) ||
+      !isEpochValid(activeBrewProfile.fermentationStartAt) ||
+      activeBrewProfile.fermentationStartAt <= activeBrewProfile.createdAt) {
+    return 0.0f;
+  }
+  float offset = (activeBrewProfile.fermentationStartAt - activeBrewProfile.createdAt) / 3600.0f;
+  if (offset < 0.0f) offset = 0.0f;
+  if (offset > 168.0f) offset = 168.0f;
+  return offset;
+}
+
+unsigned long fermentationElapsedSecondsAt(unsigned long epoch) {
+  if (!brewProfileLoaded || !isEpochValid(epoch)) return 0;
+  unsigned long startEpoch = activeBrewProfile.createdAt;
+  if (isEpochValid(activeBrewProfile.fermentationStartAt) &&
+      (!isEpochValid(startEpoch) || activeBrewProfile.fermentationStartAt > startEpoch)) {
+    startEpoch = activeBrewProfile.fermentationStartAt;
+  }
+  if (!isEpochValid(startEpoch) || epoch <= startEpoch) return 0;
+  return epoch - startEpoch;
+}
+
+float targetModelHourForChartHour(float chartHour) {
+  float modelHour = chartHour - targetStartOffsetHours();
+  return modelHour > 0.0f ? modelHour : 0.0f;
+}
+
+float targetChartHourForModelHour(float modelHour) {
+  if (modelHour < 0.0f) modelHour = 0.0f;
+  return targetStartOffsetHours() + modelHour;
+}
+
+float expectedTargetSGAtChartHour(float chartHour) {
+  return TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, targetModelHourForChartHour(chartHour));
+}
+
+float currentTemperatureTargetC(unsigned long nowEpoch) {
+  float yeastLow = activeBrewProfile.recommendedTempMinC > 0.0f ? activeBrewProfile.recommendedTempMinC : 18.0f;
+  float yeastHigh = activeBrewProfile.recommendedTempMaxC > yeastLow ? activeBrewProfile.recommendedTempMaxC : yeastLow + 4.0f;
+  float target = (yeastLow + yeastHigh) * 0.5f;
+
+  if (activeBrewProfile.dRestDone && !activeBrewProfile.dRestSkipped) {
+    float dRestTarget = yeastHigh + 2.0f;
+    if (dRestTarget > 29.0f) dRestTarget = 29.0f;
+    float progress = 1.0f;
+    if (isEpochValid(nowEpoch) && isEpochValid(activeBrewProfile.dRestStartedAt) &&
+        nowEpoch < activeBrewProfile.dRestStartedAt + 12UL * 3600UL) {
+      progress = (nowEpoch - activeBrewProfile.dRestStartedAt) / (12.0f * 3600.0f);
+    }
+    if (progress < 0.0f) progress = 0.0f;
+    if (progress > 1.0f) progress = 1.0f;
+    target += (dRestTarget - target) * progress;
+  }
+
+  if (activeBrewProfile.coldCrashDone && !activeBrewProfile.coldCrashSkipped) {
+    const float coldCrashTarget = 2.5f;
+    float progress = 1.0f;
+    if (isEpochValid(nowEpoch) && isEpochValid(activeBrewProfile.coldCrashStartedAt) &&
+        nowEpoch < activeBrewProfile.coldCrashStartedAt + 24UL * 3600UL) {
+      progress = (nowEpoch - activeBrewProfile.coldCrashStartedAt) / (24.0f * 3600.0f);
+    }
+    if (progress < 0.0f) progress = 0.0f;
+    if (progress > 1.0f) progress = 1.0f;
+    target += (coldCrashTarget - target) * progress;
+  }
+  return target;
+}
+
 float targetHourForSG(float targetSG, float chartHours) {
   if (targetSG <= 0.0f || chartHours <= 0.0f) return -1.0f;
+  float startOffset = targetStartOffsetHours();
+  float modelHours = chartHours - startOffset;
+  if (modelHours <= 0.0f) return -1.0f;
   for (int i = 0; i <= 160; i++) {
-    float hour = chartHours * (float)i / 160.0f;
-    float sg = TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, hour);
-    if (sg <= targetSG) return hour;
+    float modelHour = modelHours * (float)i / 160.0f;
+    float sg = TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, modelHour);
+    if (sg <= targetSG) return targetChartHourForModelHour(modelHour);
   }
   return -1.0f;
 }
@@ -2883,11 +2981,7 @@ void drawTargetChartXAxis(int gx, int gy, int gw, int gh, float chartHours) {
     int px = gx + (int)((hour / chartHours) * gw);
     tft.drawFastVLine(px, gy + gh - 3, 4, uiColorBorder);
     char buf[12];
-    if (hour >= 48.0f) {
-      snprintf(buf, sizeof(buf), "%.0fd", hour / 24.0f);
-    } else {
-      snprintf(buf, sizeof(buf), "%.0fh", hour);
-    }
+    snprintf(buf, sizeof(buf), "%.0fh", hour);
     int labelX = px - tft.textWidth(buf) / 2;
     if (labelX < gx) labelX = gx;
     if (labelX + tft.textWidth(buf) > gx + gw) labelX = gx + gw - tft.textWidth(buf);
@@ -2935,7 +3029,7 @@ void drawTargetChartEventMarkers(int gx, int gy, int gw, int gh, float chartHour
     coldHour = eventHourFromEpoch(activeBrewProfile.coldCrashStartedAt);
     if (coldHour < 0.0f) {
       coldHour = activeBrewProfile.typicalDurationHours > 0.0f
-        ? activeBrewProfile.typicalDurationHours
+        ? targetChartHourForModelHour(activeBrewProfile.typicalDurationHours)
         : targetHourForAttenuation((float)activeBrewProfile.expectedApparentAttenuation * 0.98f, chartHours);
     }
     if (removeHour >= 0.0f && coldHour < removeHour + 2.0f) {
@@ -2999,7 +3093,7 @@ void drawTargetVsActualChart() {
   float maxSG = 0.0f;
   for (int i = 0; i <= 40; i++) {
     float hour = chartHours * (float)i / 40.0f;
-    float sg = TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, hour);
+    float sg = expectedTargetSGAtChartHour(hour);
     if (sg < minSG) minSG = sg;
     if (sg > maxSG) maxSG = sg;
   }
@@ -3034,7 +3128,7 @@ void drawTargetVsActualChart() {
   int prevLowerX = -1, prevLowerY = -1;
   for (int i = 0; i <= 60; i++) {
     float hour = chartHours * (float)i / 60.0f;
-    float sg = TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, hour);
+    float sg = expectedTargetSGAtChartHour(hour);
     float progress = chartHours > 0.0f ? hour / chartHours : 0.0f;
     float band = 0.002f;
     if (progress < 0.20f) band = 0.006f;
@@ -3092,14 +3186,6 @@ void drawTargetVsActualChart() {
     prevX = px;
     prevY = py;
   }
-
-  tft.setTextColor(uiColorGold);
-  tft.setFreeFont(FONT_SIZE_XS);
-  tft.setCursor(gx + 6, gy + 14);
-  tft.print("target");
-  tft.setTextColor(uiColorInfo);
-  tft.setCursor(gx + 64, gy + 14);
-  tft.print("actual");
 
   drawTargetChartXAxis(gx, gy, gw, gh, chartHours);
 
@@ -3491,7 +3577,7 @@ void drawGraphForMetric(GraphMetric metric) {
     float coldHour = eventHourFromEpoch(activeBrewProfile.coldCrashStartedAt);
     if (coldHour < 0.0f && !activeBrewProfile.coldCrashSkipped) {
       coldHour = activeBrewProfile.typicalDurationHours > 0.0f
-        ? activeBrewProfile.typicalDurationHours
+        ? targetChartHourForModelHour(activeBrewProfile.typicalDurationHours)
         : targetHourForAttenuation((float)activeBrewProfile.expectedApparentAttenuation * 0.98f, chartHours);
     }
     float dryHopHour = -1.0f;
@@ -3622,7 +3708,7 @@ void drawGraphForMetric(GraphMetric metric) {
       payload_t data = displayDataBuffer[idx];
       uint32_t pointTime = useMetricRtcTime ? timestampForPoint(i) : data.uptime_s;
       float hour = pointTime >= firstMetricTime ? (pointTime - firstMetricTime) / 3600.0f : 0.0f;
-      float targetSG = TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, hour);
+      float targetSG = expectedTargetSGAtChartHour(hour);
       float targetAngle = angleForTargetSG(targetSG);
       int x = graphXForPoint(i, graphX, graphW);
       int y = graphY + graphH - ((targetAngle - minValue) / valueRange * graphH);
@@ -3648,7 +3734,7 @@ void drawGraphForMetric(GraphMetric metric) {
     int prevTargetY = -1;
     for (int i = 0; i <= 80; i++) {
       float hour = chartHours * (float)i / 80.0f;
-      float targetSG = TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, hour);
+      float targetSG = expectedTargetSGAtChartHour(hour);
       float targetAbv = DerivedCalculations::abv(activeBrewProfile.effectiveOG, targetSG);
       int x = graphXForHour(hour, graphX, graphW, chartHours);
       int y = graphY + graphH - ((targetAbv - minValue) / valueRange * graphH);
@@ -6016,7 +6102,7 @@ void updateFermentationAssistant(payload_t data, uint32_t epoch_s) {
         currentMode = OG_VERIFICATION_VIEW;
         screenDirty = true;
       } else {
-        activeBrewProfile.effectiveOG = activeBrewProfile.recipeOG;
+        activeBrewProfile.effectiveOG = activeBrewProfile.measuredOG;
         activeBrewProfile.ogVerified = true;
       }
       persistActiveBrewProfile();
@@ -6048,11 +6134,23 @@ void updateFermentationAssistant(payload_t data, uint32_t epoch_s) {
     fermentationMetrics.gravityDeltaPerHour,
     data.temperature,
     epoch_s);
+  if (activeBrewProfile.fermentationStartAt == 0 &&
+      (phase == FERMENTATION_ACTIVE ||
+       phase == FERMENTATION_DIACETYL_REST_READY ||
+       phase == FERMENTATION_FINAL_GRAVITY_STABLE ||
+       phase == FERMENTATION_READY_TO_PACKAGE) &&
+      isEpochValid(epoch_s) && isEpochValid(activeBrewProfile.createdAt) &&
+      epoch_s >= activeBrewProfile.createdAt) {
+    activeBrewProfile.fermentationStartAt = epoch_s;
+    if (mountSDTemporarily()) {
+      BrewProfileStore::save(activeBrewProfile);
+      TargetCurveGenerator::generateAndSave(activeBrewProfile);
+      dismountSD();
+    }
+  }
 
   unsigned long elapsedSeconds = 0;
-  if (isEpochValid(epoch_s) && isEpochValid(activeBrewProfile.createdAt) && epoch_s > activeBrewProfile.createdAt) {
-    elapsedSeconds = epoch_s - activeBrewProfile.createdAt;
-  }
+  elapsedSeconds = fermentationElapsedSecondsAt(epoch_s);
 
   currentRecommendation = RecommendationEngine::build(
     activeBrewProfile,
@@ -6065,12 +6163,11 @@ void updateFermentationAssistant(payload_t data, uint32_t epoch_s) {
     data.temperature,
     fermentationMetrics.gravityDeltaPerHour,
     elapsedSeconds);
-  currentBatchAction = BatchActionEngine::evaluate(
-    activeBrewProfile,
+  currentBatchAction = evaluateBatchActionWithHysteresis(
     phase,
     fermentationMetrics.currentAttenuation,
     data.density,
-    fermentationMetrics.gravityDeltaPerHour,
+    smoothedGravityDeltaPerHour(9),
     epoch_s);
   if (currentBatchAction.type != ACTION_NONE) {
     currentRecommendation.code = currentBatchAction.code;
@@ -6082,7 +6179,7 @@ void updateFermentationAssistant(payload_t data, uint32_t epoch_s) {
     currentRecommendation.message[sizeof(currentRecommendation.message) - 1] = '\0';
   }
   currentETA = ETAPredictor::predict(activeBrewProfile, data.density, fermentationMetrics.expectedFinalGravity,
-                                     fermentationMetrics.gravityDeltaPerHour, elapsedSeconds);
+                                     smoothedGravityDeltaPerHour(9), elapsedSeconds);
 
   if (!yeastPerformanceSaved &&
       (phase == FERMENTATION_READY_TO_PACKAGE || phase == FERMENTATION_COMPLETED)) {
@@ -6102,12 +6199,11 @@ void refreshCurrentBatchAction(float currentSG, unsigned long nowEpoch) {
     strcpy(currentBatchAction.message, "No active batch");
     return;
   }
-  currentBatchAction = BatchActionEngine::evaluate(
-    activeBrewProfile,
+  currentBatchAction = evaluateBatchActionWithHysteresis(
     fermentationStateMachine.phase(),
     fermentationMetrics.currentAttenuation,
     currentSG,
-    fermentationMetrics.gravityDeltaPerHour,
+    smoothedGravityDeltaPerHour(9),
     nowEpoch);
   if (currentBatchAction.type != ACTION_NONE) {
     currentRecommendation.code = currentBatchAction.code;
@@ -6121,6 +6217,91 @@ void refreshCurrentBatchAction(float currentSG, unsigned long nowEpoch) {
     strncpy(currentRecommendation.message, currentBatchAction.message, sizeof(currentRecommendation.message) - 1);
     currentRecommendation.message[sizeof(currentRecommendation.message) - 1] = '\0';
   }
+}
+
+BatchAction evaluateBatchActionWithHysteresis(FermentationPhase phase, float attenuation,
+                                              float currentSG, float gravityDeltaPerHour,
+                                              unsigned long nowEpoch) {
+  BatchAction nextAction = BatchActionEngine::evaluate(
+    activeBrewProfile,
+    phase,
+    attenuation,
+    currentSG,
+    gravityDeltaPerHour,
+    nowEpoch);
+  if (shouldKeepDryHopActionLatched(currentBatchAction, nextAction, currentSG, gravityDeltaPerHour)) {
+    return makeLatchedDryHopAction(currentSG);
+  }
+  return nextAction;
+}
+
+bool shouldKeepDryHopActionLatched(const BatchAction& previousAction,
+                                   const BatchAction& nextAction,
+                                   float currentSG, float gravityDeltaPerHour) {
+  if (!brewProfileLoaded || !activeBrewProfile.dryHopEnabled ||
+      activeBrewProfile.dryHopDone || activeBrewProfile.dryHopSkipped) {
+    return false;
+  }
+  if (previousAction.type != ACTION_DRY_HOP || !previousAction.requiresChoice) {
+    return false;
+  }
+  if (nextAction.type == ACTION_D_REST || nextAction.type == ACTION_VERIFY_OG) {
+    return false;
+  }
+  if (nextAction.type == ACTION_DRY_HOP && nextAction.requiresChoice) {
+    return false;
+  }
+
+  float triggerSG = activeBrewProfile.dryHopTriggerSG > 0.0f ? activeBrewProfile.dryHopTriggerSG : 1.014f;
+  float fgBasedTrigger = activeBrewProfile.expectedFinalGravity > 1.0f
+    ? activeBrewProfile.expectedFinalGravity + 0.004f
+    : triggerSG;
+  if (fgBasedTrigger > triggerSG) triggerSG = fgBasedTrigger;
+
+  const float releaseBandSG = 0.004f;
+  const float fastRisePerHour = 0.00010f;
+  if (currentSG > triggerSG + releaseBandSG && gravityDeltaPerHour > fastRisePerHour) {
+    return false;
+  }
+  return currentSG <= triggerSG + releaseBandSG;
+}
+
+BatchAction makeLatchedDryHopAction(float currentSG) {
+  BatchAction action;
+  memset(&action, 0, sizeof(action));
+  action.type = ACTION_DRY_HOP;
+  action.code = 100;
+  action.requiresChoice = true;
+  strncpy(action.title, "Dry Hop", sizeof(action.title) - 1);
+  snprintf(action.message, sizeof(action.message), "Add dry hops now, SG %.3f", currentSG);
+  return action;
+}
+
+float smoothedGravityDeltaPerHour(int maxReadings) {
+  if (displayDataCount < 3) return fermentationMetrics.gravityDeltaPerHour;
+  if (maxReadings < 3) maxReadings = 3;
+  if (maxReadings > displayDataCount) maxReadings = displayDataCount;
+
+  int latestPoint = displayDataCount - 1;
+  int earliestPoint = displayDataCount - maxReadings;
+  int latestIdx = displayBufferIndexForPoint(latestPoint);
+  int earliestIdx = displayBufferIndexForPoint(earliestPoint);
+  uint32_t latestEpoch = timestampForPoint(latestPoint);
+  uint32_t earliestEpoch = timestampForPoint(earliestPoint);
+
+  if (isEpochValid(latestEpoch) && isEpochValid(earliestEpoch) && latestEpoch > earliestEpoch) {
+    float delta = displayDataBuffer[latestIdx].density - displayDataBuffer[earliestIdx].density;
+    return delta * 3600.0f / (float)(latestEpoch - earliestEpoch);
+  }
+
+  uint32_t latestUptime = displayDataBuffer[latestIdx].uptime_s;
+  uint32_t earliestUptime = displayDataBuffer[earliestIdx].uptime_s;
+  if (latestUptime > earliestUptime) {
+    float delta = displayDataBuffer[latestIdx].density - displayDataBuffer[earliestIdx].density;
+    return delta * 3600.0f / (float)(latestUptime - earliestUptime);
+  }
+
+  return fermentationMetrics.gravityDeltaPerHour;
 }
 
 void refreshFermentationAssistantFromProfile() {
@@ -6144,9 +6325,7 @@ void refreshFermentationAssistantFromProfile() {
 
   unsigned long elapsedSeconds = 0;
   uint32_t nowEpoch = getCurrentEpoch();
-  if (isEpochValid(nowEpoch) && isEpochValid(activeBrewProfile.createdAt) && nowEpoch > activeBrewProfile.createdAt) {
-    elapsedSeconds = nowEpoch - activeBrewProfile.createdAt;
-  }
+  elapsedSeconds = fermentationElapsedSecondsAt(nowEpoch);
 
   FermentationPhase phase = fermentationStateMachine.update(
     activeBrewProfile,
@@ -6176,6 +6355,101 @@ void refreshFermentationAssistantFromProfile() {
     0.0f,
     elapsedSeconds);
   refreshCurrentBatchAction(activeBrewProfile.effectiveOG, nowEpoch);
+}
+
+bool migrateActiveBrewProfileFromHistory(const char* logPath) {
+  if (!brewProfileLoaded || !logPath || logPath[0] == '\0') return false;
+
+  bool changed = false;
+
+  if (activeBrewProfile.measuredOG > 1.0f &&
+      !activeBrewProfile.ogNeedsChoice &&
+      !OGVerifier::exceedsThreshold(activeBrewProfile.measuredOG - activeBrewProfile.recipeOG) &&
+      fabs(activeBrewProfile.effectiveOG - activeBrewProfile.measuredOG) > 0.0005f) {
+    activeBrewProfile.ogDifference = activeBrewProfile.measuredOG - activeBrewProfile.recipeOG;
+    activeBrewProfile.effectiveOG = activeBrewProfile.measuredOG;
+    activeBrewProfile.ogVerified = true;
+    changed = true;
+  }
+
+  if (isEpochValid(activeBrewProfile.createdAt) &&
+      SD.exists(logPath)) {
+    File file = SD.open(logPath, FILE_READ);
+    if (file) {
+      static const int MIGRATION_MAX_POINTS = 720;
+      static uint32_t epochs[MIGRATION_MAX_POINTS];
+      static float sg[MIGRATION_MAX_POINTS];
+      static char line[180];
+      int count = 0;
+
+      while (file.available() && count < MIGRATION_MAX_POINTS) {
+        int bytesRead = file.readBytesUntil('\n', line, sizeof(line) - 1);
+        line[bytesRead] = '\0';
+        if (line[0] == '\0' || line[0] == '#' || strstr(line, "timestamp") == line) continue;
+
+        payload_t data = {0};
+        uint32_t epoch = 0;
+        uint8_t batteryPercent = 0;
+        if (!parseCSVDataLine(line, &data, &epoch, &batteryPercent)) continue;
+        if (!isEpochValid(epoch) || epoch < activeBrewProfile.createdAt) continue;
+        if (data.density < 0.900f || data.density > 1.300f) continue;
+        epochs[count] = epoch;
+        sg[count] = data.density;
+        count++;
+      }
+      file.close();
+
+      if (count >= 8) {
+        float peakSG = sg[0];
+        int peakIndex = 0;
+        uint32_t peakWindowEnd = activeBrewProfile.createdAt + 14UL * 3600UL;
+        if (activeBrewProfile.lagPhaseHours > 0.0f) {
+          unsigned long profileWindow = activeBrewProfile.createdAt +
+            (unsigned long)((activeBrewProfile.lagPhaseHours + 8.0f) * 3600.0f);
+          if (profileWindow > peakWindowEnd) peakWindowEnd = profileWindow;
+        }
+        for (int i = 0; i < count; i++) {
+          if (epochs[i] > peakWindowEnd) break;
+          if (sg[i] > peakSG) {
+            peakSG = sg[i];
+            peakIndex = i;
+          }
+        }
+
+        uint32_t detectedStart = 0;
+        for (int i = peakIndex + 1; i < count - 6; i++) {
+          float dropFromPeak = peakSG - sg[i];
+          float futureDrop = sg[i] - sg[i + 6];
+          int mostlyFalling = 0;
+          for (int j = i; j < i + 6; j++) {
+            if (sg[j + 1] <= sg[j] + 0.0002f) mostlyFalling++;
+          }
+          bool confirmedTrend = mostlyFalling >= 4 && futureDrop >= 0.0012f;
+          bool strongTrend = mostlyFalling >= 3 && futureDrop >= 0.0018f;
+          if (dropFromPeak >= 0.0007f && (confirmedTrend || strongTrend)) {
+            detectedStart = epochs[i];
+            break;
+          }
+        }
+        if (isEpochValid(detectedStart) &&
+            (activeBrewProfile.fermentationStartAt == 0 ||
+             detectedStart + 1800UL < activeBrewProfile.fermentationStartAt)) {
+          activeBrewProfile.fermentationStartAt = detectedStart;
+          changed = true;
+        }
+      }
+    }
+  }
+
+  if (changed) {
+    activeBrewProfile.expectedFinalGravity = DerivedCalculations::expectedFG(
+      activeBrewProfile.effectiveOG,
+      activeBrewProfile.expectedApparentAttenuation);
+    BrewProfileStore::save(activeBrewProfile);
+    TargetCurveGenerator::generateAndSave(activeBrewProfile);
+  }
+
+  return changed;
 }
 
 void checkExistingFermentation() {
@@ -6236,6 +6510,12 @@ void checkExistingFermentation() {
       BrewProfileStore::logPath(batchId, currentFermentationFile, sizeof(currentFermentationFile));
       fermentationFileOpen = logReady;
       LOG_INFO("Auto-continuing batch log: %s\n", currentFermentationFile);
+      if (logReady && migrateActiveBrewProfileFromHistory(currentFermentationFile)) {
+        originalGravity = activeBrewProfile.effectiveOG;
+        currentABV = activeBrewProfile.estimatedABV;
+        ogCaptured = activeBrewProfile.effectiveOG > 1.0f;
+        LOG_INFOLN("Active batch profile migrated from historical log");
+      }
       
       // Load historical data from the CSV file
       if (logReady && loadHistoricalDataFromCSV(currentFermentationFile, LOAD_6H, MAX_DATA_POINTS, 1)) {
@@ -8317,6 +8597,47 @@ bool uiTestRunActionButtonTests(char* buffer, size_t bufferSize) {
   handleCurrentActionChoice(false);
   bool removeSkipped = activeBrewProfile.dryHopRemoveSkipped;
 
+  activeBrewProfile.dryHopDone = false;
+  activeBrewProfile.dryHopSkipped = false;
+  activeBrewProfile.dryHopStartTime = 0;
+  activeBrewProfile.dryHopRemoved = false;
+  activeBrewProfile.dryHopRemoveSkipped = false;
+  activeBrewProfile.dryHopRemovedAt = 0;
+  BatchAction farDryHop = BatchActionEngine::evaluate(
+    activeBrewProfile, FERMENTATION_ACTIVE, 25.0f, 1.040f, -0.0080f, nowEpoch);
+  bool farDryHopNoCountdown = farDryHop.type == ACTION_DRY_HOP &&
+                              !farDryHop.requiresChoice &&
+                              farDryHop.secondsUntilDue == 0;
+  BatchAction nearDryHop = BatchActionEngine::evaluate(
+    activeBrewProfile, FERMENTATION_ACTIVE, 55.0f, 1.024f, -0.0010f, nowEpoch);
+  bool nearDryHopCountdown = nearDryHop.type == ACTION_DRY_HOP &&
+                             !nearDryHop.requiresChoice &&
+                             nearDryHop.secondsUntilDue > 0 &&
+                             nearDryHop.secondsUntilDue <= 12UL * 3600UL;
+  currentBatchAction.type = ACTION_NONE;
+  BatchAction firstDue = evaluateBatchActionWithHysteresis(
+    FERMENTATION_ACTIVE, 65.0f, 1.0180f, 0.0f, nowEpoch);
+  currentBatchAction = firstDue;
+  BatchAction latchedDue = evaluateBatchActionWithHysteresis(
+    FERMENTATION_ACTIVE, 65.0f, 1.0183f, -0.00020f, nowEpoch + 600UL);
+  bool dryHopLatchStable = firstDue.type == ACTION_DRY_HOP &&
+                           firstDue.requiresChoice &&
+                           latchedDue.type == ACTION_DRY_HOP &&
+                           latchedDue.requiresChoice;
+  activeBrewProfile.dryHopEnabled = false;
+  activeBrewProfile.coldCrashDone = true;
+  activeBrewProfile.coldCrashSkipped = false;
+  activeBrewProfile.coldCrashStartedAt = nowEpoch;
+  BatchAction coldCrashWaiting = BatchActionEngine::evaluate(
+    activeBrewProfile, FERMENTATION_READY_TO_PACKAGE, 100.0f, 1.010f, 0.0f, nowEpoch + 3600UL);
+  bool packageWaitsForColdCrash = coldCrashWaiting.type == ACTION_PACKAGE &&
+                                  !coldCrashWaiting.requiresChoice &&
+                                  coldCrashWaiting.secondsUntilDue > 0;
+  BatchAction coldCrashElapsed = BatchActionEngine::evaluate(
+    activeBrewProfile, FERMENTATION_READY_TO_PACKAGE, 100.0f, 1.010f, 0.0f, nowEpoch + 49UL * 3600UL);
+  bool packageAfterColdCrash = coldCrashElapsed.type == ACTION_PACKAGE &&
+                               coldCrashElapsed.requiresChoice;
+
   if (mountSDTemporarily()) {
     uiTestDeleteBatchById("test_batch");
     dismountSD();
@@ -8332,9 +8653,13 @@ bool uiTestRunActionButtonTests(char* buffer, size_t bufferSize) {
   currentRecommendation = savedRecommendation;
   screenDirty = true;
 
-  bool ok = dryHopShown && dryHopDone && removeShown && removeSkipped;
-  snprintf(buffer, bufferSize, "action_buttons dryHopShown=%d dryHopDone=%d removeShown=%d removeSkipped=%d",
-           dryHopShown ? 1 : 0, dryHopDone ? 1 : 0, removeShown ? 1 : 0, removeSkipped ? 1 : 0);
+  bool ok = dryHopShown && dryHopDone && removeShown && removeSkipped &&
+            farDryHopNoCountdown && nearDryHopCountdown && dryHopLatchStable &&
+            packageWaitsForColdCrash && packageAfterColdCrash;
+  snprintf(buffer, bufferSize, "action_buttons dryHopShown=%d dryHopDone=%d removeShown=%d removeSkipped=%d farNoCountdown=%d nearCountdown=%d latch=%d coldWait=%d packageAfter=%d",
+           dryHopShown ? 1 : 0, dryHopDone ? 1 : 0, removeShown ? 1 : 0, removeSkipped ? 1 : 0,
+           farDryHopNoCountdown ? 1 : 0, nearDryHopCountdown ? 1 : 0, dryHopLatchStable ? 1 : 0,
+           packageWaitsForColdCrash ? 1 : 0, packageAfterColdCrash ? 1 : 0);
   return ok;
 }
 
@@ -8437,6 +8762,25 @@ static bool uiTestWriteMixedEpochLog(const char* path, uint32_t createdAt) {
               (unsigned long)(createdAt + 600UL));
   file.printf("2026-05-21 20:23:20,%lu,0,50.20,1.0030,20.00,4.06,88,ACTIVE,92.00,5.20,81\n",
               (unsigned long)(createdAt + 1200UL));
+  file.flush();
+  file.close();
+  return true;
+}
+
+static bool uiTestWriteDelayedFermentationLog(const char* path, uint32_t createdAt) {
+  File file = SD.open(path, FILE_WRITE);
+  if (!file) return false;
+  file.println("timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code");
+  file.printf("2026-05-21 08:00:00,%lu,0,50.00,1.0520,20.00,4.08,90,LAG,0.00,0.00,0\n",
+              (unsigned long)(createdAt + 2UL * 3600UL));
+  file.printf("2026-05-22 08:00:00,%lu,0,50.10,1.0518,20.00,4.07,89,LAG,0.00,0.00,0\n",
+              (unsigned long)(createdAt + 24UL * 3600UL));
+  file.printf("2026-05-22 09:00:00,%lu,0,50.20,1.0506,20.00,4.06,88,ACTIVE,3.00,0.20,0\n",
+              (unsigned long)(createdAt + 25UL * 3600UL));
+  file.printf("2026-05-22 10:00:00,%lu,0,50.30,1.0488,20.00,4.05,87,ACTIVE,7.00,0.42,0\n",
+              (unsigned long)(createdAt + 26UL * 3600UL));
+  file.printf("2026-05-22 11:00:00,%lu,0,50.40,1.0468,20.00,4.04,86,ACTIVE,11.00,0.68,0\n",
+              (unsigned long)(createdAt + 27UL * 3600UL));
   file.flush();
   file.close();
   return true;
@@ -9164,6 +9508,73 @@ bool uiTestRunRegressionTests(char* buffer, size_t bufferSize) {
   handleOGChoice(true);
   bool ogMeasuredOK = fabs(activeBrewProfile.effectiveOG - activeBrewProfile.measuredOG) < 0.0005f && activeBrewProfile.ogVerified;
   run("OGVerificationConfirmMeasuredOG", ogMeasuredOK, "effective_og", "measuredOG", ogMeasuredOK ? "measuredOG" : "other");
+
+  uiTestCreateBatch();
+  activeBrewProfile.recipeOG = 1.050f;
+  activeBrewProfile.effectiveOG = activeBrewProfile.recipeOG;
+  activeBrewProfile.expectedApparentAttenuation = 75;
+  activeBrewProfile.ogVerified = false;
+  activeBrewProfile.ogNeedsChoice = false;
+  activeBrewProfile.measuredOG = 0.0f;
+  activeBrewProfile.ogDifference = 0.0f;
+  ogVerifier.reset();
+  uiTestSetMockSG(1.052f); uiTestRunAnalyzer();
+  uiTestSetMockSG(1.052f); uiTestRunAnalyzer();
+  uiTestSetMockSG(1.052f); uiTestRunAnalyzer();
+  bool ogAutoMeasuredOK = activeBrewProfile.ogVerified &&
+    !activeBrewProfile.ogNeedsChoice &&
+    fabs(activeBrewProfile.effectiveOG - activeBrewProfile.measuredOG) < 0.0005f &&
+    fabs(activeBrewProfile.measuredOG - 1.052f) < 0.0005f &&
+    fabs(activeBrewProfile.expectedFinalGravity - DerivedCalculations::expectedFG(activeBrewProfile.effectiveOG, activeBrewProfile.expectedApparentAttenuation)) < 0.0005f;
+  run("OGVerificationAutoUsesMeasuredOG", ogAutoMeasuredOK, "effective_og", "measuredOG", ogAutoMeasuredOK ? "measuredOG" : "other");
+
+  uiTestCreateBatch();
+  activeBrewProfile.createdAt = 100000UL;
+  activeBrewProfile.fermentationStartAt = activeBrewProfile.createdAt + 24UL * 3600UL;
+  activeBrewProfile.effectiveOG = 1.050f;
+  activeBrewProfile.expectedFinalGravity = 1.010f;
+  activeBrewProfile.expectedApparentAttenuation = 80;
+  activeBrewProfile.autoModeEnabled = true;
+  activeBrewProfile.typicalDurationHours = 120.0f;
+  float preStartTarget = expectedTargetSGAtChartHour(12.0f);
+  float shiftedTarget = expectedTargetSGAtChartHour(30.0f);
+  float modelSixHourTarget = TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, 6.0f);
+  float shiftedAttenuationHour = targetHourForAttenuation(10.0f, targetChartHours());
+  bool shiftedCurveOK = fabs(preStartTarget - activeBrewProfile.effectiveOG) < 0.0005f &&
+    fabs(shiftedTarget - modelSixHourTarget) < 0.0005f &&
+    shiftedAttenuationHour >= 24.0f;
+  run("TargetCurveShiftedToFermentationStart", shiftedCurveOK, "start_offset", "24h", shiftedCurveOK ? "24h" : "unshifted");
+
+  bool migrationOK = false;
+  if (mountSDTemporarily()) {
+    static char migrationPath[80];
+    BrewProfileStore::setDefaults(&activeBrewProfile);
+    strncpy(activeBrewProfile.batchId, "test_batch", sizeof(activeBrewProfile.batchId) - 1);
+    activeBrewProfile.batchId[sizeof(activeBrewProfile.batchId) - 1] = '\0';
+    activeBrewProfile.createdAt = 200000UL;
+    activeBrewProfile.recipeOG = 1.050f;
+    activeBrewProfile.measuredOG = 1.052f;
+    activeBrewProfile.effectiveOG = activeBrewProfile.recipeOG;
+    activeBrewProfile.ogDifference = activeBrewProfile.measuredOG - activeBrewProfile.recipeOG;
+    activeBrewProfile.ogVerified = true;
+    activeBrewProfile.ogNeedsChoice = false;
+    activeBrewProfile.fermentationStartAt = 0;
+    activeBrewProfile.expectedApparentAttenuation = 80;
+    activeBrewProfile.expectedFinalGravity = DerivedCalculations::expectedFG(activeBrewProfile.effectiveOG, activeBrewProfile.expectedApparentAttenuation);
+    brewProfileLoaded = true;
+    BrewProfileStore::logPath(activeBrewProfile.batchId, migrationPath, sizeof(migrationPath));
+    uiTestDeleteBatchById(activeBrewProfile.batchId);
+    BrewProfileStore::ensureBatchDirectory(activeBrewProfile.batchId);
+    bool wroteLog = uiTestWriteDelayedFermentationLog(migrationPath, activeBrewProfile.createdAt);
+    bool migrated = wroteLog && migrateActiveBrewProfileFromHistory(migrationPath);
+    migrationOK = migrated &&
+      fabs(activeBrewProfile.effectiveOG - activeBrewProfile.measuredOG) < 0.0005f &&
+      activeBrewProfile.fermentationStartAt >= activeBrewProfile.createdAt + 24UL * 3600UL &&
+      activeBrewProfile.fermentationStartAt <= activeBrewProfile.createdAt + 26UL * 3600UL;
+    uiTestDeleteBatchById("test_batch");
+    dismountSD();
+  }
+  run("ActiveBatchHistoryMigration", migrationOK, "profile_patch", "og_and_start", migrationOK ? "og_and_start" : "missing");
 
   // 16-17. Sensor invalid/extreme handling
   uiTestSetMockSG(0.0f);

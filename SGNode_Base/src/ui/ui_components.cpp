@@ -1,4 +1,5 @@
 #include "ui_components.h"
+#include <time.h>
 #include <TFT_eSPI.h>
 #include <string.h>
 
@@ -86,10 +87,23 @@ void uiDrawTopbar(const char* title, bool espNowOk, bool sdOk, uint8_t battPerce
 
   if (title != NULL && title[0] != '\0' && strcmp(title, "SGNode") != 0) {
     char viewTitle[28];
-    uiEllipsize(title, 160, viewTitle, sizeof(viewTitle));
+    uiEllipsize(title, 120, viewTitle, sizeof(viewTitle));
     tft.setFreeFont(FONT_SIZE_XS);
     tft.setCursor(MARGIN + 92, TOPBAR_H / 2 + 4);
     tft.print(viewTitle);
+  }
+
+  time_t now = time(NULL);
+  if (now > 1700000000) {
+    struct tm timeInfo;
+    localtime_r(&now, &timeInfo);
+    char dateTime[16];
+    snprintf(dateTime, sizeof(dateTime), "%02d.%02d %02d:%02d",
+             timeInfo.tm_mday, timeInfo.tm_mon + 1, timeInfo.tm_hour, timeInfo.tm_min);
+    tft.setFreeFont(FONT_SIZE_XS);
+    int dateTimeW = tft.textWidth(dateTime);
+    tft.setCursor(UI_W - MARGIN - 100 - dateTimeW, TOPBAR_H / 2 + 4);
+    tft.print(dateTime);
   }
   
   // Draw battery icon + percentage on the right side
