@@ -5,6 +5,9 @@ build/
 .codex_build/
 sd_backups/
 DeepSleepProbe/
+SGNode_Plug_Button_Led_Test/
+SGNode_Plug_Hardware_Check/
+SGNode_Plug_Sensor_Relay_Test/
 *.tmp
 *.log
 
