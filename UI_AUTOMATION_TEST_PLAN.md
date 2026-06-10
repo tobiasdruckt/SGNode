@@ -2,6 +2,8 @@
 
 **Scope:** debug-only UI and firmware regression testing through `SGNODE_UI_TEST_HARNESS`.
 
+**Current release:** alpha 0.5.0
+
 The harness sends serial commands into the native touchscreen UI. Touch simulation enters the same event path as real touch input. The test suite must never commit a destructive user action unless the same final confirmation path a user would press has completed.
 
 ## Running
@@ -26,6 +28,8 @@ run_state_logic_tests
 run_ui_safety_tests
 run_batch_restore_tests
 run_fallback_log_tests
+run_completed_batch_tests
+run_manage_brew_ui_tests
 run_ui_regression_tests
 ```
 
@@ -51,55 +55,58 @@ ERR ui_regression total=36 passed=28 failed=8 first_failure=InvalidBrixInput:val
 | 3 | Calibration Final Save | Save/reload temporary coefficients, then restore old values | New coefficients reload, old values restored |
 | 4 | New Batch Abort Before Confirm | Open wizard, enter partial data, back out | No `profile.json` |
 | 5 | New Batch Abort After Partial Draft | Forward/back/cancel flow | No committed batch |
-| 6 | New Batch Final Confirm | Create `test_batch` | `profile.json`, `target.json`, `log.csv` exist |
-| 7 | Duplicate Batch Name | Existing test batch then new wizard | New batch id is unique |
-| 8 | Invalid Brix Input | Calculation/validation probe | Invalid values rejected or flagged |
-| 9 | Invalid Batch Size | Validation probe | Invalid volume rejected |
-| 10 | Invalid Attenuation | FG bounds probe | No invalid FG |
-| 11 | Auto Mode Toggle Consistency | Toggle source fields | Correct `attenuationSource` |
-| 12 | Yeast Preset Missing/Corrupt | Missing preset lookup | Fallback preset exists |
-| 13 | OG Verification Abort | Pending choice without selection | `effectiveOG` unchanged |
-| 14 | OG Verification Recipe | Confirm recipe OG | `effectiveOG == recipeOG` |
-| 15 | OG Verification Measured | Confirm measured OG | `effectiveOG == measuredOG` |
-| 16 | Sensor Dropout | Mock invalid SG/temp | UI remains responsive, sensor issue visible |
-| 17 | Extreme Sensor Values | Mock SG/temp extremes | No NaN/inf/crash |
-| 18 | State Machine Spike | Normal drop then SG spike | State does not reset to idle |
-| 19 | Stable Gravity Detection | Short/long stability simulation | Not ready early, stable later |
-| 20 | Diacetyl Rest Logic | Lager and ale profiles | Lager triggers, ale does not auto-trigger |
-| 21 | Reboot During Active Batch | Soft reload from SD | Active profile reloads |
-| 21b | Mock Time Isolation | Set mock time, then write via normal CSV logger | CSV epoch uses RTC time, not mock time |
-| 21c | Historical Mixed Log Filter | Build log with rows before and after `createdAt` | Loaded/skipped/error counts expose filtered rows |
-| 21d | Active Batch Restore Safety | Create older active batch and newer inactive batch | Boot restore must not blindly load highest batch number |
-| 21e | Fallback Uses Log Data | No active marker, higher empty batch exists | Select batch with valid post-`createdAt` log data |
-| 22 | SD Card Missing | Fault-injection placeholder | Must be implemented with SD mock/hardware test |
-| 23 | Corrupt profile.json | Fault-injection placeholder | Must be implemented with file mutation/recovery |
-| 24 | Corrupt target.json | Fault-injection placeholder | Must be implemented with file mutation/regeneration |
-| 25 | Log Append Failure | Fault-injection placeholder | Must be implemented with SD write failure mock |
-| 26 | Touch Spam | Rapid next/back taps | No crash/double create |
-| 27 | Back Navigation | Enter, forward, back | Values retained |
-| 28 | Cancel Confirmation | Press cancel after edits | `Discard changes?` dialog appears |
-| 29 | Completed Batch Protection | Completed state lock probe | Completed batch protected from overwrite |
-| 30 | Dashboard No Batch | Delete test batch | Dashboard survives no active batch |
-| 31 | Long Text Input | Long batch name | Bounded safely |
-| 32 | Special Characters | Unsupported chars and safe ASCII | No invalid paths or overflow |
-| 33 | Memory/Heap Stability | Repeated create/delete | Heap does not steadily fall |
-| 34 | Full End-to-End Auto Mode | Auto batch plus mock SG | ETA/recommendations present |
-| 35 | Full End-to-End Manual Mode | Manual profile | `attenuationSource == manual` |
+| 6 | New Batch Final Confirm | Create `test_batch` | `profile.json`, `target.json`, and initial `log.csv` exist |
+| 7 | Batch Start Gate | Complete wizard, then simulate pre-start packets | Live display may update, CSV rows wait for `Put Float In Brew` |
+| 8 | Quick Zero Calibration Gate | New batch starts with level-float action | Calibration ACK path runs before brew-start confirmation |
+| 9 | Plug Wizard Toggle | Open Brew Wizard Plug step | `plugControlEnabled` stores selected per-batch mode |
+| 10 | Duplicate Batch Name | Existing test batch then new wizard | New batch id is unique |
+| 11 | Invalid Brix Input | Calculation/validation probe | Invalid values rejected or flagged |
+| 12 | Invalid Batch Size | Validation probe | Invalid volume rejected |
+| 13 | Invalid Attenuation | FG bounds probe | No invalid FG |
+| 14 | Auto Mode Toggle Consistency | Toggle source fields | Correct `attenuationSource` |
+| 15 | Yeast Preset Missing/Corrupt | Missing preset lookup | Fallback preset exists |
+| 16 | OG Verification Abort | Pending choice without selection | `effectiveOG` unchanged |
+| 17 | OG Verification Recipe | Confirm recipe OG | `effectiveOG == recipeOG` |
+| 18 | OG Verification Measured | Confirm measured OG | `effectiveOG == measuredOG` |
+| 19 | Sensor Dropout | Mock invalid SG/temp | UI remains responsive, sensor issue visible |
+| 20 | Extreme Sensor Values | Mock SG/temp extremes | No NaN/inf/crash |
+| 21 | State Machine Spike | Normal drop then SG spike | State does not reset to idle |
+| 22 | Stable Gravity Detection | Short/long stability simulation | Not ready early, stable later |
+| 23 | Diacetyl Rest Logic | Lager and ale profiles | Lager triggers, ale does not auto-trigger |
+| 24 | Reboot During Active Batch | Soft reload from SD | Active profile reloads |
+| 24b | Mock Time Isolation | Set mock time, then write via normal CSV logger | CSV epoch uses RTC time, not mock time |
+| 24c | Historical Mixed Log Filter | Build log with rows before and after `createdAt` | Loaded/skipped/error counts expose filtered rows |
+| 24d | Active Batch Restore Safety | Create older active batch and newer inactive batch | Boot restore must not blindly load highest batch number |
+| 24e | Fallback Uses Log Data | No active marker, higher empty batch exists | Select batch with valid post-`createdAt` log data |
+| 25 | Manage Brew Delete Geometry | Open Manage Brew with multiple batches | Next/delete touch targets do not overlap |
+| 26 | SD Card Missing | Fault-injection placeholder | Must be implemented with SD mock/hardware test |
+| 27 | Corrupt profile.json | Fault-injection placeholder | Must be implemented with file mutation/recovery |
+| 28 | Corrupt target.json | Fault-injection placeholder | Must be implemented with file mutation/regeneration |
+| 29 | Log Append Failure | Fault-injection placeholder | Must be implemented with SD write failure mock |
+| 30 | Touch Spam | Rapid next/back taps | No crash/double create |
+| 31 | Back Navigation | Enter, forward, back | Values retained |
+| 32 | Cancel Confirmation | Press cancel after edits | `Discard changes?` dialog appears |
+| 33 | Completed Batch Protection | Completed state lock probe | Completed batch protected from overwrite |
+| 34 | Dashboard No Batch | Delete test batch | Dashboard survives no active batch |
+| 35 | Long Text Input | Long batch name | Bounded safely |
+| 36 | Special Characters | Unsupported chars and safe ASCII | No invalid paths or overflow |
+| 37 | Memory/Heap Stability | Repeated create/delete | Heap does not steadily fall |
+| 38 | Full End-to-End Auto Mode | Auto batch plus mock SG | ETA/recommendations present |
+| 39 | Full End-to-End Manual Mode | Manual profile | `attenuationSource == manual` |
 
-## Known Intentional Failures
+## Remaining Alpha Gaps
 
-Some tests are expected to fail until the firmware gains the corresponding safety feature:
+Some checks still require fault injection, hardware, or longer runs before they can be considered release gates:
 
-- Cancel confirmation dialog
 - SD missing fault injection
 - Corrupt profile recovery
 - Corrupt target regeneration checks
 - Log append failure injection
-- Completed batch write protection
 - Strong numeric validation for Brix, batch size, and attenuation
-- Active-batch restore metadata (`active_batch.txt` or equivalent)
+- Plug water/fridge validation with real sensors and relay hardware
+- Long-duration batch-start and completed-batch regression runs on the device
 
-These failures are useful: they define alpha hardening work before a non-debug build.
+These gaps are useful: they define alpha hardening work before a beta label.
 
 ## Production Rule
 

@@ -1,5 +1,7 @@
 # SGNode alpha 0.4.0 Release Notes
 
+> Historical archive. Current documentation and active release notes are in `README.md` and `RELEASE_NOTES_v0.5.0-alpha.md`.
+
 **Date:** 2026-05-21  
 **Status:** Alpha test build  
 **Focus:** Standalone intelligent fermentation assistant on the ESP32 base station
@@ -13,8 +15,6 @@ The system remains fully standalone. There is no web UI, phone app, REST fronten
 ## Added
 
 - Brew Wizard for batch setup on the 4-inch touchscreen
-- Batch-start float zero calibration through the Dashboard
-- Required `Put Float In Brew` confirmation before new-batch logging starts
 - Auto Mode with yeast behavior presets
 - Custom yeast creation, editing, deletion, and SD storage
 - Batch management: continue, copy, and delete
@@ -40,10 +40,6 @@ The system remains fully standalone. There is no web UI, phone app, REST fronten
 - New Brew avoids reusing existing batch directories or old `log.csv` files.
 - CSV loading filters rows older than the active batch creation time when timestamps are valid.
 - Details System section now shows separate SD, CSV loaded/total, and buffer counters.
-- New-batch `createdAt`, `log.csv`, and target curves now start from the `Put Float In Brew` confirmation instead of the wizard completion time.
-- Float packets received before `Put Float In Brew` update the live display but are not written to the active batch CSV.
-- Manage Brew delete now uses the batch directory name and removes the whole batch directory to handle older/migrated batches more reliably.
-- Float temperature now comes from BMI160 chip temperature because the BMP180/GY-68 was removed from the current low-power float hardware.
 
 ## Fixed
 
@@ -51,20 +47,11 @@ The system remains fully standalone. There is no web UI, phone app, REST fronten
 - New batch paths accidentally reusing old log files in some edge cases.
 - Battery view 24h mode showing fewer loaded rows than expected.
 - Details diagnostic text being clipped.
-- Manage Brew delete and next buttons overlapping on the 4-inch display.
 - Excessive serial output from float packet receive, CSV loading, SD writes, battery regression, UI taps, and calibration chatter.
-
-## Hardware Notes Since Initial Alpha
-
-- BMP180/GY-68 removed from the float; BMI160 chip temperature is diagnostic only.
-- USB-UART leakage was reduced by isolating pin 8 on the tested CP2302/USB-UART chip.
-- ME6220 regulator swap was tested but did not provide enough benefit to recommend as a priority modification.
-- Reference float deep sleep current after practical changes is about `0.95 mA`.
 
 ## Known Risks
 
 - Long-duration fermentation runs are still needed to validate phase thresholds and ETA behavior.
-- SGNode Plug remains alpha until water/fridge tests validate controller stability, logging, and fallback behavior.
 - SD buffering can still lose unsaved RAM entries on sudden reset or power loss.
 - Some UI screens are dense for a 4-inch display and need continued real-device testing.
 - Float battery drain requires measurement on hardware; calibration mode and sensor sleep behavior are the first suspects.

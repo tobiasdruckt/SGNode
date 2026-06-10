@@ -1,58 +1,88 @@
 # SGNode Improvement Backlog
 
-**Updated:** 2026-05-21  
-**Current release:** alpha 0.4.0
+**Updated:** 2026-06-10
 
-This file replaces the old v0.3.0 four-week schedule. The previous plan contained useful ideas, but it duplicated release notes and no longer matched the current Phase 1 assistant firmware.
+**Current release:** alpha 0.5.0
 
-## Completed Since v0.3.0
+This backlog tracks the active alpha work. Historical release contents live in the release notes; this file should stay focused on the next useful checks and implementation steps.
 
-- Base station debug levels and quieter serial output
-- Native touchscreen Brew Wizard
-- Yeast Auto Mode and custom yeast management
-- Batch profile, target, and log storage under `/data/batches/`
-- Dashboard, Details, Battery, and target-vs-actual chart improvements
-- Historical CSV reload after reboot
-- Theme persistence
-- Batch management and safer new-batch log isolation
+## Current Alpha Status
+
+- Float/Base completed a first real fermentation run.
+- SGNode Plug firmware and Base integration exist, but Plug control has not yet passed the water/fridge validation run.
+- New batches are gated by quick zero calibration and a required `Put Float In Brew` confirmation before CSV logging starts.
+- The current Float reference build removed the BMP180/GY-68. BMI160 chip temperature is kept as a diagnostic value only.
+- Reference Float deep sleep current is about `0.95 mA` after practical low-power changes.
+- Low-level Plug test sketches are kept local-only and ignored by Git.
+
+## Completed Since v0.4.0
+
+- Batch-start quick zero calibration via Float ACK command.
+- Required `Put Float In Brew` action to separate setup packets from real batch logging.
+- Manage Brew delete geometry and old-batch directory deletion fixes.
+- SGNode Plug alpha firmware for Gosund SP1 / ESP8285.
+- Base/Plug ESP-NOW command and status protocol.
+- Base-side Plug MAC learning, persisted status, command sender, UI diagnostics, and CSV fields.
+- Brew Wizard `SGNode Plug` step for per-batch Plug Auto Mode.
+- Hardware documentation update for BMP removal, CP2302 pin isolation, and realistic regulator-swap benefit.
 
 ## Active Alpha Priorities
 
-### 1. SD Logging Reliability
-- Flush buffered readings before reboot where possible.
-- Make buffer state visible enough for field testing.
-- Consider shorter flush interval or explicit flush on view transitions.
-- Add protection against power loss during profile/log writes.
+### 1. SGNode Plug Water/Fridge Validation
 
-### 2. Float Battery Drain
-- Measure actual sleep current.
-- Confirm deep sleep is reached after every send.
-- Check whether BMP180/BMI160 can be suspended or powered down between reads.
-- Review wake interval and calibration-mode exit behavior.
+- Run the Plug with water, both DS18B20 sensors, and the fridge before using Plug Auto Mode on beer.
+- Confirm relay polarity, command acknowledgement, stale-status handling, and compressor duty logging.
+- Validate PI outer-loop behavior for realistic batch volumes and temperature ramps.
+- Check cold-crash behavior with the 1.0 C absolute air-target clamp, static 3 K clamp, and dynamic 5 K clamp.
+- Tune default `Tn` values after measured water-test response data exists.
+
+### 2. Batch Start And Logging Validation
+
+- Re-test the full new-batch flow on hardware: wizard, quick zero, `Put Float In Brew`, first logged CSV row.
+- Confirm packets received before `Put Float In Brew` update the live display but do not enter the batch CSV.
+- Confirm completed batches remain read-only enough for normal UI use.
+- Keep active-batch restore behavior covered when older and newer batch directories coexist.
 
 ### 3. Fermentation Logic Validation
-- Test state transitions over real fermentations.
-- Tune lag, active, diacetyl, stable FG, and packaging thresholds.
-- Compare ETA predictions against real completion times.
-- Store enough yeast performance summary data for future learning.
 
-### 4. UI Consistency
-- Continue real-device checks for clipped text and touch targets.
-- Keep Details diagnostic, Dashboard, and graph screens readable in both themes.
-- Avoid adding dense text where a compact value/list is clearer.
+- Compare dry-hop, cold-hop, cold-crash, and package recommendations against real fermentation data.
+- Validate action hysteresis so repeated recommendations do not appear and disappear around SG thresholds.
+- Continue tuning ETA from smoothed recent SG slope and phase state.
+- Store enough yeast performance summary data for future learning, but defer broad learning features until basic thresholds are stable.
 
-### 5. Calibration Extension
-- Decide whether optional calibration points are required for alpha or later.
-- If yes, update float protocol, float EEPROM format, base UI, and coefficient fitting together.
+### 4. Float Hardware And Power Validation
+
+- Repeat sleep-current measurement after the BMP removal and calibration ACK changes.
+- Confirm the BMI160-only build wakes, sends, receives calibration commands, and returns to deep sleep reliably.
+- Document any remaining board-specific leakage paths only after measurement.
+- Do not reintroduce BMP/BMP180 libraries or wiring for the current reference Float.
+
+### 5. Documentation And Release Hygiene
+
+- Keep README, hardware notes, wiring diagram, release notes, and Plug plan aligned before each GitHub push.
+- Keep historical release notes historical; new behavior belongs in the current release notes.
+- Keep local-only hardware test sketches out of Git while documenting their purpose.
+- Revisit beta status only after Plug water/fridge validation is complete.
+
+## Beta Gate
+
+SGNode should stay alpha until these points are true:
+
+- Plug water/fridge test passes without unsafe relay behavior.
+- Plug and Base logs show coherent Float plus Plug rows over a realistic run.
+- Batch-start gating is stable on real hardware.
+- No critical SD/history loss is observed during normal reboot and batch-management flows.
+- The documentation describes the actual hardware and required libraries without stale BMP or test-sketch assumptions.
 
 ## Later Ideas
 
-- Centralized error code model
-- More robust settings screen
-- Export helpers for SD card data
-- Automated simulator tests for calculations and state machine
-- Hardware power profiling notes per board revision
+- Sugar/priming calculator based on batch volume, target CO2, beer temperature, and bottle size.
+- Centralized error code model.
+- More robust settings screen.
+- Export helpers for SD card data.
+- Automated simulator tests for calculations and state machine.
+- Optional additional calibration points if real Float data proves they are needed.
 
 ## Rule For Alpha
 
-Prefer small, testable fixes over broad refactors. The project is now complex enough that every change should preserve existing manual mode, Auto Mode, SD history, and calibration behavior.
+Prefer small, testable fixes over broad refactors. Every change should preserve existing manual mode, Auto Mode, SD history, batch-start gating, and calibration behavior.

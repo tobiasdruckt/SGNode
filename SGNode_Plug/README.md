@@ -40,6 +40,14 @@ with the Brew Wizard `SGNode Plug` step.
 
 Use `Generic ESP8266 Module`, 1 MB flash, DOUT flash mode, and 80 MHz CPU.
 
+Required libraries:
+
+- OneWire
+- DallasTemperature
+
+The shared headers in `SGNode_Shared` are used as a local project library when
+compiling the Plug.
+
 ## Bench-test order
 
 The low-level bench-test sketches are intentionally local-only and ignored by

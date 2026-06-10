@@ -1,6 +1,6 @@
 # SGNode v0.3.0-alpha Release Notes
 
-> Historical archive. Current documentation and active release notes are in `README.md` and `RELEASE_NOTES_v0.4.0-alpha.md`.
+> Historical archive. Current documentation and active release notes are in `README.md` and `RELEASE_NOTES_v0.5.0-alpha.md`.
 
 **Release Date:** May 6, 2026  
 **Status:** Design Freeze - Alpha Release  
@@ -120,6 +120,8 @@ SGNode v0.3.0-alpha marks a significant milestone with complete system stabiliza
 - **Power Efficiency** - Further battery optimization
 
 ## 📋 Installation Requirements
+
+This library and hardware list describes the archived v0.3.0 build only. Current requirements are documented in `README.md`.
 
 ### Required Libraries
 - **Float Unit**: EmotiBit BMI160, Adafruit BMP085

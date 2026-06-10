@@ -50,7 +50,7 @@ Exit criteria:
 ### Stage 2: Dual DS18B20 Serial Test Sketch
 
 - Create or keep a standalone local hardware-test sketch before implementing SGNode Plug firmware.
-- Suggested local path: `SGNode_Plug_Test/Dual_DS18B20_Serial_Test.ino`.
+- Suggested local path: `SGNode_Plug_Sensor_Relay_Test/SGNode_Plug_Sensor_Relay_Test.ino`.
 - Connect fridge-air DS18B20 to GPIO4.
 - Connect vessel/beer DS18B20 to GPIO5.
 - Use one 4.7 kOhm pull-up to 3.3 V on each data line.

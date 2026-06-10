@@ -70,8 +70,13 @@ SGNode_Float/
   SGNode_Float.ino                Float firmware
   polynomial_calibration.h         Float calibration logic
 
+SGNode_Plug/
+  SGNode_Plug.ino                 ESP8285 smart-plug temperature controller
+  src/                            Plug sensors, ESP-NOW transport, PI control, and relay logic
+
 SGNode_Shared/
   sg_protocol.h                   ESP-NOW payload format
+  plug_hardware.h                 Plug pin assignment
 ```
 
 ## SD Card Structure
@@ -106,6 +111,13 @@ SGNode_Shared/
 7. Flash the float.
 8. Insert a FAT32 MicroSD card into the base station.
 9. Use the touchscreen Brew Wizard to create the first batch.
+
+Optional SGNode Plug build:
+
+- Install ESP8266 board support.
+- Install `OneWire` and `DallasTemperature`.
+- Compile `SGNode_Plug/SGNode_Plug.ino` as `Generic ESP8266 Module`, 1 MB flash, DOUT flash mode, and 80 MHz CPU.
+- Include the project root as a local library path so `SGNode_Shared` headers are visible.
 
 ## Normal Operation
 
