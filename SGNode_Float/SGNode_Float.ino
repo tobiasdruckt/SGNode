@@ -33,9 +33,12 @@
 #define CALIBRATION_SWITCH_PIN 12  // Physical switch for calibration mode (pull-down)
 #define ACK_PACKET_TYPE 0xA5
 #define RETRY_BUFFER_SIZE 8
-#define ACK_WAIT_MS 120
+#define ACK_WAIT_MS 400
 #ifndef SGNODE_FLOAT_TEST_HARNESS
 #define SGNODE_FLOAT_TEST_HARNESS 0
+#endif
+#ifndef SGNODE_FLOAT_SERIAL_DIAG
+#define SGNODE_FLOAT_SERIAL_DIAG 0
 #endif
 
 // LED indicators (WeMos D32)
@@ -60,6 +63,11 @@ RTC_DATA_ATTR uint16_t lastAckedSeq = 0;
 RTC_DATA_ATTR uint16_t rtcSequenceCounter = 0;
 volatile bool ackReceived = false;
 volatile uint16_t receivedAckSeq = 0;
+RTC_DATA_ATTR uint8_t rtcPendingPayloadFlags = 0;
+RTC_DATA_ATTR uint8_t rtcLastAckCommandId = 0;
+volatile bool queuedZeroCalCommand = false;
+volatile uint8_t queuedZeroCalCommandId = 0;
+bool zeroCalProcessedThisWake = false;
 #if SGNODE_FLOAT_TEST_HARNESS
 bool harnessNoSleep = true;
 bool harnessPauseStateMachine = true;
@@ -140,13 +148,66 @@ unsigned long lastCalibrationResponse = 0;
 const unsigned long CALIBRATION_RESPONSE_INTERVAL = 2000; // 2 seconds between responses
 bool calibrationResponsePending = false;
 
+struct PendingStableCalibrationPoint {
+  bool active;
+  float targetSG;
+  uint8_t requestId;
+  uint8_t pointNumber;
+  unsigned long startedMs;
+  unsigned long lastSampleMs;
+  int sampleCount;
+  float firstAngle;
+  float firstTemp;
+  float firstSG;
+  float lastAngle;
+  float lastTemp;
+  float lastSG;
+  float sumAngle;
+  float sumTemp;
+};
+
+PendingStableCalibrationPoint pendingStablePoint = {};
+
+struct PendingStableOffsetCalibration {
+  bool active;
+  uint8_t requestId;
+  unsigned long startedMs;
+  unsigned long lastSampleMs;
+  int sampleCount;
+  float firstX;
+  float firstY;
+  float firstZ;
+  float lastX;
+  float lastY;
+  float lastZ;
+  float firstTemp;
+  float lastTemp;
+  float previousTempDrift;
+  unsigned long previousTempDriftMs;
+  float peakTempDrift;
+  float sumX;
+  float sumY;
+  float sumZ;
+  float sumTemp;
+  int minX;
+  int minY;
+  int minZ;
+  int maxX;
+  int maxY;
+  int maxZ;
+};
+
+PendingStableOffsetCalibration pendingStableOffset = {};
+
 // Function prototypes
 void initIMU();
 void initBMP180();
 void initESPNow();
 void configureUnusedGPIOs();
 void suspendBMI160();
+void ensureDebugSerial();
 float measureTilt();
+float measureImuTemperature();
 float measureTemperature();
 float calculateDensity(float angle, float temperature);
 float getBatteryVoltage();
@@ -160,7 +221,15 @@ bool sendPayloadWithAck(payload_t* payload, bool waitForAck);
 void enterDeepSleep();
 void onCalibrationCommand(const uint8_t *mac, const uint8_t *incomingData, int len);
 void recordCalibrationPoint(float target_sg, uint8_t request_id, uint8_t point_number);
+void startStableOffsetCalibration(uint8_t request_id);
+void handlePendingStableOffsetCalibration();
+void handlePendingStableCalibrationPoint();
+bool runQuickZeroCalibration();
+bool processQueuedZeroCalibrationCommand();
+bool attachPendingFlagsToPayload(payload_t* payload, bool refreshMeasurement);
+bool sendPendingZeroCalibrationResult();
 void sendCalibrationResponse(float angle, float target_sg, uint8_t request_id, const char* message);
+void sendCalibrationStatus(float etaSeconds, float tempDriftPerMin, uint8_t request_id, const char* message);
 void sendCalibrationCoefficients(uint8_t request_id);
 uint16_t crc16(const uint8_t* data, size_t length);
 float ema(float prev, float x, float alpha);
@@ -219,10 +288,16 @@ void setup() {
   
   debug_mode = calibrationMode;  // Debug mode follows calibration mode
   
-  // Start Serial in debug/calibration mode or when the test harness is compiled in.
-  if (debug_mode || SGNODE_FLOAT_TEST_HARNESS) {
+  // Start Serial in debug/calibration mode or when diagnostics are compiled in.
+  if (debug_mode || SGNODE_FLOAT_TEST_HARNESS || SGNODE_FLOAT_SERIAL_DIAG) {
     Serial.begin(115200);
     delay(100);  // Wait for Serial to initialize
+
+    if (SGNODE_FLOAT_SERIAL_DIAG) {
+      Serial.printf("DIAG boot calib=%d switch=%d wake=%d state=%d\n",
+                    calibrationMode ? 1 : 0, switchPressed ? 1 : 0,
+                    calibrationWakeup ? 1 : 0, (int)currentState);
+    }
 
     if (debug_mode) {
       Serial.println("=== CALIBRATION MODE ACTIVATED AT BOOT ===");
@@ -256,17 +331,7 @@ void setup() {
   initSensorOffsets();
 
   #if SGNODE_FLOAT_TEST_HARNESS
-  boot_time = millis() / 1000;
-  Serial.println("OK float_harness_ready paused=1");
-  while (harnessPauseStateMachine) {
-    handleFloatTestHarness();
-    if (harnessRxDebug && millis() - harnessLastIdlePrint > 3000) {
-      harnessLastIdlePrint = millis();
-      Serial.printf("OK float_harness_idle avail=%d\n", Serial.available());
-    }
-    delay(10);
-  }
-  return;
+  Serial.println("OK float_harness_boot continuing_to_imu_init");
   #endif
   
   // Configure I2C with pull-ups
@@ -298,6 +363,11 @@ void setup() {
   }
   
   if (debug_mode) Serial.println("Hardware initialized");
+
+  #if SGNODE_FLOAT_TEST_HARNESS
+  initIMU();
+  Serial.println("OK float_harness_ready paused=1 imu=1");
+  #endif
 }
 
 void loop() {
@@ -311,6 +381,18 @@ void loop() {
   
   // Ensure debug_mode follows calibration mode
   debug_mode = calibrationMode;
+
+  #if SGNODE_FLOAT_SERIAL_DIAG
+  static unsigned long lastDiagPrint = 0;
+  if (millis() - lastDiagPrint > 5000UL) {
+    lastDiagPrint = millis();
+    Serial.printf("DIAG loop calib=%d state=%d button=%d pendingOffset=%d pendingPoint=%d\n",
+                  calibrationMode ? 1 : 0, (int)currentState,
+                  digitalRead(CALIBRATION_SWITCH_PIN),
+                  pendingStableOffset.active ? 1 : 0,
+                  pendingStablePoint.active ? 1 : 0);
+  }
+  #endif
   
   // Handle push button detection with debouncing
   bool currentButtonState = digitalRead(CALIBRATION_SWITCH_PIN);
@@ -410,6 +492,8 @@ void loop() {
         currentState = SLEEP;
       } else {
         // In calibration mode, check for pending responses and continue measuring
+        handlePendingStableOffsetCalibration();
+
         static unsigned long lastCalibMsg = 0;
         if (millis() - lastCalibMsg > 10000) { // Only show message every 10 seconds
           if (debug_mode) Serial.println("Calibration mode active - waiting for commands...");
@@ -476,15 +560,7 @@ void suspendBMI160() {
 }
 
 void initBMP180() {
-  // BMP180 - simplified for testing
-  if (debug_mode) Serial.println("BMP180 init...");
-  
-  if (bmp180.begin()) {
-    if (debug_mode) Serial.println("BMP180 OK");
-  } else {
-    if (debug_mode) Serial.println("BMP180 failed");
-    sensorData.flags |= 0x02;
-  }
+  if (debug_mode) Serial.println("BMP180 disabled - using BMI160 temperature");
   delay(50);
 }
 
@@ -585,6 +661,13 @@ void configureUnusedGPIOs() {
   if (debug_mode) Serial.println("Unused GPIOs configured as OUTPUT LOW for power saving");
 }
 
+void ensureDebugSerial() {
+  if (!Serial) {
+    Serial.begin(115200);
+    delay(50);
+  }
+}
+
 float measureTilt() {
   // Read from BMI160 using library
   int ax, ay, az;
@@ -625,17 +708,24 @@ float measureTilt() {
   return angle_deg;
 }
 
+float measureImuTemperature() {
+  int16_t raw = BMI160.getTemperature();
+  if (raw == (int16_t)0x8000) {
+    return NAN;
+  }
+  return 23.0f + ((float)raw / 512.0f);
+}
+
 float measureTemperature() {
-  // Read from BMP180
-  float temperature = bmp180.readTemperature();
+  float temperature = measureImuTemperature();
   
-  if (isnan(temperature)) {
-    if (debug_mode) Serial.println("Failed to read temperature from BMP180");
+  if (isnan(temperature) || isinf(temperature)) {
+    if (debug_mode) Serial.println("Failed to read temperature from BMI160");
     sensorData.flags |= 0x02;
-    return ema_temp; // Return last valid value
+    return ema_temp;
   }
   
-  if (temperature < 0.0 || temperature > 50.0) {
+  if (temperature < -10.0 || temperature > 80.0) {
     if (debug_mode) Serial.printf("Temperature out of range: %.2f°C\n", temperature);
     sensorData.flags |= 0x02;
     return ema_temp;
@@ -778,7 +868,8 @@ void computeSensorData() {
     sensorData.sequence_id = sequence_counter++;
     rtcSequenceCounter = sequence_counter;
     sensorData.version = SG_PROTOCOL_VERSION;
-    sensorData.flags = 0;
+    sensorData.flags = rtcPendingPayloadFlags;
+    rtcPendingPayloadFlags = 0;
     sensorData.battery_voltage = harnessMockBattery;
     return;
   }
@@ -791,7 +882,8 @@ void computeSensorData() {
   sensorData.sequence_id = sequence_counter++;
   rtcSequenceCounter = sequence_counter;
   sensorData.version = SG_PROTOCOL_VERSION;
-  sensorData.flags = 0;  // Clear flags
+  sensorData.flags = rtcPendingPayloadFlags;
+  rtcPendingPayloadFlags = 0;
   
   // Use cached battery voltage read before WiFi was enabled
   sensorData.battery_voltage = cachedBatteryVoltage;
@@ -812,7 +904,10 @@ void transmitData() {
 
   storePayloadForRetry(sensorData);
   sendRetryPayloads();
+  processQueuedZeroCalibrationCommand();
+  attachPendingFlagsToPayload(&sensorData, true);
   bool acked = sendPayloadWithAck(&sensorData, true);
+  processQueuedZeroCalibrationCommand();
 
   if (acked) {
     markAcked(sensorData.sequence_id);
@@ -820,6 +915,11 @@ void transmitData() {
     sensorData.flags |= 0x01;  // Set delayed flag for local sleep interval handling
     storePayloadForRetry(sensorData);
   }
+
+  // If the zero command arrived in the ACK for the current payload, the
+  // current payload is already gone. Send the confirmation before sleeping.
+  processQueuedZeroCalibrationCommand();
+  sendPendingZeroCalibrationResult();
 
   delay(50);
 
@@ -838,12 +938,139 @@ void onDataAck(const uint8_t *mac, const uint8_t *incomingData, int len) {
   memcpy(&ack, incomingData, len);
   if (ack.packet_type != ACK_PACKET_TYPE) return;
 
+  if (ack.command == SG_ACK_COMMAND_ZERO_CALIBRATE) {
+    queuedZeroCalCommandId = ack.command_id;
+    queuedZeroCalCommand = true;
+  }
+
   receivedAckSeq = ack.sequence_id;
-  ackReceived = true;
   markAcked(ack.sequence_id);
   if (ack.highest_seen > lastAckedSeq) {
     lastAckedSeq = ack.highest_seen;
   }
+  ackReceived = true;
+}
+
+bool runQuickZeroCalibration() {
+  const int sampleCount = 5;
+  const int maxAxisSpan = 150;
+  long totalX = 0;
+  long totalY = 0;
+  long totalZ = 0;
+  int minX = 32767, minY = 32767, minZ = 32767;
+  int maxX = -32768, maxY = -32768, maxZ = -32768;
+
+  for (int i = 0; i < sampleCount; i++) {
+    int ax, ay, az;
+    BMI160.readAccelerometer(ax, ay, az);
+    totalX += ax;
+    totalY += ay;
+    totalZ += az;
+    if (ax < minX) minX = ax;
+    if (ay < minY) minY = ay;
+    if (az < minZ) minZ = az;
+    if (ax > maxX) maxX = ax;
+    if (ay > maxY) maxY = ay;
+    if (az > maxZ) maxZ = az;
+    delay(40);
+  }
+
+  float avgX = totalX / (float)sampleCount;
+  float avgY = totalY / (float)sampleCount;
+  float avgZ = totalZ / (float)sampleCount;
+  float magnitude = sqrtf(avgX * avgX + avgY * avgY + avgZ * avgZ) / 16384.0f;
+  bool stable = (maxX - minX) <= maxAxisSpan &&
+                (maxY - minY) <= maxAxisSpan &&
+                (maxZ - minZ) <= maxAxisSpan;
+  bool plausible = magnitude >= 0.80f && magnitude <= 1.20f;
+  if (!stable || !plausible) {
+    if (debug_mode) {
+      Serial.printf("Quick zero rejected stable=%d mag=%.3f span=%d/%d/%d\n",
+                    stable ? 1 : 0, magnitude, maxX - minX, maxY - minY, maxZ - minZ);
+    }
+    return false;
+  }
+
+  float newOffsetX = avgX;
+  float newOffsetY = avgY + 16384.0f;
+  float newOffsetZ = avgZ;
+  if (sensorOffsets.isValid) {
+    float dx = newOffsetX - sensorOffsets.offsetX;
+    float dy = newOffsetY - sensorOffsets.offsetY;
+    float dz = newOffsetZ - sensorOffsets.offsetZ;
+    float offsetDelta = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (offsetDelta > 2500.0f) {
+      if (debug_mode) {
+        Serial.printf("Quick zero rejected offset jump %.0f\n", offsetDelta);
+      }
+      return false;
+    }
+  }
+
+  sensorOffsets.offsetX = newOffsetX;
+  sensorOffsets.offsetY = newOffsetY;
+  sensorOffsets.offsetZ = newOffsetZ;
+  sensorOffsets.isValid = true;
+  return saveSensorOffsets();
+}
+
+bool processQueuedZeroCalibrationCommand() {
+  if (!queuedZeroCalCommand) return false;
+
+  uint8_t commandId = queuedZeroCalCommandId;
+  queuedZeroCalCommand = false;
+  if (zeroCalProcessedThisWake) return false;
+
+  bool ok = runQuickZeroCalibration();
+  zeroCalProcessedThisWake = true;
+  rtcLastAckCommandId = commandId;
+  rtcPendingPayloadFlags &= ~(SG_PAYLOAD_FLAG_ZERO_CAL_OK | SG_PAYLOAD_FLAG_ZERO_CAL_FAIL);
+  rtcPendingPayloadFlags |= ok ? SG_PAYLOAD_FLAG_ZERO_CAL_OK : SG_PAYLOAD_FLAG_ZERO_CAL_FAIL;
+  return true;
+}
+
+bool attachPendingFlagsToPayload(payload_t* payload, bool refreshMeasurement) {
+  if (!payload || rtcPendingPayloadFlags == 0) return false;
+
+  uint8_t pendingFlags = rtcPendingPayloadFlags;
+  rtcPendingPayloadFlags = 0;
+  if (refreshMeasurement) {
+    payload->angle = measureTilt();
+    payload->temperature = measureTemperature();
+    payload->density = calculateDensity(payload->angle, payload->temperature);
+    payload->uptime_s = (millis() / 1000) - boot_time;
+  }
+  payload->flags |= pendingFlags;
+  return true;
+}
+
+bool sendPendingZeroCalibrationResult() {
+  if ((rtcPendingPayloadFlags & (SG_PAYLOAD_FLAG_ZERO_CAL_OK | SG_PAYLOAD_FLAG_ZERO_CAL_FAIL)) == 0) {
+    return false;
+  }
+
+  payload_t resultPayload = {};
+  resultPayload.version = SG_PROTOCOL_VERSION;
+  resultPayload.angle = measureTilt();
+  resultPayload.temperature = measureTemperature();
+  resultPayload.density = calculateDensity(resultPayload.angle, resultPayload.temperature);
+  resultPayload.uptime_s = (millis() / 1000) - boot_time;
+  sequence_counter = rtcSequenceCounter;
+  resultPayload.sequence_id = sequence_counter++;
+  rtcSequenceCounter = sequence_counter;
+  resultPayload.battery_voltage = cachedBatteryVoltage;
+  resultPayload.flags = rtcPendingPayloadFlags;
+  rtcPendingPayloadFlags = 0;
+
+  storePayloadForRetry(resultPayload);
+  bool acked = sendPayloadWithAck(&resultPayload, true);
+  if (acked) {
+    markAcked(resultPayload.sequence_id);
+  } else {
+    resultPayload.flags |= SG_PAYLOAD_FLAG_DELAYED;
+    storePayloadForRetry(resultPayload);
+  }
+  return acked;
 }
 
 void storePayloadForRetry(const payload_t& payload) {
@@ -909,11 +1136,13 @@ bool sendPayloadWithAck(payload_t* payload, bool waitForAck) {
 
   unsigned long start = millis();
   while (millis() - start < ACK_WAIT_MS) {
+    processQueuedZeroCalibrationCommand();
     if (ackReceived && receivedAckSeq == payload->sequence_id) {
       return true;
     }
     delay(5);
   }
+  processQueuedZeroCalibrationCommand();
   return false;
 }
 
@@ -980,6 +1209,9 @@ void onCalibrationCommand(const uint8_t *mac, const uint8_t *incomingData, int l
   if (!calibrationMode) {
     return;
   }
+
+  ensureDebugSerial();
+  debug_mode = true;
   
   // Update activity timestamp on any calibration command
   updateCalibrationActivity();
@@ -999,7 +1231,9 @@ void onCalibrationCommand(const uint8_t *mac, const uint8_t *incomingData, int l
     case 5: // CALIBRATE_OFFSET
       if (debug_mode) Serial.println("Sensor offset calibration requested");
       {
-        if (calibrateSensorOffset()) {
+        if (true) {
+          startStableOffsetCalibration(cmd.request_id);
+        } else if (calibrateSensorOffset()) {
           // Send response with the calculated offset angle (should be close to 0°)
           float offsetAngle = measureTilt(); // This should now be close to 0° with offsets applied
           sendCalibrationResponse(offsetAngle, 0.0, cmd.request_id, "Offset calibrated");
@@ -1186,7 +1420,7 @@ void recordCalibrationPoint(float target_sg, uint8_t request_id, uint8_t point_n
 
   float totalAngle = 0.0f;
   float totalTemp = 0.0f;
-  int numReadings = 5;
+  const int numReadings = 5;
 
   for (int i = 0; i < numReadings; i++) {
     totalAngle += measureTilt();
@@ -1196,7 +1430,6 @@ void recordCalibrationPoint(float target_sg, uint8_t request_id, uint8_t point_n
 
   float avgAngle = totalAngle / numReadings;
   float avgTemp = totalTemp / numReadings;
-
   addCalibrationPoint(avgAngle, target_sg, avgTemp);
 
   char message[24];
@@ -1207,6 +1440,251 @@ void recordCalibrationPoint(float target_sg, uint8_t request_id, uint8_t point_n
     Serial.printf("Point %u averaged: %.2f deg, %.1f C (%d readings)\n",
                   point_number, avgAngle, avgTemp, numReadings);
   }
+  updateCalibrationActivity();
+}
+
+void startStableOffsetCalibration(uint8_t request_id) {
+  ensureDebugSerial();
+  debug_mode = true;
+  memset(&pendingStableOffset, 0, sizeof(pendingStableOffset));
+  pendingStableOffset.active = true;
+  pendingStableOffset.requestId = request_id;
+  pendingStableOffset.startedMs = millis();
+  pendingStableOffset.lastSampleMs = 0;
+  pendingStableOffset.minX = pendingStableOffset.minY = pendingStableOffset.minZ = 32767;
+  pendingStableOffset.maxX = pendingStableOffset.maxY = pendingStableOffset.maxZ = -32768;
+  updateCalibrationActivity();
+  Serial.printf("Offset stable calibration started request=%u\n", request_id);
+}
+
+void handlePendingStableOffsetCalibration() {
+  if (!pendingStableOffset.active) return;
+
+  const unsigned long minStableMs = 60000UL;
+  const unsigned long maxStableMs = 600000UL;
+  const unsigned long sampleIntervalMs = 10000UL;
+  const float maxAxisDriftPerMin = 150.0f;
+  const float maxTempDriftPerMin = 0.20f;
+  const int maxShortSpan = 1200;
+  unsigned long now = millis();
+  if (pendingStableOffset.lastSampleMs != 0 && now - pendingStableOffset.lastSampleMs < sampleIntervalMs) {
+    return;
+  }
+
+  pendingStableOffset.lastSampleMs = now;
+  int ax, ay, az;
+  BMI160.readAccelerometer(ax, ay, az);
+  float temp = measureImuTemperature();
+  if (isnan(temp) || isinf(temp)) {
+    temp = measureTemperature();
+  }
+  if (pendingStableOffset.sampleCount == 0) {
+    pendingStableOffset.firstX = ax;
+    pendingStableOffset.firstY = ay;
+    pendingStableOffset.firstZ = az;
+    pendingStableOffset.firstTemp = temp;
+  }
+  pendingStableOffset.lastX = ax;
+  pendingStableOffset.lastY = ay;
+  pendingStableOffset.lastZ = az;
+  pendingStableOffset.lastTemp = temp;
+  pendingStableOffset.sumX += ax;
+  pendingStableOffset.sumY += ay;
+  pendingStableOffset.sumZ += az;
+  pendingStableOffset.sumTemp += temp;
+  pendingStableOffset.sampleCount++;
+  if (ax < pendingStableOffset.minX) pendingStableOffset.minX = ax;
+  if (ay < pendingStableOffset.minY) pendingStableOffset.minY = ay;
+  if (az < pendingStableOffset.minZ) pendingStableOffset.minZ = az;
+  if (ax > pendingStableOffset.maxX) pendingStableOffset.maxX = ax;
+  if (ay > pendingStableOffset.maxY) pendingStableOffset.maxY = ay;
+  if (az > pendingStableOffset.maxZ) pendingStableOffset.maxZ = az;
+  updateCalibrationActivity();
+
+  unsigned long elapsedMs = now - pendingStableOffset.startedMs;
+  float elapsedMin = elapsedMs / 60000.0f;
+  if (elapsedMin < 0.1f) elapsedMin = 0.1f;
+  float driftX = fabsf(pendingStableOffset.lastX - pendingStableOffset.firstX) / elapsedMin;
+  float driftY = fabsf(pendingStableOffset.lastY - pendingStableOffset.firstY) / elapsedMin;
+  float driftZ = fabsf(pendingStableOffset.lastZ - pendingStableOffset.firstZ) / elapsedMin;
+  float tempDrift = fabsf(pendingStableOffset.lastTemp - pendingStableOffset.firstTemp) / elapsedMin;
+  if (tempDrift > pendingStableOffset.peakTempDrift) {
+    pendingStableOffset.peakTempDrift = tempDrift;
+  }
+  float avgX = pendingStableOffset.sumX / pendingStableOffset.sampleCount;
+  float avgY = pendingStableOffset.sumY / pendingStableOffset.sampleCount;
+  float avgZ = pendingStableOffset.sumZ / pendingStableOffset.sampleCount;
+  float magnitude = sqrtf(avgX * avgX + avgY * avgY + avgZ * avgZ) / 16384.0f;
+  bool vectorValid = magnitude >= 0.80f && magnitude <= 1.20f;
+  bool stable = elapsedMs >= minStableMs &&
+                pendingStableOffset.sampleCount >= 6 &&
+                driftX <= maxAxisDriftPerMin &&
+                driftY <= maxAxisDriftPerMin &&
+                driftZ <= maxAxisDriftPerMin &&
+                vectorValid &&
+                (pendingStableOffset.maxX - pendingStableOffset.minX) <= maxShortSpan &&
+                (pendingStableOffset.maxY - pendingStableOffset.minY) <= maxShortSpan &&
+                (pendingStableOffset.maxZ - pendingStableOffset.minZ) <= maxShortSpan;
+  bool timeout = elapsedMs >= maxStableMs;
+  float minRemainingSec = elapsedMs < minStableMs ? (minStableMs - elapsedMs) / 1000.0f : 0.0f;
+  float tempRemainingSec = tempDrift > maxTempDriftPerMin ? 120.0f : 0.0f;
+  if (tempDrift > maxTempDriftPerMin &&
+      pendingStableOffset.previousTempDrift > tempDrift &&
+      pendingStableOffset.previousTempDriftMs > 0 &&
+      now > pendingStableOffset.previousTempDriftMs) {
+    float dtMin = (now - pendingStableOffset.previousTempDriftMs) / 60000.0f;
+    float decay = logf(pendingStableOffset.previousTempDrift / tempDrift) / dtMin;
+    if (decay > 0.001f && decay < 10.0f) {
+      tempRemainingSec = logf(tempDrift / maxTempDriftPerMin) / decay * 60.0f;
+      if (tempRemainingSec < 0.0f) tempRemainingSec = 0.0f;
+    }
+  }
+  pendingStableOffset.previousTempDrift = tempDrift;
+  pendingStableOffset.previousTempDriftMs = now;
+  float maxRemainingSec = elapsedMs < maxStableMs ? (maxStableMs - elapsedMs) / 1000.0f : 0.0f;
+  if (tempRemainingSec > maxRemainingSec) tempRemainingSec = maxRemainingSec;
+  float etaSeconds = minRemainingSec > tempRemainingSec ? minRemainingSec : tempRemainingSec;
+  if (!stable && !timeout) {
+    if (!vectorValid) {
+      char status[24];
+      snprintf(status, sizeof(status), "Mag %.2fg", magnitude);
+      sendCalibrationStatus(0.0f, tempDrift, pendingStableOffset.requestId, status);
+    } else if (driftX > maxAxisDriftPerMin || driftY > maxAxisDriftPerMin || driftZ > maxAxisDriftPerMin ||
+               (pendingStableOffset.maxX - pendingStableOffset.minX) > maxShortSpan ||
+               (pendingStableOffset.maxY - pendingStableOffset.minY) > maxShortSpan ||
+               (pendingStableOffset.maxZ - pendingStableOffset.minZ) > maxShortSpan) {
+      sendCalibrationStatus(etaSeconds, tempDrift, pendingStableOffset.requestId, "Hold still");
+    } else if (tempDrift > maxTempDriftPerMin) {
+      sendCalibrationStatus(etaSeconds, tempDrift, pendingStableOffset.requestId, "G stable soon");
+    } else {
+      sendCalibrationStatus(etaSeconds, tempDrift, pendingStableOffset.requestId, "G stable soon");
+    }
+    Serial.printf("Offset sample avg=%0.f/%0.f/%0.f mag=%.3f drift=%0.f/%0.f/%0.f span=%d/%d/%d temp=%.2f rate=%.3f samples=%d\n",
+                  avgX, avgY, avgZ, magnitude, driftX, driftY, driftZ,
+                  pendingStableOffset.maxX - pendingStableOffset.minX,
+                  pendingStableOffset.maxY - pendingStableOffset.minY,
+                  pendingStableOffset.maxZ - pendingStableOffset.minZ,
+                  pendingStableOffset.lastTemp, tempDrift, pendingStableOffset.sampleCount);
+    return;
+  }
+
+  if (!stable && !vectorValid) {
+    pendingStableOffset.active = false;
+    char message[32];
+    snprintf(message, sizeof(message), "Offset mag %.2fg", magnitude);
+    sendCalibrationResponse(0.0f, 0.0f, pendingStableOffset.requestId, message);
+    if (debug_mode) {
+      Serial.printf("Offset calibration failed: mag=%.3f avg=%0.f/%0.f/%0.f span=%d/%d/%d\n",
+                    magnitude, avgX, avgY, avgZ,
+                    pendingStableOffset.maxX - pendingStableOffset.minX,
+                    pendingStableOffset.maxY - pendingStableOffset.minY,
+                    pendingStableOffset.maxZ - pendingStableOffset.minZ);
+    }
+    return;
+  }
+
+  float newOffsetX = avgX;
+  float newOffsetY = avgY + 16384.0f;
+  float newOffsetZ = avgZ;
+  if (sensorOffsets.isValid) {
+    float dx = newOffsetX - sensorOffsets.offsetX;
+    float dy = newOffsetY - sensorOffsets.offsetY;
+    float dz = newOffsetZ - sensorOffsets.offsetZ;
+    float offsetDelta = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (offsetDelta > 2500.0f) {
+      pendingStableOffset.active = false;
+      char message[32];
+      snprintf(message, sizeof(message), "Offset jump %.0f", offsetDelta);
+      sendCalibrationResponse(0.0f, 0.0f, pendingStableOffset.requestId, message);
+      if (debug_mode) {
+        Serial.printf("Offset calibration rejected: delta=%.0f old=%.0f/%.0f/%.0f new=%.0f/%.0f/%.0f\n",
+                      offsetDelta, sensorOffsets.offsetX, sensorOffsets.offsetY, sensorOffsets.offsetZ,
+                      newOffsetX, newOffsetY, newOffsetZ);
+      }
+      return;
+    }
+  }
+
+  sensorOffsets.offsetX = newOffsetX;
+  sensorOffsets.offsetY = newOffsetY;
+  sensorOffsets.offsetZ = newOffsetZ;
+  sensorOffsets.isValid = true;
+  bool saved = saveSensorOffsets();
+  float offsetAngle = saved ? measureTilt() : 0.0f;
+  pendingStableOffset.active = false;
+  sendCalibrationResponse(offsetAngle, 0.0f, pendingStableOffset.requestId,
+                          saved ? (stable ? "Offset stable" : "Offset max wait") : "Offset save failed");
+  if (debug_mode) {
+    Serial.printf("Offset calibration %s: angle %.2f samples=%d mag=%.3f\n",
+                  saved ? "saved" : "failed", offsetAngle,
+                  pendingStableOffset.sampleCount, magnitude);
+  }
+}
+
+void handlePendingStableCalibrationPoint() {
+  if (!pendingStablePoint.active) return;
+
+  const unsigned long minStableMs = 120000UL;
+  const unsigned long maxStableMs = 600000UL;
+  const unsigned long sampleIntervalMs = 10000UL;
+  unsigned long now = millis();
+  if (pendingStablePoint.lastSampleMs != 0 && now - pendingStablePoint.lastSampleMs < sampleIntervalMs) {
+    return;
+  }
+
+  pendingStablePoint.lastSampleMs = now;
+  float angle = measureTilt();
+  float temp = measureTemperature();
+  float sg = calculateDensity(angle, temp);
+  if (pendingStablePoint.sampleCount == 0) {
+    pendingStablePoint.firstAngle = angle;
+    pendingStablePoint.firstTemp = temp;
+    pendingStablePoint.firstSG = sg;
+  }
+  pendingStablePoint.lastAngle = angle;
+  pendingStablePoint.lastTemp = temp;
+  pendingStablePoint.lastSG = sg;
+  pendingStablePoint.sumAngle += angle;
+  pendingStablePoint.sumTemp += temp;
+  pendingStablePoint.sampleCount++;
+  updateCalibrationActivity();
+
+  unsigned long elapsedMs = now - pendingStablePoint.startedMs;
+  float elapsedMin = elapsedMs / 60000.0f;
+  if (elapsedMin < 0.1f) elapsedMin = 0.1f;
+  float angleDriftPerMin = fabsf(pendingStablePoint.lastAngle - pendingStablePoint.firstAngle) / elapsedMin;
+  float tempDriftPerMin = fabsf(pendingStablePoint.lastTemp - pendingStablePoint.firstTemp) / elapsedMin;
+  float sgDriftPerMin = fabsf(pendingStablePoint.lastSG - pendingStablePoint.firstSG) / elapsedMin;
+  bool stable = elapsedMs >= minStableMs &&
+                pendingStablePoint.sampleCount >= 6 &&
+                angleDriftPerMin <= 0.05f &&
+                tempDriftPerMin <= 0.05f &&
+                sgDriftPerMin <= 0.0002f;
+  bool timeout = elapsedMs >= maxStableMs;
+
+  if (!stable && !timeout) {
+    if (debug_mode) {
+      Serial.printf("Point %u stabilizing: angle %.2f/min temp %.3f/min sg %.5f/min samples=%d\n",
+                    pendingStablePoint.pointNumber, angleDriftPerMin, tempDriftPerMin,
+                    sgDriftPerMin, pendingStablePoint.sampleCount);
+    }
+    return;
+  }
+
+  float avgAngle = pendingStablePoint.sumAngle / pendingStablePoint.sampleCount;
+  float avgTemp = pendingStablePoint.sumTemp / pendingStablePoint.sampleCount;
+  addCalibrationPoint(avgAngle, pendingStablePoint.targetSG, avgTemp);
+
+  char message[24];
+  snprintf(message, sizeof(message), timeout ? "Point %u max wait" : "Point %u stable", pendingStablePoint.pointNumber);
+  sendCalibrationResponse(avgAngle, pendingStablePoint.targetSG, pendingStablePoint.requestId, message);
+
+  if (debug_mode) {
+    Serial.printf("Point %u accepted: %.2f deg, %.1f C (%d samples, stable=%d)\n",
+                  pendingStablePoint.pointNumber, avgAngle, avgTemp,
+                  pendingStablePoint.sampleCount, stable ? 1 : 0);
+  }
+  pendingStablePoint.active = false;
 }
 
 void sendCalibrationCoefficients(uint8_t request_id) {
@@ -1268,6 +1746,30 @@ void sendCalibrationResponse(float angle, float target_sg, uint8_t request_id, c
   } else {
     if (debug_mode) Serial.printf("Error sending calibration response: %d\n", result);
     calibrationResponsePending = true; // Mark as pending for retry
+  }
+}
+
+void sendCalibrationStatus(float etaSeconds, float tempDriftPerMin, uint8_t request_id, const char* message) {
+  unsigned long currentTime = millis();
+  if (currentTime - lastCalibrationResponse < CALIBRATION_RESPONSE_INTERVAL) {
+    return;
+  }
+
+  calib_response_t response;
+  response.response_type = 1;
+  response.angle = tempDriftPerMin;
+  response.sg = etaSeconds;
+  response.request_id = request_id;
+  strncpy(response.message, message, sizeof(response.message) - 1);
+  response.message[sizeof(response.message) - 1] = '\0';
+
+  esp_err_t result = esp_now_send(baseStationMac, (uint8_t *)&response, sizeof(response));
+  if (result == ESP_OK) {
+    lastCalibrationResponse = currentTime;
+    if (debug_mode) {
+      Serial.printf("Calibration status sent: eta=%.0fs tempDrift=%.3f msg=%s\n",
+                    etaSeconds, tempDriftPerMin, message);
+    }
   }
 }
 
@@ -1334,7 +1836,7 @@ bool processFloatHarnessCommand(char* line) {
   }
 
   if (strcmp(line, "help") == 0) {
-    printFloatHarnessOK("commands=help,build_info,status,dump_config,mock_measurement,set_mock_sg,set_mock_temp,set_mock_battery,set_mock_angle,set_sequence,send_now,send_retry_buffer,dump_retry_buffer,clear_retry_buffer,simulate_ack,simulate_no_ack,no_sleep,pause_state,rx_debug,enter_calibration_mode,exit_calibration_mode,calib_status");
+    printFloatHarnessOK("commands=help,build_info,status,dump_config,mock_measurement,set_mock_sg,set_mock_temp,set_mock_battery,set_mock_angle,set_sequence,send_now,send_retry_buffer,dump_retry_buffer,clear_retry_buffer,simulate_ack,simulate_zero_ack,quick_zero,quick_zero_diag,zero_status,reset_zero_state,simulate_no_ack,no_sleep,pause_state,rx_debug,enter_calibration_mode,exit_calibration_mode,calib_status");
     return true;
   }
   if (strcmp(line, "build_info") == 0) {
@@ -1439,6 +1941,99 @@ bool processFloatHarnessCommand(char* line) {
     printFloatHarnessOK("ack_simulated");
     return true;
   }
+  if (strcmp(line, "simulate_zero_ack") == 0) {
+    uint16_t seq = sensorData.sequence_id;
+    uint8_t commandId = (uint8_t)(rtcLastAckCommandId + 1);
+    if (args && args[0]) {
+      seq = (uint16_t)atoi(args);
+      char* second = strchr(args, ' ');
+      if (second) {
+        while (*second == ' ') second++;
+        commandId = (uint8_t)atoi(second);
+      }
+    }
+
+    ack_packet_t ack = {};
+    ack.packet_type = ACK_PACKET_TYPE;
+    ack.sequence_id = seq;
+    ack.highest_seen = seq;
+    ack.command = SG_ACK_COMMAND_ZERO_CALIBRATE;
+    ack.command_id = commandId;
+
+    zeroCalProcessedThisWake = false;
+    onDataAck(baseStationMac, (const uint8_t*)&ack, sizeof(ack));
+    bool processed = processQueuedZeroCalibrationCommand();
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "zero_ack seq=%u cmd=%u processed=%d flags=0x%02X offset=%d queued=%d",
+             seq, commandId, processed ? 1 : 0, rtcPendingPayloadFlags,
+             sensorOffsets.isValid ? 1 : 0, queuedZeroCalCommand ? 1 : 0);
+    printFloatHarnessOK(msg);
+    return true;
+  }
+  if (strcmp(line, "quick_zero") == 0) {
+    float before = measureTilt();
+    bool ok = runQuickZeroCalibration();
+    float after = measureTilt();
+    char msg[160];
+    snprintf(msg, sizeof(msg), "quick_zero ok=%d before=%.2f after=%.2f offset=%d",
+             ok ? 1 : 0, before, after, sensorOffsets.isValid ? 1 : 0);
+    printFloatHarnessOK(msg);
+    return true;
+  }
+  if (strcmp(line, "quick_zero_diag") == 0) {
+    const int sampleCount = 5;
+    long totalX = 0, totalY = 0, totalZ = 0;
+    int minX = 32767, minY = 32767, minZ = 32767;
+    int maxX = -32768, maxY = -32768, maxZ = -32768;
+    for (int i = 0; i < sampleCount; i++) {
+      int ax, ay, az;
+      BMI160.readAccelerometer(ax, ay, az);
+      totalX += ax; totalY += ay; totalZ += az;
+      if (ax < minX) minX = ax; if (ay < minY) minY = ay; if (az < minZ) minZ = az;
+      if (ax > maxX) maxX = ax; if (ay > maxY) maxY = ay; if (az > maxZ) maxZ = az;
+      delay(40);
+    }
+    float avgX = totalX / (float)sampleCount;
+    float avgY = totalY / (float)sampleCount;
+    float avgZ = totalZ / (float)sampleCount;
+    float mag = sqrtf(avgX * avgX + avgY * avgY + avgZ * avgZ) / 16384.0f;
+    float newOffsetX = avgX;
+    float newOffsetY = avgY + 16384.0f;
+    float newOffsetZ = avgZ;
+    float dx = sensorOffsets.isValid ? newOffsetX - sensorOffsets.offsetX : 0.0f;
+    float dy = sensorOffsets.isValid ? newOffsetY - sensorOffsets.offsetY : 0.0f;
+    float dz = sensorOffsets.isValid ? newOffsetZ - sensorOffsets.offsetZ : 0.0f;
+    float delta = sensorOffsets.isValid ? sqrtf(dx * dx + dy * dy + dz * dz) : 0.0f;
+    char msg[240];
+    snprintf(msg, sizeof(msg),
+             "quick_zero_diag mag=%.3f span=%d/%d/%d delta=%.0f raw=%.0f/%.0f/%.0f new=%.0f/%.0f/%.0f old=%.0f/%.0f/%.0f valid=%d",
+             mag, maxX - minX, maxY - minY, maxZ - minZ, delta,
+             avgX, avgY, avgZ, newOffsetX, newOffsetY, newOffsetZ,
+             sensorOffsets.offsetX, sensorOffsets.offsetY, sensorOffsets.offsetZ,
+             sensorOffsets.isValid ? 1 : 0);
+    printFloatHarnessOK(msg);
+    return true;
+  }
+  if (strcmp(line, "zero_status") == 0) {
+    float angle = measureTilt();
+    char msg[180];
+    snprintf(msg, sizeof(msg),
+             "zero_status angle=%.2f flags=0x%02X last_cmd=%u queued=%d queued_id=%u processed=%d offset=%d",
+             angle, rtcPendingPayloadFlags, rtcLastAckCommandId,
+             queuedZeroCalCommand ? 1 : 0, queuedZeroCalCommandId,
+             zeroCalProcessedThisWake ? 1 : 0, sensorOffsets.isValid ? 1 : 0);
+    printFloatHarnessOK(msg);
+    return true;
+  }
+  if (strcmp(line, "reset_zero_state") == 0) {
+    queuedZeroCalCommand = false;
+    queuedZeroCalCommandId = 0;
+    zeroCalProcessedThisWake = false;
+    rtcPendingPayloadFlags &= ~(SG_PAYLOAD_FLAG_ZERO_CAL_OK | SG_PAYLOAD_FLAG_ZERO_CAL_FAIL);
+    printFloatHarnessOK("zero_state_reset");
+    return true;
+  }
   if (strcmp(line, "simulate_no_ack") == 0) {
     storePayloadForRetry(sensorData);
     printFloatHarnessOK("no_ack_simulated");
@@ -1522,6 +2117,7 @@ void exitCalibrationMode() {
 }
 
 void sendCalibrationTrigger() {
+  ensureDebugSerial();
   Serial.println("=== SENDING CALIBRATION TRIGGER ===");
   Serial.printf("Target MAC: %02X:%02X:%02X:%02X:%02X\n", 
                 baseStationMac[0], baseStationMac[1], baseStationMac[2], 

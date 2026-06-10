@@ -265,6 +265,9 @@ bool lastHistoricalBatchStartRelaxed = false;
 uint32_t lastHistoricalOldestEpoch = 0;
 uint32_t lastHistoricalNewestEpoch = 0;
 
+#define CSV_LINE_BUFFER_SIZE 320
+#define FERMENTATION_LOG_HEADER "timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code,float_temperature,plug_beer_temperature,plug_air_temperature,plug_beer_target,plug_air_target,plug_mode,plug_relay,plug_duty_10m,plug_faults,plug_pi_offset,plug_pi_tn"
+
 // Separate buffer for discharge rate calculation (25 recent points only)
 payload_t dischargeRateBuffer[25];
 uint32_t dischargeRateTimestampBuffer[25];
@@ -373,11 +376,16 @@ float calibOffset = 0.0; // Store sensor offset angle
 bool offsetCalibrated = false; // Track if offset calibration is complete
 uint8_t currentRequestId = 0;
 bool calibrationModeActive = false; // Track if float is in calibration mode
+char calibFailureMessage[64] = "No response from float";
 
 // Wait notification system
 unsigned long waitStartTime = 0;
 bool waitActive = false;
 int waitDuration = 0; // Duration in milliseconds
+float calibWaitEtaSeconds = -1.0f;
+float calibWaitTempDriftPerMin = 0.0f;
+uint32_t calibWaitStatusMs = 0;
+char calibWaitStatus[32] = "Measuring...";
 
 // Calibration response flood protection
 unsigned long lastCalibrationResponse = 0;
@@ -389,14 +397,26 @@ const int MAX_CALIBRATION_RESPONSES_PER_MINUTE = 30; // Max 30 responses per min
 // Float unit MAC address storage
 uint8_t floatMac[6] = {0}; // Store float unit MAC address
 bool floatMacKnown = false; // Flag to indicate if float MAC is known
+uint8_t plugMac[6] = {0};
+bool plugMacKnown = false;
+sg_plug_status_t latestPlugStatus = {};
+bool latestPlugStatusValid = false;
+uint32_t latestPlugStatusMs = 0;
+uint16_t plugCommandSequence = 0;
+uint32_t lastPlugCommandMs = 0;
+float latestFloatTemperatureC = NAN;
 
 // EEPROM addresses for float MAC storage
+#define EEPROM_BYTES 160
 #define EEPROM_FLOAT_MAC_MAGIC 100
 #define EEPROM_FLOAT_MAC_ADDR 104
 #define EEPROM_THEME_MAGIC 120
 #define EEPROM_THEME_VALUE 124
+#define EEPROM_PLUG_MAC_MAGIC 132
+#define EEPROM_PLUG_MAC_ADDR 136
 #define FLOAT_MAC_MAGIC 0x4D414346 // "MACF" in hex
 #define THEME_MAGIC 0x54484D45 // "THME" in hex
+#define PLUG_MAC_MAGIC 0x4D414350 // "MACP" in hex
 
 // Touch handling
 uint16_t touchX, touchY;
@@ -451,6 +471,16 @@ const unsigned long TOPBAR_REFRESH_INTERVAL = 10000; // ms
 #define BUTTON_CONTINUE_W 100
 #define BUTTON_CONTINUE_H 40
 
+#define MANAGE_BREW_ROW_Y 184
+#define MANAGE_BREW_ROW_H 34
+#define MANAGE_BREW_NAV_W 48
+#define MANAGE_BREW_ACTION_W 90
+#define MANAGE_BREW_PREV_X MARGIN
+#define MANAGE_BREW_CONT_X (MARGIN + 60)
+#define MANAGE_BREW_COPY_X (MARGIN + 162)
+#define MANAGE_BREW_DELETE_X (MARGIN + 264)
+#define MANAGE_BREW_NEXT_X (UI_W - MARGIN - MANAGE_BREW_NAV_W)
+
 #define BUTTON_NEW_X 160
 #define BUTTON_NEW_Y 140
 #define BUTTON_NEW_W 100
@@ -492,6 +522,10 @@ bool targetCurveAvailable = false;
 bool yeastPerformanceSaved = false;
 float previousAnalyticsSG = 0.0f;
 uint32_t previousAnalyticsEpoch = 0;
+bool floatZeroCalCommandPending = false;
+bool floatZeroCalAwaitingConfirmation = false;
+uint8_t floatZeroCalCommandId = 0;
+char floatZeroCalStatus[80] = "";
 
 enum NewYeastStep {
   NY_NAME,
@@ -637,7 +671,15 @@ void formatTimestamp(uint32_t epoch, char* buf, size_t bufSize);
 uint32_t buildEpochWithUploadOffset();
 uint32_t parseDateTimeToEpoch(const char* timestamp);
 void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len);
-void sendDataAck(const uint8_t* mac, uint16_t sequence_id);
+void onPlugStatusReceived(const uint8_t *mac, const uint8_t *incomingData, int len);
+void sendPlugCommandIfDue();
+bool hasValidPlugBeerTemperature();
+bool hasValidPlugAirTemperature();
+bool hasFreshPlugStatus();
+float effectiveTemperatureC(float floatTemperatureC);
+bool ensureFloatPeerRegistered(const uint8_t* mac);
+void setFloatZeroCalStatus(const char* message);
+void sendDataAck(const uint8_t* mac, const payload_t& data);
 bool isDuplicateFloatSequence(uint16_t sequence_id);
 void rememberFloatSequence(uint16_t sequence_id);
 void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int len);
@@ -690,6 +732,8 @@ void drawGrid();
 void drawGraph();
 void loadFloatMacFromEEPROM();
 void saveFloatMacToEEPROM();
+void loadPlugMacFromEEPROM();
+void savePlugMacToEEPROM();
 void startWait(int durationMs);
 void checkWaitTimeout();
 void stopWait();
@@ -739,6 +783,8 @@ bool migrateActiveBrewProfileFromHistory(const char* logPath);
 void finalizeHistoricalDataLoad();
 void markScreenDirtyForFloatData();
 void clearHistoricalDisplayData();
+void clearBufferedSensorData();
+bool shouldRecordBatchFloatData();
 void drawWrappedText(int x, int y, int w, const char* text, uint16_t color);
 void persistActiveBrewProfile();
 void startNewBatchStorage(const char* batchId);
@@ -836,6 +882,7 @@ void setup() {
   
   // Load float MAC from EEPROM for permanent pairing
   loadFloatMacFromEEPROM();
+  loadPlugMacFromEEPROM();
   
   // Show boot screen first
   drawBootScreen();
@@ -860,6 +907,8 @@ void loop() {
   #if SGNODE_BATTERY_DEBUG
     handleBatteryDebugSerial();
   #endif
+
+  sendPlugCommandIfDue();
 
   // Check for touch input
   if (millis() - lastTouchCheck > TOUCH_CHECK_INTERVAL) {
@@ -1173,8 +1222,10 @@ void initESPNow() {
       rssiAvailable = true;
     }
     
-    // Check message type first for 26-byte packets to distinguish between sensor data and coefficients
-    if (len == sizeof(calib_response_t)) { // 42 bytes - Calibration response
+    // Typed Plug packets are dispatched before legacy size-based Float packets.
+    if (len == sizeof(sg_plug_status_t) && data[0] == SG_PLUG_STATUS_TYPE) {
+      onPlugStatusReceived(recv_info->src_addr, data, len);
+    } else if (len == sizeof(calib_response_t)) { // 42 bytes - Calibration response
       onCalibrationResponse(recv_info->src_addr, data, len);
     } else if (len == sizeof(calib_coeffs_t)) { // 26 bytes - Calibration coefficients
       // Check first byte to distinguish from sensor data
@@ -1199,19 +1250,57 @@ void initESPNow() {
   LOG_INFO("Base Station MAC: %s\n", macAddress.c_str());
 }
 
-void sendDataAck(const uint8_t* mac, uint16_t sequence_id) {
+void setFloatZeroCalStatus(const char* message) {
+  if (!message || message[0] == '\0') return;
+
+  strncpy(floatZeroCalStatus, message, sizeof(floatZeroCalStatus) - 1);
+  floatZeroCalStatus[sizeof(floatZeroCalStatus) - 1] = '\0';
+  screenDirty = true;
+}
+
+void sendDataAck(const uint8_t* mac, const payload_t& data) {
   if (!mac) return;
 
   ack_packet_t ack;
   ack.packet_type = ACK_PACKET_TYPE;
-  ack.sequence_id = sequence_id;
+  ack.sequence_id = data.sequence_id;
   ack.highest_seen = highestSeenFloatSeq;
+  ack.command = SG_ACK_COMMAND_NONE;
+  ack.command_id = floatZeroCalCommandId;
+
+  bool zeroCalResult =
+    (data.flags & (SG_PAYLOAD_FLAG_ZERO_CAL_OK | SG_PAYLOAD_FLAG_ZERO_CAL_FAIL)) != 0;
+  if ((floatZeroCalCommandPending || floatZeroCalAwaitingConfirmation) && !zeroCalResult) {
+    ack.command = SG_ACK_COMMAND_ZERO_CALIBRATE;
+    ack.command_id = ++floatZeroCalCommandId;
+  }
+
+  if (!ensureFloatPeerRegistered(mac)) {
+    if (ack.command == SG_ACK_COMMAND_ZERO_CALIBRATE) {
+      setFloatZeroCalStatus("Zero ACK peer error");
+    }
+    return;
+  }
 
   esp_err_t result = esp_now_send(mac, (uint8_t*)&ack, sizeof(ack));
   if (result == ESP_OK) {
-    lastAckedFloatSeq = sequence_id;
+    lastAckedFloatSeq = data.sequence_id;
+    if (ack.command == SG_ACK_COMMAND_ZERO_CALIBRATE) {
+      floatZeroCalCommandPending = false;
+      floatZeroCalAwaitingConfirmation = true;
+      char msg[80];
+      snprintf(msg, sizeof(msg), "Zero ACK sent seq %u", data.sequence_id);
+      setFloatZeroCalStatus(msg);
+      LOG_INFO("Sent float zero calibration command id=%u at angle %.2f\n",
+               ack.command_id, data.angle);
+    }
   } else {
-    LOG_VERBOSE("Failed to send ACK for seq=%u result=%d\n", sequence_id, result);
+    if (ack.command == SG_ACK_COMMAND_ZERO_CALIBRATE) {
+      char msg[80];
+      snprintf(msg, sizeof(msg), "Zero ACK send failed %d", result);
+      setFloatZeroCalStatus(msg);
+    }
+    LOG_VERBOSE("Failed to send ACK for seq=%u result=%d\n", data.sequence_id, result);
   }
 }
 
@@ -1317,6 +1406,131 @@ void initTouch() {
   LOG_INFOLN("Touch screen ready (using TFT_eSPI built-in support)");
 }
 
+bool ensureFloatPeerRegistered(const uint8_t* mac) {
+  if (!mac) return false;
+
+  if (!floatMacKnown || memcmp(floatMac, mac, sizeof(floatMac)) != 0) {
+    memcpy(floatMac, mac, sizeof(floatMac));
+    floatMacKnown = true;
+    saveFloatMacToEEPROM();
+  }
+
+  if (esp_now_is_peer_exist(mac)) {
+    return true;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = ESPNOW_CHANNEL;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+
+  esp_err_t addResult = esp_now_add_peer(&peerInfo);
+  if (addResult == ESP_OK || addResult == ESP_ERR_ESPNOW_EXIST) {
+    return true;
+  }
+
+  LOG_ERROR("Failed to register float as peer: %d\n", addResult);
+  return false;
+}
+
+void onPlugStatusReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  if (!mac || !incomingData || len != sizeof(sg_plug_status_t)) return;
+
+  sg_plug_status_t status;
+  memcpy(&status, incomingData, sizeof(status));
+  uint16_t calculatedCrc = sg_crc16((const uint8_t*)&status, offsetof(sg_plug_status_t, crc));
+  if (status.packet_type != SG_PLUG_STATUS_TYPE ||
+      status.version != SG_PROTOCOL_VERSION || status.crc != calculatedCrc) {
+    LOG_ERRORLN("Rejected invalid SGNode Plug status packet");
+    return;
+  }
+
+  if (!plugMacKnown) {
+    memcpy(plugMac, mac, sizeof(plugMac));
+    plugMacKnown = true;
+    savePlugMacToEEPROM();
+
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, plugMac, sizeof(plugMac));
+    peerInfo.channel = ESPNOW_CHANNEL;
+    peerInfo.encrypt = false;
+    peerInfo.ifidx = WIFI_IF_STA;
+    esp_err_t addResult = esp_now_add_peer(&peerInfo);
+    if (addResult != ESP_OK && addResult != ESP_ERR_ESPNOW_EXIST) {
+      LOG_ERROR("Failed to register SGNode Plug peer: %d\n", addResult);
+    }
+  } else if (memcmp(plugMac, mac, sizeof(plugMac)) != 0) {
+    LOG_ERRORLN("Ignored SGNode Plug status from unknown MAC");
+    return;
+  }
+
+  latestPlugStatus = status;
+  latestPlugStatusValid = true;
+  latestPlugStatusMs = millis();
+  tileTempDirty = true;
+  topbarDirty = true;
+  detailsDirty = true;
+  screenDirty = true;
+}
+
+bool hasValidPlugBeerTemperature() {
+  if (!latestPlugStatusValid || millis() - latestPlugStatusMs > 5UL * 60000UL) return false;
+  if ((latestPlugStatus.faults & SG_PLUG_FAULT_BEER_SENSOR) != 0) return false;
+  return !isnan(latestPlugStatus.beer_temp_c) && !isinf(latestPlugStatus.beer_temp_c) &&
+         latestPlugStatus.beer_temp_c > -5.0f && latestPlugStatus.beer_temp_c < 60.0f;
+}
+
+bool hasValidPlugAirTemperature() {
+  if (!latestPlugStatusValid || millis() - latestPlugStatusMs > 5UL * 60000UL) return false;
+  if ((latestPlugStatus.faults & SG_PLUG_FAULT_AIR_SENSOR) != 0) return false;
+  return !isnan(latestPlugStatus.air_temp_c) && !isinf(latestPlugStatus.air_temp_c) &&
+         latestPlugStatus.air_temp_c > -20.0f && latestPlugStatus.air_temp_c < 60.0f;
+}
+
+bool hasFreshPlugStatus() {
+  return latestPlugStatusValid && millis() - latestPlugStatusMs <= 5UL * 60000UL;
+}
+
+float effectiveTemperatureC(float floatTemperatureC) {
+  return hasValidPlugBeerTemperature() ? latestPlugStatus.beer_temp_c : floatTemperatureC;
+}
+
+void sendPlugCommandIfDue() {
+  const uint32_t nowMs = millis();
+  if (!plugMacKnown || nowMs - lastPlugCommandMs < 60000UL) return;
+  lastPlugCommandMs = nowMs;
+
+  sg_plug_command_t command = {};
+  command.packet_type = SG_PLUG_COMMAND_TYPE;
+  command.version = SG_PROTOCOL_VERSION;
+  command.sequence_id = ++plugCommandSequence;
+  command.base_epoch = getCurrentEpoch();
+  command.beer_target_c = brewProfileLoaded ? currentTemperatureTargetC(command.base_epoch) : 20.0f;
+  command.ramp_k_per_h = 0.0f;
+  if (brewProfileLoaded && activeBrewProfile.coldCrashDone &&
+      !activeBrewProfile.coldCrashSkipped &&
+      isEpochValid(activeBrewProfile.coldCrashStartedAt) &&
+      command.base_epoch < activeBrewProfile.coldCrashStartedAt + 24UL * 3600UL) {
+    command.ramp_k_per_h = 1.0f;
+  } else if (brewProfileLoaded && activeBrewProfile.dRestDone &&
+             !activeBrewProfile.dRestSkipped &&
+             isEpochValid(activeBrewProfile.dRestStartedAt) &&
+             command.base_epoch < activeBrewProfile.dRestStartedAt + 12UL * 3600UL) {
+    command.ramp_k_per_h = 0.2f;
+  }
+  command.batch_liters = brewProfileLoaded ? activeBrewProfile.batchSizeLiters : 20.0f;
+  command.flags = brewProfileLoaded && !activeBrewProfile.completed && activeBrewProfile.plugControlEnabled
+    ? SG_PLUG_COMMAND_ENABLE
+    : 0;
+  command.crc = sg_crc16((const uint8_t*)&command, offsetof(sg_plug_command_t, crc));
+
+  esp_err_t result = esp_now_send(plugMac, (uint8_t*)&command, sizeof(command));
+  if (result != ESP_OK) {
+    LOG_ERROR("Failed to send SGNode Plug command: %d\n", result);
+  }
+}
+
 void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
   if (len == sizeof(payload_t)) {
     // Store float MAC address if not known yet
@@ -1376,7 +1590,7 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
     } else {
       duplicateFloatPackets++;
     }
-    sendDataAck(mac, receivedData.sequence_id);
+    sendDataAck(mac, receivedData);
     
     uint32_t receivedEpoch = getCurrentEpoch();
 
@@ -1396,10 +1610,51 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
                 receivedData.battery_voltage, normalizedData.battery_voltage);
     }
 
+    latestFloatTemperatureC = receivedData.temperature;
+    normalizedData.temperature = effectiveTemperatureC(receivedData.temperature);
+
     uint8_t batteryPercent = calculateBatteryPercentage(normalizedData.battery_voltage);
     latestFloatData = normalizedData;
     latestFloatEpoch = receivedEpoch;
     latestFloatDataValid = true;
+
+    if ((receivedData.flags & SG_PAYLOAD_FLAG_ZERO_CAL_OK) != 0 && brewProfileLoaded) {
+      floatZeroCalCommandPending = false;
+      floatZeroCalAwaitingConfirmation = false;
+      activeBrewProfile.floatZeroCalDone = true;
+      activeBrewProfile.floatZeroCalSkipped = false;
+      activeBrewProfile.floatZeroCalibratedAt = receivedEpoch;
+      if (mountSDTemporarily()) {
+        BrewProfileStore::save(activeBrewProfile);
+        BrewProfileStore::appendBatchEvent(activeBrewProfile.batchId, receivedEpoch,
+                                           "FLOAT_ZERO_CAL_DONE",
+                                           "Float zero calibration confirmed",
+                                           normalizedData.angle);
+        dismountSD();
+      }
+      currentRecommendation.code = 0;
+      currentRecommendation.message[0] = '\0';
+      currentBatchAction.type = ACTION_NONE;
+      currentBatchAction.code = 0;
+      currentBatchAction.message[0] = '\0';
+      floatZeroCalStatus[0] = '\0';
+      refreshFermentationAssistantFromProfile();
+    } else if ((receivedData.flags & SG_PAYLOAD_FLAG_ZERO_CAL_FAIL) != 0 && brewProfileLoaded) {
+      floatZeroCalCommandPending = false;
+      floatZeroCalAwaitingConfirmation = false;
+      activeBrewProfile.floatZeroCalDone = false;
+      if (mountSDTemporarily()) {
+        BrewProfileStore::save(activeBrewProfile);
+        BrewProfileStore::appendBatchEvent(activeBrewProfile.batchId, receivedEpoch,
+                                           "FLOAT_ZERO_CAL_FAILED",
+                                           "Place float level and retry",
+                                           normalizedData.angle);
+        dismountSD();
+      }
+      currentRecommendation.code = 12;
+      strncpy(currentRecommendation.message, "Zero calibration failed", sizeof(currentRecommendation.message) - 1);
+      currentRecommendation.message[sizeof(currentRecommendation.message) - 1] = '\0';
+    }
     
     // Update charging state only with plausible battery values
     if (batteryPlausible) {
@@ -1413,8 +1668,10 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
                   chargingState == DISCHARGING ? "DISCHARGING" : "UNKNOWN");
     
     if (!duplicatePacket) {
+      bool recordBatchFloatData = shouldRecordBatchFloatData();
+
       // Check OG stability if not yet captured
-      if (!brewProfileLoaded && !ogCaptured && fermentationFileOpen) {
+      if (recordBatchFloatData && !brewProfileLoaded && !ogCaptured && fermentationFileOpen) {
         checkOGStability(normalizedData.density);
       }
 
@@ -1423,13 +1680,19 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
         currentABV = calculateABV(originalGravity, normalizedData.density);
       }
 
-      updateFermentationAssistant(normalizedData, receivedEpoch);
+      if (recordBatchFloatData) {
+        updateFermentationAssistant(normalizedData, receivedEpoch);
+      } else {
+        refreshCurrentBatchAction(normalizedData.density, receivedEpoch);
+      }
 
       // Add data to display buffer
       addDataPoint(normalizedData, receivedEpoch);
 
-      // Buffer sensor data for SD writing (time-based approach)
-      bufferSensorData(normalizedData, receivedEpoch);
+      // Buffer sensor data for SD writing only after the float is confirmed in the brew.
+      if (recordBatchFloatData) {
+        bufferSensorData(normalizedData, receivedEpoch);
+      }
     } else {
       LOG_VERBOSE("Duplicate float packet seq=%u acknowledged, not logged again\n", receivedData.sequence_id);
     }
@@ -1503,6 +1766,19 @@ void clearHistoricalDisplayData() {
   memset(dischargeRateTimestampBuffer, 0, sizeof(dischargeRateTimestampBuffer));
   previousAnalyticsSG = 0.0f;
   previousAnalyticsEpoch = 0;
+}
+
+void clearBufferedSensorData() {
+  bufferIndex = 0;
+  bufferedCount = 0;
+  oldestBufferedMillis = 0;
+  memset(dataBuffer, 0, sizeof(dataBuffer));
+}
+
+bool shouldRecordBatchFloatData() {
+  if (!brewProfileLoaded) return fermentationFileOpen && currentFermentationFile[0] != '\0';
+  if (activeBrewProfile.completed) return false;
+  return activeBrewProfile.floatInBrewConfirmed || activeBrewProfile.ogVerified;
 }
 
 void finalizeHistoricalDataLoad() {
@@ -1905,7 +2181,8 @@ void drawDashboardScreen() {
   uiEllipsize(currentBatchAction.title, contentW - 20, text, sizeof(text));
   tft.setCursor(MARGIN + 10, actionY + 34);
   tft.print(text);
-  drawWrappedText(MARGIN + 10, actionY + 50, contentW - (currentBatchAction.requiresChoice ? 196 : 20),
+  bool singleActionButton = currentBatchAction.type == ACTION_FLOAT_IN_BREW;
+  drawWrappedText(MARGIN + 10, actionY + 50, contentW - (currentBatchAction.requiresChoice ? (singleActionButton ? 106 : 196) : 20),
                   currentBatchAction.type == ACTION_NONE ? currentRecommendation.message : currentBatchAction.message,
                   uiColorTextSecondary);
   if (currentBatchAction.requiresChoice) {
@@ -1913,11 +2190,15 @@ void drawDashboardScreen() {
     int buttonY = actionY + actionH - 32;
     int skipX = MARGIN + contentW - buttonW * 2 - GAP - 10;
     int doneX = MARGIN + contentW - buttonW - 10;
-    tft.fillRoundRect(skipX, buttonY, buttonW, 28, 8, uiColorCardBackground);
-    tft.drawRoundRect(skipX, buttonY, buttonW, 28, 8, uiColorBorder);
-    uiTextCenter(skipX, buttonY, buttonW, 28, "SKIP", FONT_SIZE_XS, uiColorTextPrimary);
+    if (!singleActionButton) {
+      tft.fillRoundRect(skipX, buttonY, buttonW, 28, 8, uiColorCardBackground);
+      tft.drawRoundRect(skipX, buttonY, buttonW, 28, 8, uiColorBorder);
+      uiTextCenter(skipX, buttonY, buttonW, 28, "SKIP", FONT_SIZE_XS, uiColorTextPrimary);
+    }
     tft.fillRoundRect(doneX, buttonY, buttonW, 28, 8, uiColorGold);
-    uiTextCenter(doneX, buttonY, buttonW, 28, "DONE", FONT_SIZE_XS, uiColorPrimaryText);
+    uiTextCenter(doneX, buttonY, buttonW, 28,
+                 currentBatchAction.type == ACTION_FLOAT_ZERO_CAL ? "READY" : "DONE",
+                 FONT_SIZE_XS, uiColorPrimaryText);
   }
 
   // 4 core metrics in one calm row
@@ -2424,7 +2705,7 @@ void loadManagedBatches() {
       const char* id = slash ? slash + 1 : name;
       static BrewProfile p;
       if (BrewProfileStore::load(id, &p)) {
-        strncpy(managedBatchIds[managedBatchCount], p.batchId, 23);
+        strncpy(managedBatchIds[managedBatchCount], id, 23);
         managedBatchIds[managedBatchCount][23] = '\0';
         strncpy(managedBatchNames[managedBatchCount], p.batchName, 39);
         managedBatchNames[managedBatchCount][39] = '\0';
@@ -2516,6 +2797,8 @@ void copyManagedBatch(const char* batchId) {
     p.ogDifference = 0.0f;
     p.ogVerified = false;
     p.ogNeedsChoice = false;
+    p.floatInBrewConfirmed = false;
+    p.floatInBrewAt = 0;
     BrewProfileStore::save(p);
     TargetCurveGenerator::generateAndSave(p);
     activeBrewProfile = p;
@@ -2533,22 +2816,61 @@ void copyManagedBatch(const char* batchId) {
   screenDirty = true;
 }
 
+void buildManagedBatchChildPath(const char* parentPath, const char* entryName, char* path, size_t pathSize) {
+  if (!entryName || entryName[0] == '\0') {
+    snprintf(path, pathSize, "%s", parentPath);
+    return;
+  }
+  if (strchr(entryName, '/')) {
+    snprintf(path, pathSize, "%s", entryName);
+    return;
+  }
+  snprintf(path, pathSize, "%s/%s", parentPath, entryName);
+}
+
+bool deleteManagedBatchPath(const char* path) {
+  File entry = SD.open(path);
+  if (!entry) return !SD.exists(path);
+
+  if (!entry.isDirectory()) {
+    entry.close();
+    return SD.remove(path);
+  }
+
+  File child = entry.openNextFile();
+  bool ok = true;
+  while (child) {
+    char childPath[96];
+    buildManagedBatchChildPath(path, child.name(), childPath, sizeof(childPath));
+    child.close();
+    ok = deleteManagedBatchPath(childPath) && ok;
+    child = entry.openNextFile();
+  }
+  entry.close();
+  return SD.rmdir(path) && ok;
+}
+
 void deleteManagedBatch(const char* batchId) {
   if (!mountSDTemporarily()) return;
-  char path[80];
-  BrewProfileStore::profilePath(batchId, path, sizeof(path));
-  if (SD.exists(path)) SD.remove(path);
-  BrewProfileStore::targetPath(batchId, path, sizeof(path));
-  if (SD.exists(path)) SD.remove(path);
-  BrewProfileStore::logPath(batchId, path, sizeof(path));
-  if (SD.exists(path)) SD.remove(path);
-  BrewProfileStore::eventsPath(batchId, path, sizeof(path));
-  if (SD.exists(path)) SD.remove(path);
-  if (strcmp(activeBrewProfile.batchId, batchId) == 0) {
+  char activeBatchId[24];
+  bool deletingActive =
+    strcmp(activeBrewProfile.batchId, batchId) == 0 ||
+    (BrewProfileStore::loadActiveBatchId(activeBatchId, sizeof(activeBatchId)) &&
+     strcmp(activeBatchId, batchId) == 0);
+
+  char path[64];
+  snprintf(path, sizeof(path), "/data/batches/%s", batchId);
+  bool deleted = deleteManagedBatchPath(path);
+  if (!deleted) {
+    LOG_ERROR("Failed to delete batch directory: %s\n", path);
+  }
+
+  if (deletingActive) {
     brewProfileLoaded = false;
     fermentationFileOpen = false;
     currentFermentationFile[0] = '\0';
     BrewProfileStore::clearActiveBatchId();
+    clearHistoricalDisplayData();
   }
   dismountSD();
   loadManagedBatches();
@@ -2600,7 +2922,7 @@ void loadManagedBatchSummary(const char* batchId, ManagedBatchSummary* summary) 
     BrewProfileStore::logPath(batchId, logPath, sizeof(logPath));
     File file = SD.open(logPath, FILE_READ);
     if (file) {
-      static char line[180];
+      static char line[CSV_LINE_BUFFER_SIZE];
       while (file.available()) {
         int bytesRead = file.readBytesUntil('\n', line, sizeof(line) - 1);
         line[bytesRead] = '\0';
@@ -2674,11 +2996,11 @@ void drawManageBrewScreen() {
   snprintf(label, sizeof(label), "%d/%d", manageBatchIndex + 1, managedBatchCount);
   uiTextRight(MARGIN, y + 104, UI_W - MARGIN * 2 - 12, 20, label, FONT_SIZE_XS, uiColorTextMuted);
 
-  drawButton(MARGIN, 184, 72, 34, "<", false);
-  drawButton(UI_W - MARGIN - 72, 184, 72, 34, ">", false);
-  drawButton(MARGIN + 84, 184, 104, 34, "CONT", summary.completed);
-  drawButton(MARGIN + 200, 184, 104, 34, "COPY", false);
-  drawButton(MARGIN + 316, 184, 104, 34, "DELETE", false);
+  drawButton(MANAGE_BREW_PREV_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_NAV_W, MANAGE_BREW_ROW_H, "<", false);
+  drawButton(MANAGE_BREW_NEXT_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_NAV_W, MANAGE_BREW_ROW_H, ">", false);
+  drawButton(MANAGE_BREW_CONT_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_ACTION_W, MANAGE_BREW_ROW_H, "CONT", summary.completed);
+  drawButton(MANAGE_BREW_COPY_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_ACTION_W, MANAGE_BREW_ROW_H, "COPY", false);
+  drawButton(MANAGE_BREW_DELETE_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_ACTION_W, MANAGE_BREW_ROW_H, "DELETE", false);
   drawButton(MARGIN + 84, 226, 150, 34, "COMPLETE", summary.completed);
   drawButton(MARGIN + 246, 226, 174, 34, summary.completed ? "ARCHIVED" : "ACTIVE", true);
   drawButton(MARGIN, 276, 120, 36, "BACK", false);
@@ -2722,25 +3044,30 @@ bool handleManageBrewTouch(int x, int y) {
     return true;
   }
   if (managedBatchCount <= 0) return false;
-  if (x >= MARGIN && x <= MARGIN + 72 && y >= 184 && y <= 218) {
+  if (x >= MANAGE_BREW_PREV_X && x <= MANAGE_BREW_PREV_X + MANAGE_BREW_NAV_W &&
+      y >= MANAGE_BREW_ROW_Y && y <= MANAGE_BREW_ROW_Y + MANAGE_BREW_ROW_H) {
     manageBatchIndex = manageBatchIndex <= 0 ? managedBatchCount - 1 : manageBatchIndex - 1;
     screenDirty = true;
     return true;
   }
-  if (x >= UI_W - MARGIN - 72 && x <= UI_W - MARGIN && y >= 184 && y <= 218) {
+  if (x >= MANAGE_BREW_NEXT_X && x <= MANAGE_BREW_NEXT_X + MANAGE_BREW_NAV_W &&
+      y >= MANAGE_BREW_ROW_Y && y <= MANAGE_BREW_ROW_Y + MANAGE_BREW_ROW_H) {
     manageBatchIndex = (manageBatchIndex + 1) % managedBatchCount;
     screenDirty = true;
     return true;
   }
-  if (x >= MARGIN + 84 && x <= MARGIN + 188 && y >= 184 && y <= 218) {
+  if (x >= MANAGE_BREW_CONT_X && x <= MANAGE_BREW_CONT_X + MANAGE_BREW_ACTION_W &&
+      y >= MANAGE_BREW_ROW_Y && y <= MANAGE_BREW_ROW_Y + MANAGE_BREW_ROW_H) {
     continueManagedBatch(managedBatchIds[manageBatchIndex]);
     return true;
   }
-  if (x >= MARGIN + 200 && x <= MARGIN + 304 && y >= 184 && y <= 218) {
+  if (x >= MANAGE_BREW_COPY_X && x <= MANAGE_BREW_COPY_X + MANAGE_BREW_ACTION_W &&
+      y >= MANAGE_BREW_ROW_Y && y <= MANAGE_BREW_ROW_Y + MANAGE_BREW_ROW_H) {
     copyManagedBatch(managedBatchIds[manageBatchIndex]);
     return true;
   }
-  if (x >= MARGIN + 316 && x <= MARGIN + 420 && y >= 184 && y <= 218) {
+  if (x >= MANAGE_BREW_DELETE_X && x <= MANAGE_BREW_DELETE_X + MANAGE_BREW_ACTION_W &&
+      y >= MANAGE_BREW_ROW_Y && y <= MANAGE_BREW_ROW_Y + MANAGE_BREW_ROW_H) {
     deleteManagedBatch(managedBatchIds[manageBatchIndex]);
     return true;
   }
@@ -3847,32 +4174,19 @@ void drawCalibrationView() {
     tft.setTextColor(uiColorTextPrimary);
     tft.setFreeFont(FONT_SIZE_SM);
     tft.setCursor(MARGIN + 18, contentY + 62);
-    tft.print("SG Calibration");
-    IOSSwitch::draw(tft, UI_W - MARGIN - 86, contentY + 35, calibDoSGCalibration);
+    tft.print(calibUseSixPoints ? "6 SG points" : "4 SG points");
+    IOSSwitch::draw(tft, UI_W - MARGIN - 86, contentY + 35, calibUseSixPoints);
+
+    tft.setCursor(MARGIN + 18, contentY + 108);
+    tft.print(calibUseSalt ? "Salt solution" : "Sugar solution");
+    IOSSwitch::draw(tft, UI_W - MARGIN - 86, contentY + 81, calibUseSalt);
 
     tft.setTextColor(uiColorTextSecondary);
-    if (calibDoSGCalibration) {
-      tft.setTextColor(uiColorTextPrimary);
-      tft.setFreeFont(FONT_SIZE_SM);
-      tft.setCursor(MARGIN + 18, contentY + 108);
-      tft.print(calibUseSixPoints ? "6 SG points" : "4 SG points");
-      IOSSwitch::draw(tft, UI_W - MARGIN - 86, contentY + 81, calibUseSixPoints);
-
-      tft.setCursor(MARGIN + 18, contentY + 154);
-      tft.print(calibUseSalt ? "Salt solution" : "Sugar solution");
-      IOSSwitch::draw(tft, UI_W - MARGIN - 86, contentY + 127, calibUseSalt);
-
-      tft.setTextColor(uiColorTextSecondary);
-      tft.setFreeFont(FONT_SIZE_XS);
-      tft.setCursor(MARGIN + 18, contentY + 180);
-      tft.print("Amounts shown per calibration point.");
-    } else {
-      tft.setFreeFont(FONT_SIZE_SM);
-      tft.setCursor(MARGIN + 18, contentY + 112);
-      tft.print("Only sensor offset will be calibrated.");
-      tft.setCursor(MARGIN + 18, contentY + 140);
-      tft.print("SG points and solution type are skipped.");
-    }
+    tft.setFreeFont(FONT_SIZE_XS);
+    tft.setCursor(MARGIN + 18, contentY + 154);
+    tft.print("SG calibration is always recorded.");
+    tft.setCursor(MARGIN + 18, contentY + 180);
+    tft.print("Surface calibration waits for stability.");
 
     drawButton(BUTTON_CALIB_BACK_X, BUTTON_CALIB_BACK_Y, BUTTON_CALIB_BACK_W, BUTTON_CALIB_BACK_H, "BACK", false);
     drawButton(BUTTON_CALIB_NEXT_X, BUTTON_CALIB_NEXT_Y, BUTTON_CALIB_NEXT_W, BUTTON_CALIB_NEXT_H, "NEXT", false);
@@ -4011,7 +4325,7 @@ void drawCalibrationView() {
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
     tft.setCursor(MARGIN + 18, contentY + 86);
-    tft.print("No response from float");
+    tft.print(calibFailureMessage);
     
     drawButton(BUTTON_CALIB_EXIT_X, BUTTON_CALIB_EXIT_Y, BUTTON_CALIB_EXIT_W, BUTTON_CALIB_EXIT_H, "EXIT", false);
   }
@@ -4035,7 +4349,30 @@ void drawCalibrationView() {
     
     tft.setTextColor(uiColorTextSecondary);
     tft.setFreeFont(FONT_SIZE_SM);
-    uiTextCenter(boxX, boxY + 50, boxW, 16, "Measuring...", FONT_SIZE_SM, uiColorTextSecondary);
+    char waitLine[48];
+    if (calibMode == CALIB_OFFSET && millis() - calibWaitStatusMs < 20000UL) {
+      if (strncmp(calibWaitStatus, "Mag ", 4) == 0 ||
+          strncmp(calibWaitStatus, "Hold", 4) == 0) {
+        strncpy(waitLine, calibWaitStatus, sizeof(waitLine) - 1);
+        waitLine[sizeof(waitLine) - 1] = '\0';
+      } else if (calibWaitEtaSeconds > 0.0f) {
+        unsigned long eta = (unsigned long)(calibWaitEtaSeconds + 0.5f);
+        snprintf(waitLine, sizeof(waitLine), "ETA %lum %02lus",
+                 eta / 60UL, eta % 60UL);
+      } else {
+        strncpy(waitLine, calibWaitStatus, sizeof(waitLine) - 1);
+        waitLine[sizeof(waitLine) - 1] = '\0';
+      }
+    } else {
+      strncpy(waitLine, "Measuring...", sizeof(waitLine) - 1);
+      waitLine[sizeof(waitLine) - 1] = '\0';
+    }
+    uiTextCenter(boxX, boxY + 48, boxW, 16, waitLine, FONT_SIZE_SM, uiColorTextSecondary);
+    if (calibMode == CALIB_OFFSET && millis() - calibWaitStatusMs < 20000UL) {
+      char driftLine[48];
+      snprintf(driftLine, sizeof(driftLine), "%.3f C/min", calibWaitTempDriftPerMin);
+      uiTextCenter(boxX, boxY + 64, boxW, 12, driftLine, FONT_SIZE_XS, uiColorTextMuted);
+    }
   }
 }
 
@@ -4373,7 +4710,7 @@ void drawThemeToggle(int x, int y, bool enabled) {
 }
 
 void loadThemePreference() {
-  EEPROM.begin(128);
+  EEPROM.begin(EEPROM_BYTES);
   uint32_t magic = 0;
   EEPROM.get(EEPROM_THEME_MAGIC, magic);
   if (magic == THEME_MAGIC) {
@@ -4387,7 +4724,7 @@ void loadThemePreference() {
 }
 
 void saveThemePreference() {
-  EEPROM.begin(128);
+  EEPROM.begin(EEPROM_BYTES);
   EEPROM.put(EEPROM_THEME_MAGIC, THEME_MAGIC);
   EEPROM.write(EEPROM_THEME_VALUE, darkMode ? 1 : 0);
   if (EEPROM.commit()) {
@@ -4534,7 +4871,8 @@ void checkTouch() {
       int buttonY = actionY + actionH - 32;
       int buttonW = 86;
       if (touchY >= buttonY && touchY <= buttonY + 28) {
-        if (touchX >= MARGIN + contentW - buttonW * 2 - GAP - 10 &&
+        if (currentBatchAction.type != ACTION_FLOAT_IN_BREW &&
+            touchX >= MARGIN + contentW - buttonW * 2 - GAP - 10 &&
             touchX <= MARGIN + contentW - buttonW - GAP - 10) {
           handleCurrentActionChoice(false);
           delay(50);
@@ -4919,19 +5257,14 @@ void checkTouch() {
 
       if (calibMode == CALIB_SETUP) {
         int contentY = TOPBAR_H + MARGIN;
+        calibDoSGCalibration = true;
         if (IOSSwitch::hit(touchX, touchY, UI_W - MARGIN - 86, contentY + 35)) {
-          calibDoSGCalibration = !calibDoSGCalibration;
-          screenDirty = true;
-          delay(50);
-          return;
-        }
-        if (calibDoSGCalibration && IOSSwitch::hit(touchX, touchY, UI_W - MARGIN - 86, contentY + 81)) {
           calibUseSixPoints = !calibUseSixPoints;
           screenDirty = true;
           delay(50);
           return;
         }
-        if (calibDoSGCalibration && IOSSwitch::hit(touchX, touchY, UI_W - MARGIN - 86, contentY + 127)) {
+        if (IOSSwitch::hit(touchX, touchY, UI_W - MARGIN - 86, contentY + 81)) {
           calibUseSalt = !calibUseSalt;
           screenDirty = true;
           delay(50);
@@ -4969,6 +5302,8 @@ void checkTouch() {
           touchX >= BUTTON_CALIB_NEXT_X && touchX <= BUTTON_CALIB_NEXT_X + BUTTON_CALIB_NEXT_W &&
           touchY >= BUTTON_CALIB_NEXT_Y && touchY <= BUTTON_CALIB_NEXT_Y + BUTTON_CALIB_NEXT_H) {
         calibMode = CALIB_OFFSET;
+        strncpy(calibFailureMessage, "No response from float", sizeof(calibFailureMessage) - 1);
+        calibFailureMessage[sizeof(calibFailureMessage) - 1] = '\0';
         screenDirty = true;
         LOG_VERBOSELN("Moved to Offset Calibration");
       }
@@ -4978,8 +5313,8 @@ void checkTouch() {
           touchX >= BUTTON_CALIB_OFFSET_X && touchX <= BUTTON_CALIB_OFFSET_X + BUTTON_CALIB_OFFSET_W &&
           touchY >= BUTTON_CALIB_OFFSET_Y && touchY <= BUTTON_CALIB_OFFSET_Y + BUTTON_CALIB_OFFSET_H) {
         sendCalibrationCommand(5, 0.0); // Command 5 for offset calibration
-        startWait(2000); // 2 second wait for offset calibration
-        LOG_VERBOSELN("CALIBRATE OFFSET - started 2s wait");
+        startWait(660000); // Wait up to 11 minutes for stable surface calibration
+        LOG_VERBOSELN("CALIBRATE OFFSET - waiting for stable surface");
       }
 
       if ((calibMode == CALIB_OFFSET || (calibMode >= CALIB_POINT1 && calibMode <= CALIB_POINT6) || calibMode == CALIB_COMPLETE || calibMode == CALIB_FAILED) &&
@@ -5020,7 +5355,7 @@ void checkTouch() {
           touchX >= BUTTON_CALIB_RECORD_X && touchX <= BUTTON_CALIB_RECORD_X + BUTTON_CALIB_RECORD_W &&
           touchY >= BUTTON_CALIB_RECORD_Y && touchY <= BUTTON_CALIB_RECORD_Y + BUTTON_CALIB_RECORD_H) {
         int idx = calibrationPointIndex(calibMode);
-        uint8_t command = calibUseSixPoints ? (uint8_t)(8 + idx) : (uint8_t)idx;
+        uint8_t command = (uint8_t)(8 + idx);
         sendCalibrationCommand(command, calibrationTargetSG(idx));
         startWait(2000); // 2 second wait for RECORD
         LOG_VERBOSE("RECORD Point %d - started 2s wait\n", idx + 1);
@@ -5168,23 +5503,39 @@ void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int 
   LOG_VERBOSE("Calibration response: angle=%.2fÂ°, sg=%.3f, request_id=%d\n", 
                 calibResp.angle, calibResp.sg, calibResp.request_id);
   
+  if (calibResp.response_type == 1 && calibResp.request_id == 5 && calibMode == CALIB_OFFSET) {
+    calibWaitEtaSeconds = calibResp.sg;
+    calibWaitTempDriftPerMin = calibResp.angle;
+    strncpy(calibWaitStatus, calibResp.message, sizeof(calibWaitStatus) - 1);
+    calibWaitStatus[sizeof(calibWaitStatus) - 1] = '\0';
+    calibWaitStatusMs = millis();
+    screenDirty = true;
+    return;
+  }
+
   if (calibResp.response_type == 0) {
     // Simplified response handling for new workflow
     // Handle offset calibration response (request_id=5)
     if (calibResp.request_id == 5 && calibMode == CALIB_OFFSET) {
       LOG_INFOLN("Offset calibration completed");
       stopWait(); // Stop the 2s wait
+      if (strstr(calibResp.message, "implausible") != NULL ||
+          strstr(calibResp.message, "Offset mag") != NULL ||
+          strstr(calibResp.message, "Offset jump") != NULL ||
+          strstr(calibResp.message, "not stable") != NULL ||
+          strstr(calibResp.message, "failed") != NULL ||
+          strstr(calibResp.message, "fail") != NULL) {
+        calibMode = CALIB_FAILED;
+        strncpy(calibFailureMessage, calibResp.message, sizeof(calibFailureMessage) - 1);
+        calibFailureMessage[sizeof(calibFailureMessage) - 1] = '\0';
+        screenDirty = true;
+        LOG_ERROR("Offset calibration rejected: %s\n", calibResp.message);
+        return;
+      }
       calibOffset = calibResp.angle; // Store offset angle
       offsetCalibrated = true;
-      if (calibDoSGCalibration) {
-        calibMode = CALIB_POINT1; // Move to first SG calibration point
-      } else {
-        sendExitCalibrationCommand();
-        calibMode = CALIB_IDLE;
-        currentMode = LIVE_VIEW;
-        calibrationModeActive = false;
-        staticElementsDrawn = false;
-      }
+      calibDoSGCalibration = true;
+      calibMode = CALIB_POINT1; // Move to first SG calibration point
       screenDirty = true;
       LOG_INFO("Stored offset angle: %.2fÂ°, moved to Point 1\n", calibOffset);
     }
@@ -5213,6 +5564,9 @@ void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int 
         if (fabs(calibResp.sg - calibrationTargetSG(i)) <= 0.006f) {
           calibAngles[i] = calibResp.angle;
           LOG_INFO("Stored Point %d angle: %.2f deg\n", i + 1, calibAngles[i]);
+          stopWait();
+          calibMode = (i + 1 >= calibrationPointCount()) ? CALIB_COMPLETE : calibrationModeForPoint(i + 1);
+          screenDirty = true;
           break;
         }
       }
@@ -5398,7 +5752,7 @@ bool loadHistoricalDataFromCSV(const char* filename,
   int postBatchLines = 0;
   uint32_t lastPreBatchEpoch = 0;
   uint32_t firstPostBatchEpoch = 0;
-  static char line[180];
+  static char line[CSV_LINE_BUFFER_SIZE];
   
   file.seek(0);
   
@@ -5719,7 +6073,7 @@ bool ensureFermentationLogFile(const char* batchId) {
     return false;
   }
 
-  file.println("timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code");
+  file.println(FERMENTATION_LOG_HEADER);
   file.flush();
   file.close();
   LOG_INFO("Created missing batch log file: %s\n", logPath);
@@ -5738,7 +6092,7 @@ bool createFreshBatchLogFile(const char* batchId) {
     LOG_ERROR("Failed to create fresh batch log file: %s\n", logPath);
     return false;
   }
-  file.println("timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code");
+  file.println(FERMENTATION_LOG_HEADER);
   file.flush();
   file.close();
   return true;
@@ -5770,7 +6124,7 @@ bool findBestFallbackBatch(char* batchId, size_t bufferSize) {
   int highestNumber = 0;
   int bestDataNumber = 0;
   uint32_t bestDataEpoch = 0;
-  static char line[180];
+  static char line[CSV_LINE_BUFFER_SIZE];
   static BrewProfile candidateProfile;
 
   File entry = root.openNextFile();
@@ -6008,12 +6362,46 @@ void handleCurrentActionChoice(bool done) {
   unsigned long nowEpoch = getCurrentEpoch();
   if (!isEpochValid(nowEpoch)) nowEpoch = latestFloatDataValid ? latestFloatEpoch : activeBrewProfile.createdAt;
 
+  if (type == ACTION_FLOAT_ZERO_CAL && done) {
+    floatZeroCalCommandPending = true;
+    floatZeroCalAwaitingConfirmation = false;
+    strncpy(floatZeroCalStatus, "Waiting for level float packet", sizeof(floatZeroCalStatus) - 1);
+    floatZeroCalStatus[sizeof(floatZeroCalStatus) - 1] = '\0';
+    activeBrewProfile.floatZeroCalDone = false;
+    activeBrewProfile.floatZeroCalSkipped = false;
+    currentBatchAction.requiresChoice = false;
+    currentBatchAction.secondsUntilDue = 0;
+    strncpy(currentBatchAction.title, "Level Float", sizeof(currentBatchAction.title) - 1);
+    currentBatchAction.title[sizeof(currentBatchAction.title) - 1] = '\0';
+    strncpy(currentBatchAction.message, "Waiting for level float packet", sizeof(currentBatchAction.message) - 1);
+    currentBatchAction.message[sizeof(currentBatchAction.message) - 1] = '\0';
+    currentRecommendation.code = currentBatchAction.code;
+    strncpy(currentRecommendation.message, currentBatchAction.message, sizeof(currentRecommendation.message) - 1);
+    currentRecommendation.message[sizeof(currentRecommendation.message) - 1] = '\0';
+    if (mountSDTemporarily()) {
+      BrewProfileStore::appendBatchEvent(activeBrewProfile.batchId, nowEpoch,
+                                         "FLOAT_ZERO_CAL_READY",
+                                         currentBatchAction.message,
+                                         latestFloatDataValid ? latestFloatData.angle : 0.0f);
+      dismountSD();
+    }
+    screenDirty = true;
+    return;
+  }
+
   bool changed = done
     ? BatchActionEngine::applyDone(&activeBrewProfile, type, nowEpoch)
     : BatchActionEngine::applySkip(&activeBrewProfile, type, nowEpoch);
   if (!changed) return;
 
   if (mountSDTemporarily()) {
+    if (type == ACTION_FLOAT_IN_BREW && done) {
+      clearBufferedSensorData();
+      clearHistoricalDisplayData();
+      createFreshBatchLogFile(activeBrewProfile.batchId);
+      TargetCurveGenerator::generateAndSave(activeBrewProfile);
+      startNewBatchStorage(activeBrewProfile.batchId);
+    }
     BrewProfileStore::save(activeBrewProfile);
     BrewProfileStore::appendBatchEvent(activeBrewProfile.batchId, nowEpoch,
                                        BatchActionEngine::eventName(type, done),
@@ -6169,6 +6557,14 @@ void updateFermentationAssistant(payload_t data, uint32_t epoch_s) {
     data.density,
     smoothedGravityDeltaPerHour(9),
     epoch_s);
+  if ((floatZeroCalCommandPending || floatZeroCalAwaitingConfirmation) &&
+      currentBatchAction.type == ACTION_FLOAT_ZERO_CAL) {
+    currentBatchAction.requiresChoice = false;
+    currentBatchAction.secondsUntilDue = 0;
+    strncpy(currentBatchAction.message, "Waiting for level float packet",
+            sizeof(currentBatchAction.message) - 1);
+    currentBatchAction.message[sizeof(currentBatchAction.message) - 1] = '\0';
+  }
   if (currentBatchAction.type != ACTION_NONE) {
     currentRecommendation.code = currentBatchAction.code;
     strncpy(currentRecommendation.message, currentBatchAction.message, sizeof(currentRecommendation.message) - 1);
@@ -6205,6 +6601,14 @@ void refreshCurrentBatchAction(float currentSG, unsigned long nowEpoch) {
     currentSG,
     smoothedGravityDeltaPerHour(9),
     nowEpoch);
+  if ((floatZeroCalCommandPending || floatZeroCalAwaitingConfirmation) &&
+      currentBatchAction.type == ACTION_FLOAT_ZERO_CAL) {
+    currentBatchAction.requiresChoice = false;
+    currentBatchAction.secondsUntilDue = 0;
+    strncpy(currentBatchAction.message, "Waiting for level float packet",
+            sizeof(currentBatchAction.message) - 1);
+    currentBatchAction.message[sizeof(currentBatchAction.message) - 1] = '\0';
+  }
   if (currentBatchAction.type != ACTION_NONE) {
     currentRecommendation.code = currentBatchAction.code;
     strncpy(currentRecommendation.message, currentBatchAction.message, sizeof(currentRecommendation.message) - 1);
@@ -6379,7 +6783,7 @@ bool migrateActiveBrewProfileFromHistory(const char* logPath) {
       static const int MIGRATION_MAX_POINTS = 720;
       static uint32_t epochs[MIGRATION_MAX_POINTS];
       static float sg[MIGRATION_MAX_POINTS];
-      static char line[180];
+      static char line[CSV_LINE_BUFFER_SIZE];
       int count = 0;
 
       while (file.available() && count < MIGRATION_MAX_POINTS) {
@@ -6585,7 +6989,7 @@ void createNewFermentationFile() {
     }
     
     // Write CSV header
-    file.println("timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code");
+    file.println(FERMENTATION_LOG_HEADER);
     file.flush();  // Ensure header is written to SD card
     file.close();
     
@@ -6681,7 +7085,7 @@ bool logDataToSD(payload_t data, uint32_t epoch_s) {
     }
     
     // Write CSV header for new file
-    file.println("timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code");
+    file.println(FERMENTATION_LOG_HEADER);
     file.close();
     
     // Try opening again in append mode
@@ -6701,15 +7105,40 @@ bool logDataToSD(payload_t data, uint32_t epoch_s) {
   uint8_t batteryPercent = calculateBatteryPercentage(data.battery_voltage);
   char timestamp[24];
   formatTimestamp(epoch_s, timestamp, sizeof(timestamp));
+  float floatTemperatureForLog = (!isnan(latestFloatTemperatureC) && !isinf(latestFloatTemperatureC))
+    ? latestFloatTemperatureC
+    : data.temperature;
+  float plugBeerTemperatureForLog = hasValidPlugBeerTemperature() ? latestPlugStatus.beer_temp_c : NAN;
+  float plugAirTemperatureForLog = hasValidPlugAirTemperature() ? latestPlugStatus.air_temp_c : NAN;
+  bool freshPlugStatusForLog = hasFreshPlugStatus();
+  float plugBeerTargetForLog = freshPlugStatusForLog ? latestPlugStatus.beer_target_c : NAN;
+  float plugAirTargetForLog = freshPlugStatusForLog ? latestPlugStatus.air_target_c : NAN;
+  uint8_t plugModeForLog = freshPlugStatusForLog ? latestPlugStatus.control_mode : 0;
+  uint8_t plugRelayForLog = freshPlugStatusForLog ? latestPlugStatus.relay_on : 0;
+  float plugDutyForLog = freshPlugStatusForLog ? latestPlugStatus.duty_10m_percent : NAN;
+  uint16_t plugFaultsForLog = freshPlugStatusForLog ? latestPlugStatus.faults : 0;
+  float plugPiOffsetForLog = freshPlugStatusForLog ? latestPlugStatus.pi_offset_c : NAN;
+  float plugPiTnForLog = freshPlugStatusForLog ? latestPlugStatus.pi_tn_hours : NAN;
   LOG_VERBOSE("Writing to SD - SG:%.4f, Temp:%.2f, Batt:%.2fV\n", 
                 data.density, data.temperature, data.battery_voltage);
-  int bytesWritten = file.printf("%s,%lu,%lu,%.2f,%.4f,%.2f,%.2f,%d,%s,%.2f,%.2f,%d\n", 
+  int bytesWritten = file.printf("%s,%lu,%lu,%.2f,%.4f,%.2f,%.2f,%d,%s,%.2f,%.2f,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%u,%.1f,%u,%.2f,%.2f\n",
              timestamp, (unsigned long)epoch_s, (unsigned long)data.uptime_s, data.angle, data.density,
              data.temperature, data.battery_voltage, batteryPercent,
              fermentationStateMachine.phaseName(),
              fermentationMetrics.currentAttenuation,
              fermentationMetrics.estimatedABV,
-             currentRecommendation.code);
+             currentRecommendation.code,
+             floatTemperatureForLog,
+             plugBeerTemperatureForLog,
+             plugAirTemperatureForLog,
+             plugBeerTargetForLog,
+             plugAirTargetForLog,
+             plugModeForLog,
+             plugRelayForLog,
+             plugDutyForLog,
+             plugFaultsForLog,
+             plugPiOffsetForLog,
+             plugPiTnForLog);
   
   // Check for timeout
   if (millis() - startTime > SD_TIMEOUT) {
@@ -7335,36 +7764,48 @@ void drawLiveDetailsView() {
   if (currentETA.valid) formatDurationShort(currentETA.secondsToPackaging, eta, sizeof(eta));
   else strcpy(eta, "--");
   drawDetailRowAt(leftX, &leftY, colW, "ETA", eta);
+  leftY += 4;
+  drawDetailSectionAt(leftX, &leftY, colW, "SYSTEM");
+  snprintf(value, sizeof(value), "%s %d/%d", fermentationFileOpen ? "Log OK" : "Log ERR", bufferedCount, MAX_DATA_BUFFER);
+  drawDetailRowAt(leftX, &leftY, colW, "Log/Buf", value);
+  snprintf(value, sizeof(value), "%d/%d", lastHistoricalSkippedLines, lastHistoricalParseErrors);
+  drawDetailRowAt(leftX, &leftY, colW, "Skip/Err", value);
 
   drawDetailSectionAt(rightX, &rightY, colW, "FLOAT");
-  snprintf(value, sizeof(value), "%.1f C / %.1f deg", latest.temperature, latest.angle);
+  float floatTemp = !isnan(latestFloatTemperatureC) && !isinf(latestFloatTemperatureC)
+    ? latestFloatTemperatureC
+    : latest.temperature;
+  snprintf(value, sizeof(value), "%.1f C / %.1f deg", floatTemp, latest.angle);
   drawDetailRowAt(rightX, &rightY, colW, "Temp/Ang", hasData ? value : "--");
   uint8_t battPercent = hasData ? calculateBatteryPercentage(latest.battery_voltage) : 0;
-  snprintf(value, sizeof(value), "%.2f V / %d%%", latest.battery_voltage, battPercent);
-  drawDetailRowAt(rightX, &rightY, colW, "Battery", hasData ? value : "--");
-  snprintf(value, sizeof(value), "%d", hasData ? latest.sequence_id : 0);
-  drawDetailRowAt(rightX, &rightY, colW, "Seq", hasData ? value : "--");
+  snprintf(value, sizeof(value), "%.2fV %d%% #%d", latest.battery_voltage, battPercent, hasData ? latest.sequence_id : 0);
+  drawDetailRowAt(rightX, &rightY, colW, "Batt/Seq", hasData ? value : "--");
+
+  rightY += 4;
+  drawDetailSectionAt(rightX, &rightY, colW, "PLUG");
+  bool freshPlug = hasFreshPlugStatus();
+  if (hasValidPlugBeerTemperature()) snprintf(value, sizeof(value), "%.1f C", latestPlugStatus.beer_temp_c);
+  else strcpy(value, "--");
+  drawDetailRowAt(rightX, &rightY, colW, "Beer", value);
+  if (hasValidPlugAirTemperature()) snprintf(value, sizeof(value), "%.1f C", latestPlugStatus.air_temp_c);
+  else strcpy(value, "--");
+  drawDetailRowAt(rightX, &rightY, colW, "Air", value);
+  if (freshPlug) snprintf(value, sizeof(value), "%.1f/%.1f C", latestPlugStatus.beer_target_c, latestPlugStatus.air_target_c);
+  else strcpy(value, "--");
+  drawDetailRowAt(rightX, &rightY, colW, "Target", value);
+  if (freshPlug) snprintf(value, sizeof(value), "%s %.0f%%", latestPlugStatus.relay_on ? "ON" : "OFF", latestPlugStatus.duty_10m_percent);
+  else strcpy(value, "--");
+  drawDetailRowAt(rightX, &rightY, colW, "Relay", value);
+  if (freshPlug) snprintf(value, sizeof(value), "%u F%04X", latestPlugStatus.control_mode, latestPlugStatus.faults);
+  else strcpy(value, "--");
+  drawDetailRowAt(rightX, &rightY, colW, "Mode", value);
+
+  rightY += 4;
+  drawDetailSectionAt(rightX, &rightY, colW, "RADIO");
   snprintf(value, sizeof(value), "%u / %lu", lastAckedFloatSeq, (unsigned long)duplicateFloatPackets);
   drawDetailRowAt(rightX, &rightY, colW, "ACK/Dup", value);
   snprintf(value, sizeof(value), "%d dBm", lastRSSI);
   drawDetailRowAt(rightX, &rightY, colW, "RSSI", rssiAvailable ? value : "--");
-
-  rightY += 4;
-  drawDetailSectionAt(rightX, &rightY, colW, "SYSTEM");
-  snprintf(value, sizeof(value), "%s", fermentationFileOpen ? "OK" : "ERR");
-  drawDetailRowAt(rightX, &rightY, colW, "Log", value);
-  snprintf(value, sizeof(value), "%d", displayDataCount);
-  drawDetailRowAt(rightX, &rightY, colW, "Live Pts", value);
-  if (totalCSVDataLines > 0 || lastHistoricalLoadedLines > 0) {
-    snprintf(value, sizeof(value), "%d/%d", lastHistoricalLoadedLines, totalCSVDataLines);
-  } else {
-    snprintf(value, sizeof(value), "%s", hasData ? "pending" : "0/0");
-  }
-  drawDetailRowAt(rightX, &rightY, colW, "CSV L/T", value);
-  snprintf(value, sizeof(value), "%d/%d", lastHistoricalSkippedLines, lastHistoricalParseErrors);
-  drawDetailRowAt(rightX, &rightY, colW, "Skip/Err", value);
-  snprintf(value, sizeof(value), "%d/%d", bufferedCount, MAX_DATA_BUFFER);
-  drawDetailRowAt(rightX, &rightY, colW, "Buf", value);
 
   uiDrawBottomNav(TAB_LIVE);
   detailsDirty = false;
@@ -7577,7 +8018,7 @@ bool isSafeForSDOperation() {
 }
 
 void loadFloatMacFromEEPROM() {
-  EEPROM.begin(128); // Reserve space for float MAC
+  EEPROM.begin(EEPROM_BYTES);
   uint32_t magic;
   EEPROM.get(EEPROM_FLOAT_MAC_MAGIC, magic);
   
@@ -7610,7 +8051,7 @@ void loadFloatMacFromEEPROM() {
 void saveFloatMacToEEPROM() {
   if (!floatMacKnown) return;
   
-  EEPROM.begin(128);
+  EEPROM.begin(EEPROM_BYTES);
   EEPROM.put(EEPROM_FLOAT_MAC_MAGIC, FLOAT_MAC_MAGIC);
   EEPROM.put(EEPROM_FLOAT_MAC_ADDR, floatMac);
   
@@ -7622,10 +8063,48 @@ void saveFloatMacToEEPROM() {
   }
 }
 
+void loadPlugMacFromEEPROM() {
+  EEPROM.begin(EEPROM_BYTES);
+  uint32_t magic;
+  EEPROM.get(EEPROM_PLUG_MAC_MAGIC, magic);
+  if (magic != PLUG_MAC_MAGIC) {
+    LOG_INFOLN("No valid SGNode Plug MAC found in EEPROM");
+    return;
+  }
+
+  EEPROM.get(EEPROM_PLUG_MAC_ADDR, plugMac);
+  plugMacKnown = true;
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, plugMac, sizeof(plugMac));
+  peerInfo.channel = ESPNOW_CHANNEL;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+  esp_err_t addResult = esp_now_add_peer(&peerInfo);
+  if (addResult != ESP_OK && addResult != ESP_ERR_ESPNOW_EXIST) {
+    LOG_ERROR("Failed to register stored SGNode Plug peer: %d\n", addResult);
+  }
+}
+
+void savePlugMacToEEPROM() {
+  if (!plugMacKnown) return;
+  EEPROM.begin(EEPROM_BYTES);
+  EEPROM.put(EEPROM_PLUG_MAC_MAGIC, PLUG_MAC_MAGIC);
+  EEPROM.put(EEPROM_PLUG_MAC_ADDR, plugMac);
+  if (!EEPROM.commit()) {
+    LOG_ERRORLN("ERROR: Failed to save SGNode Plug MAC");
+  }
+}
+
 void startWait(int durationMs) {
   waitStartTime = millis();
   waitDuration = durationMs;
   waitActive = true;
+  calibWaitEtaSeconds = -1.0f;
+  calibWaitTempDriftPerMin = 0.0f;
+  calibWaitStatusMs = 0;
+  strncpy(calibWaitStatus, "Measuring...", sizeof(calibWaitStatus) - 1);
+  calibWaitStatus[sizeof(calibWaitStatus) - 1] = '\0';
   screenDirty = true;
   LOG_VERBOSE("Wait started for %d ms\n", durationMs);
 }
@@ -7775,8 +8254,12 @@ void checkWaitTimeout() {
       screenDirty = true;
       staticElementsDrawn = false; // Force complete redraw to clear artifacts
       LOG_INFOLN("Apply timeout - calibration complete, returning to Live View");
+    } else if (calibMode == CALIB_OFFSET) {
+      calibMode = CALIB_FAILED;
+      strncpy(calibFailureMessage, "Surface calibration timeout", sizeof(calibFailureMessage) - 1);
+      calibFailureMessage[sizeof(calibFailureMessage) - 1] = '\0';
+      LOG_ERRORLN("Offset timeout - stable surface calibration not received");
     } else if (calibMode >= CALIB_POINT1 && calibMode <= CALIB_POINT6) {
-      // Record timeout - advance to next step
       int idx = calibrationPointIndex(calibMode);
       calibMode = (idx + 1 >= calibrationPointCount()) ? CALIB_COMPLETE : calibrationModeForPoint(idx + 1);
       LOG_VERBOSELN("Record timeout - advanced to next step");
@@ -8026,8 +8509,12 @@ static int uiTestObjects(UITestObject* objects, int maxObjects) {
         int contentW = UI_W - MARGIN * 2;
         int buttonW = 86;
         int buttonY = actionY + actionH - 32;
-        addObj("btn_action_skip", "button", "Skip", MARGIN + contentW - buttonW * 2 - GAP - 10, buttonY, buttonW, 28);
-        addObj("btn_action_done", "button", "Done", MARGIN + contentW - buttonW - 10, buttonY, buttonW, 28);
+        if (currentBatchAction.type != ACTION_FLOAT_IN_BREW) {
+          addObj("btn_action_skip", "button", "Skip", MARGIN + contentW - buttonW * 2 - GAP - 10, buttonY, buttonW, 28);
+        }
+        addObj("btn_action_done", "button",
+               currentBatchAction.type == ACTION_FLOAT_ZERO_CAL ? "Ready" : "Done",
+               MARGIN + contentW - buttonW - 10, buttonY, buttonW, 28);
       }
     }
     addObj("panel_recommendation", "panel", currentRecommendation.message, MARGIN, UI_H - NAV_H - 47, UI_W - MARGIN * 2, 40);
@@ -8053,11 +8540,11 @@ static int uiTestObjects(UITestObject* objects, int maxObjects) {
     addObj("btn_manage_yeast", "button", "Manage Yeast", rightX, contentY, cardW, cardH);
   } else if (currentMode == MANAGE_BREW_VIEW) {
     if (managedBatchCount > 0) {
-      addObj("btn_prev_batch", "button", "<", MARGIN, 184, 72, 34);
-      addObj("btn_next_batch", "button", ">", UI_W - MARGIN - 72, 184, 72, 34);
-      addObj("btn_continue_batch", "button", "Cont", MARGIN + 84, 184, 104, 34);
-      addObj("btn_copy_batch", "button", "Copy", MARGIN + 200, 184, 104, 34);
-      addObj("btn_delete_batch", "button", "Delete", MARGIN + 316, 184, 104, 34);
+      addObj("btn_prev_batch", "button", "<", MANAGE_BREW_PREV_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_NAV_W, MANAGE_BREW_ROW_H);
+      addObj("btn_next_batch", "button", ">", MANAGE_BREW_NEXT_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_NAV_W, MANAGE_BREW_ROW_H);
+      addObj("btn_continue_batch", "button", "Cont", MANAGE_BREW_CONT_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_ACTION_W, MANAGE_BREW_ROW_H);
+      addObj("btn_copy_batch", "button", "Copy", MANAGE_BREW_COPY_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_ACTION_W, MANAGE_BREW_ROW_H);
+      addObj("btn_delete_batch", "button", "Delete", MANAGE_BREW_DELETE_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_ACTION_W, MANAGE_BREW_ROW_H);
       addObj("btn_complete_batch", "button", "Complete", MARGIN + 84, 226, 150, 34);
       addObj("batch_status", "text", managedBatchNames[manageBatchIndex], MARGIN, TOPBAR_H + MARGIN, UI_W - MARGIN * 2, 132);
     }
@@ -8729,7 +9216,7 @@ static bool uiTestReadLastLogEpoch(const char* path, uint32_t* epochOut) {
   File file = SD.open(path, FILE_READ);
   if (!file) return false;
 
-  static char line[180];
+  static char line[CSV_LINE_BUFFER_SIZE];
   uint32_t lastEpoch = 0;
   while (file.available()) {
     int bytesRead = file.readBytesUntil('\n', line, sizeof(line) - 1);
@@ -8755,7 +9242,7 @@ static bool uiTestReadLastLogEpoch(const char* path, uint32_t* epochOut) {
 static bool uiTestWriteMixedEpochLog(const char* path, uint32_t createdAt) {
   File file = SD.open(path, FILE_WRITE);
   if (!file) return false;
-  file.println("timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code");
+  file.println(FERMENTATION_LOG_HEADER);
   file.printf("2026-05-21 18:13:20,%lu,0,50.00,1.0040,20.00,4.08,90,ACTIVE,90.00,5.00,81\n",
               (unsigned long)(createdAt - 3600UL));
   file.printf("2026-05-21 20:13:20,%lu,0,50.10,1.0035,20.00,4.07,89,ACTIVE,91.00,5.10,81\n",
@@ -8770,7 +9257,7 @@ static bool uiTestWriteMixedEpochLog(const char* path, uint32_t createdAt) {
 static bool uiTestWriteDelayedFermentationLog(const char* path, uint32_t createdAt) {
   File file = SD.open(path, FILE_WRITE);
   if (!file) return false;
-  file.println("timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code");
+  file.println(FERMENTATION_LOG_HEADER);
   file.printf("2026-05-21 08:00:00,%lu,0,50.00,1.0520,20.00,4.08,90,LAG,0.00,0.00,0\n",
               (unsigned long)(createdAt + 2UL * 3600UL));
   file.printf("2026-05-22 08:00:00,%lu,0,50.10,1.0518,20.00,4.07,89,LAG,0.00,0.00,0\n",
@@ -9973,7 +10460,7 @@ static bool batteryDebugDumpCsv() {
   Serial.print(currentFermentationFile);
   Serial.println("\" format=epoch,voltage,temp,sg,angle");
 
-  char line[220];
+  char line[CSV_LINE_BUFFER_SIZE];
   int pos = 0;
   int emitted = 0;
   int parsed = 0;

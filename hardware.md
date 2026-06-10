@@ -10,7 +10,7 @@
 | --- | ---: | --- |
 | WeMos D32 ESP32 board | 1 | Built-in 18650 holder and charger |
 | BMI160 IMU | 1 | Tilt measurement |
-| BMP180 / GY-68 | 1 | Temperature measurement |
+| BMP180 / GY-68 | 0 | Removed from current float build; BMI160 chip temperature is used for diagnostics |
 | 18650 Li-ion cell | 1 | 2000 mAh or larger recommended |
 | SPST switch | 1 | Calibration mode on GPIO12 |
 | Waterproof enclosure | 1 | Must fit fermenter opening |
@@ -28,12 +28,20 @@
 
 | Signal | GPIO | Notes |
 | --- | ---: | --- |
-| I2C SDA | 21 | BMI160 and BMP180 |
-| I2C SCL | 22 | BMI160 and BMP180 |
+| I2C SDA | 21 | BMI160 |
+| I2C SCL | 22 | BMI160 |
 | Battery ADC | 15 | 51k/51k divider plus capacitor |
 | Calibration switch | 12 | Switch to GND |
 | Built-in LED | 5 | Status |
 | Extra LED | 16 | Calibration indicator |
+
+## Float Hardware Revision Notes
+
+- The BMP180/GY-68 has been removed from the float. It self-heated the small float interior and did not provide a reliable beer-temperature measurement.
+- Current firmware reports BMI160 chip temperature. Treat this as a diagnostic value, not as representative wort/beer temperature.
+- The USB-UART chip was isolated by cutting pin 8 on the CP2302/USB-UART package used on the tested board. This reduced sleep leakage on the reference float.
+- The voltage regulator was replaced with an ME6220 during testing. The improvement was small and is not considered worth the rework by itself.
+- Current measured reference sleep current after the practical hardware changes is about `0.95 mA`.
 
 ## Base Pin Summary
 
@@ -62,7 +70,8 @@ The 4-inch base module has display, touch, and SD wiring integrated. Current fir
 
 - Normal operation should spend most time in deep sleep.
 - Calibration mode keeps the float awake and drains the battery quickly.
-- If drain is high, measure sleep current directly and confirm sensor shutdown behavior.
+- If drain is high, measure sleep current directly and confirm BMI160 suspend behavior and USB-UART leakage.
+- Do not use the removed BMP180 as a beer-temperature reference in new builds.
 
 ### Base
 

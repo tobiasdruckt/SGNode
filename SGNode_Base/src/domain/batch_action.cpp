@@ -46,6 +46,14 @@ void BatchActionEngine::applyStyleDefaults(BrewProfile* profile) {
 BatchAction BatchActionEngine::evaluate(const BrewProfile& profile, FermentationPhase phase,
                                         float attenuation, float currentSG,
                                         float gravityDeltaPerHour, unsigned long nowEpoch) {
+  if (!profile.floatZeroCalDone && !profile.floatZeroCalSkipped) {
+    return makeAction(ACTION_FLOAT_ZERO_CAL, 12, "Level Float", "Zero angle on a flat surface");
+  }
+
+  if (!profile.completed && !profile.ogVerified && !profile.floatInBrewConfirmed) {
+    return makeAction(ACTION_FLOAT_IN_BREW, 13, "Put Float In Brew", "Confirm after placing float in wort");
+  }
+
   if (profile.ogNeedsChoice) {
     BatchAction action = makeAction(ACTION_VERIFY_OG, 10, "Verify OG", "Choose recipe or measured OG");
     action.requiresChoice = false;
@@ -153,6 +161,18 @@ bool BatchActionEngine::applyDone(BrewProfile* profile, BatchActionType type, un
       profile->packageDone = true;
       profile->packagedAt = nowEpoch;
       return true;
+    case ACTION_FLOAT_ZERO_CAL:
+      profile->floatZeroCalDone = true;
+      profile->floatZeroCalibratedAt = nowEpoch;
+      return true;
+    case ACTION_FLOAT_IN_BREW:
+      profile->floatInBrewConfirmed = true;
+      profile->floatInBrewAt = nowEpoch;
+      if (nowEpoch > 0) profile->createdAt = nowEpoch;
+      profile->fermentationStartAt = 0;
+      profile->ogVerified = false;
+      profile->ogNeedsChoice = false;
+      return true;
     default:
       return false;
   }
@@ -181,6 +201,12 @@ bool BatchActionEngine::applySkip(BrewProfile* profile, BatchActionType type, un
       profile->packageSkipped = true;
       profile->packagedAt = nowEpoch;
       return true;
+    case ACTION_FLOAT_ZERO_CAL:
+      profile->floatZeroCalSkipped = true;
+      profile->floatZeroCalibratedAt = nowEpoch;
+      return true;
+    case ACTION_FLOAT_IN_BREW:
+      return false;
     default:
       return false;
   }
@@ -193,6 +219,8 @@ const char* BatchActionEngine::eventName(BatchActionType type, bool done) {
     case ACTION_REMOVE_DRY_HOP: return done ? "DRY_HOP_REMOVED" : "DRY_HOP_REMOVE_SKIPPED";
     case ACTION_COLD_CRASH: return done ? "COLD_CRASH_STARTED" : "COLD_CRASH_SKIPPED";
     case ACTION_PACKAGE: return done ? "PACKAGE_DONE" : "PACKAGE_SKIPPED";
+    case ACTION_FLOAT_ZERO_CAL: return done ? "FLOAT_ZERO_CAL_REQUESTED" : "FLOAT_ZERO_CAL_SKIPPED";
+    case ACTION_FLOAT_IN_BREW: return done ? "FLOAT_IN_BREW_CONFIRMED" : "FLOAT_IN_BREW_SKIPPED";
     default: return done ? "ACTION_DONE" : "ACTION_SKIPPED";
   }
 }

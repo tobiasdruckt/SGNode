@@ -24,6 +24,12 @@ struct BrewProfile {
   bool ogVerified;
   bool ogNeedsChoice;
   bool autoModeEnabled;
+  bool plugControlEnabled;
+  bool floatZeroCalDone;
+  bool floatZeroCalSkipped;
+  unsigned long floatZeroCalibratedAt;
+  bool floatInBrewConfirmed;
+  unsigned long floatInBrewAt;
   char selectedYeastPresetId[24];
   char selectedYeastPresetName[32];
   char yeastCategory[32];

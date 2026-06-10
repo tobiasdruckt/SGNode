@@ -84,6 +84,12 @@ void BrewProfileStore::setDefaults(BrewProfile* profile) {
   profile->ogVerified = false;
   profile->ogNeedsChoice = false;
   profile->autoModeEnabled = true;
+  profile->plugControlEnabled = false;
+  profile->floatZeroCalDone = false;
+  profile->floatZeroCalSkipped = false;
+  profile->floatZeroCalibratedAt = 0;
+  profile->floatInBrewConfirmed = false;
+  profile->floatInBrewAt = 0;
   strcpy(profile->selectedYeastPresetId, "us05");
   strcpy(profile->selectedYeastPresetName, "US-05");
   strcpy(profile->yeastCategory, "American Ale");
@@ -218,6 +224,12 @@ bool BrewProfileStore::save(const BrewProfile& profile) {
   file.printf("  \"ogVerified\":%s,\n", profile.ogVerified ? "true" : "false");
   file.printf("  \"ogNeedsChoice\":%s,\n", profile.ogNeedsChoice ? "true" : "false");
   file.printf("  \"autoModeEnabled\":%s,\n", profile.autoModeEnabled ? "true" : "false");
+  file.printf("  \"plugControlEnabled\":%s,\n", profile.plugControlEnabled ? "true" : "false");
+  file.printf("  \"floatZeroCalDone\":%s,\n", profile.floatZeroCalDone ? "true" : "false");
+  file.printf("  \"floatZeroCalSkipped\":%s,\n", profile.floatZeroCalSkipped ? "true" : "false");
+  file.printf("  \"floatZeroCalibratedAt\":%lu,\n", profile.floatZeroCalibratedAt);
+  file.printf("  \"floatInBrewConfirmed\":%s,\n", profile.floatInBrewConfirmed ? "true" : "false");
+  file.printf("  \"floatInBrewAt\":%lu,\n", profile.floatInBrewAt);
   file.print("  \"selectedYeastPresetId\":\""); jsonEscapePrint(file, profile.selectedYeastPresetId); file.println("\",");
   file.print("  \"selectedYeastPresetName\":\""); jsonEscapePrint(file, profile.selectedYeastPresetName); file.println("\",");
   file.print("  \"yeastCategory\":\""); jsonEscapePrint(file, profile.yeastCategory); file.println("\",");
@@ -293,6 +305,12 @@ bool BrewProfileStore::loadFromPath(const char* path, BrewProfile* profile) {
   profile->ogVerified = extractBool(json, "ogVerified", profile->ogVerified);
   profile->ogNeedsChoice = extractBool(json, "ogNeedsChoice", profile->ogNeedsChoice);
   profile->autoModeEnabled = extractBool(json, "autoModeEnabled", profile->autoModeEnabled);
+  profile->plugControlEnabled = extractBool(json, "plugControlEnabled", profile->plugControlEnabled);
+  profile->floatZeroCalDone = extractBool(json, "floatZeroCalDone", profile->floatZeroCalDone);
+  profile->floatZeroCalSkipped = extractBool(json, "floatZeroCalSkipped", profile->floatZeroCalSkipped);
+  profile->floatZeroCalibratedAt = extractULong(json, "floatZeroCalibratedAt", profile->floatZeroCalibratedAt);
+  profile->floatInBrewConfirmed = extractBool(json, "floatInBrewConfirmed", profile->floatInBrewConfirmed);
+  profile->floatInBrewAt = extractULong(json, "floatInBrewAt", profile->floatInBrewAt);
   extractString(json, "selectedYeastPresetId", profile->selectedYeastPresetId, sizeof(profile->selectedYeastPresetId));
   extractString(json, "selectedYeastPresetName", profile->selectedYeastPresetName, sizeof(profile->selectedYeastPresetName));
   extractString(json, "yeastCategory", profile->yeastCategory, sizeof(profile->yeastCategory));

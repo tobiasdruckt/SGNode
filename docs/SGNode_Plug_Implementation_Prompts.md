@@ -4,6 +4,32 @@ Working notes for adding an ESP8285-based smart plug as a standalone fridge cont
 
 These notes are intentionally split into small implementation prompts. Each prompt should be usable as a focused task later.
 
+## Current Implementation Status
+
+SGNode Plug is implemented far enough for bench testing, but remains **alpha** until the water/fridge live test is complete.
+
+| Stage | Status | Notes |
+| --- | --- | --- |
+| 1. Hardware validation | Done for current bench hardware | Gosund SP1, ESP8285, power metering removed, GPIO4/GPIO5 freed, relay active-high on GPIO14 |
+| 2. Dual DS18B20 serial test | Prepared | `SGNode_Plug_Sensor_Relay_Test` exists; real two-sensor validation and routing still need to be run |
+| 3. Plug firmware skeleton | Implemented | `SGNode_Plug/SGNode_Plug.ino` and supporting modules exist |
+| 4. Local air controller | Implemented | 0.8 K hysteresis controller implemented; compressor timing still needs live validation |
+| 5. Rolling statistics and fallback | Implemented | 10-minute duty and six-hour pattern fallback implemented; replay behavior needs live validation |
+| 6. ESP-NOW protocol | Implemented | Shared command/status structs, Base MAC learning, persisted Plug MAC, and status handling are present |
+| 7. Outer PI beer controller | Implemented | Batch-size-based `Tn`, clamps, adaptive offset, and air-target derivation are implemented |
+| 8. Base batch/UI integration | Implemented | Brew Wizard Plug toggle, Base command sender, status display, and Plug temperature preference are present |
+| 9. Shared CSV integration | Implemented | Batch CSV includes Plug status fields while remaining backward-compatible |
+| 10. Water tests and tuning | Open | Next required milestone before beta |
+
+Open validation before beta:
+
+- Flash and validate both DS18B20 probes on real wiring.
+- Run low-voltage relay/contact test without 230 V load.
+- Run water/fridge test with several fill levels.
+- Validate PI `Kp`, batch-size-to-`Tn`, 3 K hold clamp, 5 K transition clamp, 1.0 C minimum air target, compressor timing, and fallback behavior.
+- Confirm Base logs coherent Float + Plug rows during the test.
+- Confirm cold-crash transition behavior with water before using Plug auto mode on a live batch.
+
 ## Implementation Order
 
 Implement and validate SGNode Plug in the following order. Do not proceed to the next stage until the current stage has passed its checks.

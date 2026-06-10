@@ -2,6 +2,7 @@
 .arduino/
 build/
 .build_*/
+.codex_build/
 sd_backups/
 DeepSleepProbe/
 *.tmp

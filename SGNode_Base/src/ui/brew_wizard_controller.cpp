@@ -333,14 +333,14 @@ void BrewWizardController::nextStep() {
     step = WIZARD_DONE;
     return;
   }
-  if (profile && profile->autoModeEnabled && step == WIZARD_YEAST) {
+  if (profile && step == WIZARD_AUTO_MODE) {
+    step = WIZARD_PLUG_CONTROL;
+  } else if (profile && profile->autoModeEnabled && step == WIZARD_YEAST) {
     step = WIZARD_YEAST_BEHAVIOR;
   } else if (profile && profile->autoModeEnabled && step == WIZARD_YEAST_BEHAVIOR) {
     step = WIZARD_REVIEW;
   } else if (profile && !profile->autoModeEnabled && step == WIZARD_DIACETYL) {
     step = WIZARD_REVIEW;
-  } else if (profile && profile->autoModeEnabled && step == WIZARD_AUTO_MODE) {
-    step = WIZARD_YEAST;
   } else {
     step = (BrewWizardStep)((int)step + 1);
   }
@@ -356,10 +356,14 @@ void BrewWizardController::previousStep() {
     return;
   }
   commitStepBuffer();
-  if (profile && profile->autoModeEnabled && step == WIZARD_REVIEW) {
+  if (profile && step == WIZARD_PLUG_CONTROL) {
+    step = WIZARD_AUTO_MODE;
+  } else if (profile && profile->autoModeEnabled && step == WIZARD_REVIEW) {
     step = WIZARD_YEAST_BEHAVIOR;
   } else if (profile && !profile->autoModeEnabled && step == WIZARD_REVIEW) {
     step = WIZARD_DIACETYL;
+  } else if (profile && profile->autoModeEnabled && step == WIZARD_YEAST) {
+    step = WIZARD_PLUG_CONTROL;
   } else if (profile && profile->autoModeEnabled && step == WIZARD_YEAST_BEHAVIOR) {
     step = WIZARD_YEAST;
   } else {
@@ -371,7 +375,7 @@ void BrewWizardController::previousStep() {
 void BrewWizardController::drawFrame(TFT_eSPI& tft, const char* title) {
   tft.fillScreen(uiColorBackground);
   uiDrawTopbar("Brew Wizard", true, true, 0);
-  WizardStepper::draw(tft, (int)step, 10, MARGIN, TOPBAR_H + 10, UI_W - MARGIN * 2);
+  WizardStepper::draw(tft, (int)step, 11, MARGIN, TOPBAR_H + 10, UI_W - MARGIN * 2);
   tft.setTextColor(uiColorTextPrimary);
   tft.setFreeFont(FONT_SIZE_SM_BOLD);
   tft.setCursor(MARGIN, TOPBAR_H + 42);
@@ -554,6 +558,17 @@ void BrewWizardController::draw(TFT_eSPI& tft) {
       tft.print(profile->autoModeEnabled ? "Preset fills attenuation, curve and ETA" : "Manual yeast and attenuation");
       drawNav(tft, true, true, "NEXT");
       break;
+    case WIZARD_PLUG_CONTROL:
+      drawFrame(tft, "SGNode Plug");
+      tft.setTextColor(uiColorTextSecondary);
+      tft.setFreeFont(FONT_SIZE_SM);
+      tft.setCursor(MARGIN, 110);
+      tft.print("Use Plug for temperature control");
+      IOSSwitch::draw(tft, UI_W - MARGIN - 74, 86, profile->plugControlEnabled);
+      tft.setCursor(MARGIN, 166);
+      tft.print(profile->plugControlEnabled ? "Base sends batch target to Plug" : "Monitor only, relay remains off");
+      drawNav(tft, true, true, "NEXT");
+      break;
     case WIZARD_YEAST:
       if (profile->autoModeEnabled) {
         drawFrame(tft, "Yeast Preset");
@@ -594,11 +609,13 @@ void BrewWizardController::draw(TFT_eSPI& tft) {
       tft.setCursor(MARGIN, 182); tft.printf("Expected FG %.3f", profile->expectedFinalGravity);
       tft.setCursor(MARGIN, 212);
       tft.printf("%s / D-rest: %s", profile->autoModeEnabled ? "Auto" : "Manual", profile->diacetylRestEnabled ? "On" : "Off");
-      tft.setTextColor(profile->dryHopEnabled ? uiColorTextPrimary : uiColorTextSecondary);
       tft.setFreeFont(FONT_SIZE_XS);
-      tft.setCursor(MARGIN, 238);
+      tft.setCursor(MARGIN, 232);
+      tft.printf("Plug: %s", profile->plugControlEnabled ? "Auto control" : "Monitor only");
+      tft.setTextColor(profile->dryHopEnabled ? uiColorTextPrimary : uiColorTextSecondary);
+      tft.setCursor(MARGIN, 252);
       if (profile->dryHopEnabled) {
-        tft.printf("Dry hop: SG %.3f, contact %lu h", profile->dryHopTriggerSG, profile->dryHopContactHours);
+        tft.printf("Dry hop SG %.3f, contact %lu h", profile->dryHopTriggerSG, profile->dryHopContactHours);
       } else {
         tft.print("Dry hop: Off");
       }
@@ -650,6 +667,12 @@ bool BrewWizardController::handleTouch(int x, int y) {
         } else {
           strcpy(profile->attenuationSource, "manual");
         }
+        return true;
+      }
+      break;
+    case WIZARD_PLUG_CONTROL:
+      if (IOSSwitch::hit(x, y, UI_W - MARGIN - 74, 86)) {
+        profile->plugControlEnabled = !profile->plugControlEnabled;
         return true;
       }
       break;
