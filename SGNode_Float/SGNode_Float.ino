@@ -7,7 +7,6 @@
  * - EmotiBit BMI160 (by Connected Future Labs) - Install from:
  *   https://github.com/EmotiBit/EmotiBit_BMI160
  *   Download as ZIP and install via Sketch -> Include Library -> Add .ZIP Library
- * - Adafruit BMP085 Library (by Adafruit)
  * - Wire (built-in)
  * - EEPROM (built-in)
  */
@@ -15,7 +14,6 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <Wire.h>
-#include <Adafruit_BMP085.h>
 #include <BMI160Gen.h>
 #include "polynomial_calibration.h"
 #include "../SGNode_Shared/sg_protocol.h"
@@ -81,9 +79,6 @@ float harnessMockSG = 1.000f;
 char harnessCommandBuffer[128];
 size_t harnessCommandLength = 0;
 #endif
-
-// BMP180 instance
-Adafruit_BMP085 bmp180;
 
 // BMI160 instance provided by EmotiBit_BMI160 library
 // No need to declare - library provides global BMI160 instance
@@ -201,7 +196,7 @@ PendingStableOffsetCalibration pendingStableOffset = {};
 
 // Function prototypes
 void initIMU();
-void initBMP180();
+void initTemperatureSensor();
 void initESPNow();
 void configureUnusedGPIOs();
 void suspendBMI160();
@@ -456,7 +451,7 @@ void loop() {
       if (debug_mode) Serial.println("State: INIT");
       delay(100);   // Short stabilization delay after wake
       initIMU();
-      initBMP180();
+      initTemperatureSensor();
       // WiFi initialization moved to SEND state for power savings
       
       // Send calibration trigger if in calibration mode and ESP-NOW is ready
@@ -559,8 +554,8 @@ void suspendBMI160() {
   if (debug_mode) Serial.println("BMI160 put into suspend mode");
 }
 
-void initBMP180() {
-  if (debug_mode) Serial.println("BMP180 disabled - using BMI160 temperature");
+void initTemperatureSensor() {
+  if (debug_mode) Serial.println("Temperature source: BMI160 chip temperature");
   delay(50);
 }
 

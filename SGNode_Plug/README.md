@@ -33,8 +33,8 @@ The relay is initialized OFF before any controller logic runs.
   faults, relay state, and the rolling ten-minute duty cycle.
 
 The Base learns the MAC of the first valid Plug status packet and stores it in
-EEPROM. Plug control remains disabled by default until the batch wizard gains
-the explicit `SGNode Plug present` choice.
+EEPROM. Plug control remains disabled by default and can be enabled per batch
+with the Brew Wizard `SGNode Plug` step.
 
 ## Build target
 
@@ -42,8 +42,12 @@ Use `Generic ESP8266 Module`, 1 MB flash, DOUT flash mode, and 80 MHz CPU.
 
 ## Bench-test order
 
-1. Flash `SGNode_Plug_Hardware_Check` and verify the serial pin report.
-2. With no 230 V connection, flash `SGNode_Plug_Sensor_Relay_Test`.
+The low-level bench-test sketches are intentionally local-only and ignored by
+Git. Keep them beside the repo when working on hardware, but do not publish
+them as part of the main firmware tree.
+
+1. Flash local `SGNode_Plug_Hardware_Check` and verify the serial pin report.
+2. With no 230 V connection, flash local `SGNode_Plug_Sensor_Relay_Test`.
 3. Verify both temperatures on serial and relay continuity with a multimeter.
 4. Flash `SGNode_Plug` only after the sensor assignment and relay polarity are
    confirmed.

@@ -29,7 +29,7 @@ SGNode remains in **alpha** while SGNode Plug temperature control is still await
 - Light/dark theme with persistent setting
 
 ### Float Unit
-- BMI160 tilt measurement and BMI160 chip-temperature reporting
+- BMI160 tilt measurement and BMI160 chip-temperature diagnostics
 - Polynomial gravity calibration stored in EEPROM
 - ESP-NOW packet transmission with protocol version and CRC
 - Battery voltage reporting
@@ -89,7 +89,7 @@ SGNode_Shared/
   yeast_history.json
 ```
 
-`log.csv` contains timestamp, epoch, uptime, angle, density, temperature, battery, fermentation state, attenuation, ABV, and recommendation code. Historical data is loaded after reboot and should be visible immediately.
+`log.csv` contains timestamp, epoch, uptime, angle, density, diagnostic float temperature, battery, fermentation state, attenuation, ABV, recommendation code, and optional Plug temperature-control fields. Historical data is loaded after reboot and should be visible immediately.
 
 ## Setup
 
@@ -98,7 +98,6 @@ SGNode_Shared/
    - TFT_eSPI
    - XPT2046_Touchscreen
    - EmotiBit BMI160
-   - Adafruit BMP085, still included by the current float sketch for compatibility even though the BMP180 sensor is no longer installed
    - SD, FS, SPI, Wire, EEPROM
 3. Configure TFT_eSPI for the 4.0-inch ESP32-32E display.
 4. Flash `SGNode_Base/SGNode_Base.ino`.

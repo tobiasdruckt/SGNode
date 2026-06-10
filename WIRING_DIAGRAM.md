@@ -1,24 +1,19 @@
 # SGNode Wiring Reference
 
-**Current release:** alpha 0.4.0
+**Current release:** alpha 0.5.0
 
 ## Float Unit
 
-### I2C Sensors
+### I2C Sensor
 
 ```text
 BMI160 VCC  -> 3.3V
 BMI160 GND  -> GND
-BMI160 SDA  -> GPIO21
-BMI160 SCL  -> GPIO22
-
-BMP180 VCC  -> 3.3V
-BMP180 GND  -> GND
-BMP180 SDA  -> GPIO21
-BMP180 SCL  -> GPIO22
+BMI160 SDA  -> GPIO26
+BMI160 SCL  -> GPIO27
 ```
 
-BMI160 and BMP180 share the same I2C bus.
+The BMP180/GY-68 was removed from the current float hardware. The firmware uses BMI160 chip temperature as a diagnostic value only.
 
 ### Battery Measurement
 
@@ -83,7 +78,7 @@ Base:  5V USB supply, 2A recommended
 
 ## Quick Checks
 
-- Float I2C devices should be on GPIO21/GPIO22.
+- Float BMI160 should be on GPIO26/GPIO27.
 - Base station SD card must be FAT32.
 - Float calibration switch must be open for normal low-power operation.
 - Keep ESP32 antennas away from metal and liquid shielding where possible.

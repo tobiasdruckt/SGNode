@@ -3,13 +3,13 @@
 **Release:** alpha 0.5.0  
 **Role:** Battery-powered ESP32 sensor float
 
-The float measures tilt, temperature, and battery voltage, converts tilt to specific gravity using stored calibration coefficients, and sends packets to the base station via ESP-NOW.
+The float measures tilt, diagnostic BMI160 chip temperature, and battery voltage, converts tilt to specific gravity using stored calibration coefficients, and sends packets to the base station via ESP-NOW.
 
 ## Hardware
 
 - WeMos D32 ESP32 board with 18650 holder
-- BMI160 IMU on I2C
-- BMP180 temperature sensor on I2C
+- BMI160 IMU on I2C, GPIO26 SDA and GPIO27 SCL
+- BMP180/GY-68 removed in the current low-power hardware revision
 - Battery voltage divider on GPIO15
 - Calibration switch on GPIO12
 - Status LEDs on GPIO5 and GPIO16
@@ -29,7 +29,6 @@ Calibration switch ON keeps the float awake for the base station calibration wor
 ## Required Libraries
 
 - EmotiBit BMI160
-- Adafruit BMP085
 - Wire
 - EEPROM
 
@@ -66,6 +65,6 @@ Adding extra optional calibration points normally requires flashing the float be
 
 - No packets: check base station MAC and ESP-NOW channel.
 - Wrong SG: recalibrate and verify the float is mechanically stable.
-- Wrong temperature: check BMP180 wiring and I2C sharing.
+- Unexpected temperature: remember this is BMI160 chip temperature for diagnostics, not beer temperature.
 - Battery reads wrong: verify the divider and calibration factor.
 - Fast drain: inspect deep sleep entry and sensor power behavior.

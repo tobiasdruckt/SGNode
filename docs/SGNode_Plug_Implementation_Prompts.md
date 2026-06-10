@@ -11,7 +11,7 @@ SGNode Plug is implemented far enough for bench testing, but remains **alpha** u
 | Stage | Status | Notes |
 | --- | --- | --- |
 | 1. Hardware validation | Done for current bench hardware | Gosund SP1, ESP8285, power metering removed, GPIO4/GPIO5 freed, relay active-high on GPIO14 |
-| 2. Dual DS18B20 serial test | Prepared | `SGNode_Plug_Sensor_Relay_Test` exists; real two-sensor validation and routing still need to be run |
+| 2. Dual DS18B20 serial test | Prepared locally | `SGNode_Plug_Sensor_Relay_Test` is kept local-only and ignored by Git; real two-sensor validation and routing still need to be run |
 | 3. Plug firmware skeleton | Implemented | `SGNode_Plug/SGNode_Plug.ino` and supporting modules exist |
 | 4. Local air controller | Implemented | 0.8 K hysteresis controller implemented; compressor timing still needs live validation |
 | 5. Rolling statistics and fallback | Implemented | 10-minute duty and six-hour pattern fallback implemented; replay behavior needs live validation |
@@ -49,8 +49,8 @@ Exit criteria:
 
 ### Stage 2: Dual DS18B20 Serial Test Sketch
 
-- Create a standalone hardware-test sketch before implementing SGNode Plug firmware.
-- Suggested path: `SGNode_Plug_Test/Dual_DS18B20_Serial_Test.ino`.
+- Create or keep a standalone local hardware-test sketch before implementing SGNode Plug firmware.
+- Suggested local path: `SGNode_Plug_Test/Dual_DS18B20_Serial_Test.ino`.
 - Connect fridge-air DS18B20 to GPIO4.
 - Connect vessel/beer DS18B20 to GPIO5.
 - Use one 4.7 kOhm pull-up to 3.3 V on each data line.

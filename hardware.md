@@ -28,8 +28,8 @@
 
 | Signal | GPIO | Notes |
 | --- | ---: | --- |
-| I2C SDA | 21 | BMI160 |
-| I2C SCL | 22 | BMI160 |
+| I2C SDA | 26 | BMI160 |
+| I2C SCL | 27 | BMI160 |
 | Battery ADC | 15 | 51k/51k divider plus capacitor |
 | Calibration switch | 12 | Switch to GND |
 | Built-in LED | 5 | Status |
@@ -39,6 +39,7 @@
 
 - The BMP180/GY-68 has been removed from the float. It self-heated the small float interior and did not provide a reliable beer-temperature measurement.
 - Current firmware reports BMI160 chip temperature. Treat this as a diagnostic value, not as representative wort/beer temperature.
+- The current Float firmware no longer requires any BMP/BMP180 support library.
 - The USB-UART chip was isolated by cutting pin 8 on the CP2302/USB-UART package used on the tested board. This reduced sleep leakage on the reference float.
 - The voltage regulator was replaced with an ME6220 during testing. The improvement was small and is not considered worth the rework by itself.
 - Current measured reference sleep current after the practical hardware changes is about `0.95 mA`.
