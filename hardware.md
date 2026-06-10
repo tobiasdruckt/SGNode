@@ -1,6 +1,6 @@
 # SGNode Hardware Notes
 
-**Current release:** alpha 0.4.0
+**Current release:** alpha 0.5.0
 
 ## Bill Of Materials
 

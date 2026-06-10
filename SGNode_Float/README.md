@@ -1,6 +1,6 @@
 # SGNode Float Firmware
 
-**Release:** alpha 0.4.0  
+**Release:** alpha 0.5.0  
 **Role:** Battery-powered ESP32 sensor float
 
 The float measures tilt, temperature, and battery voltage, converts tilt to specific gravity using stored calibration coefficients, and sends packets to the base station via ESP-NOW.

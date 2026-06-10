@@ -117,9 +117,9 @@ static void handleCommand(char* line) {
 
   if (strcmp(line, "build_info") == 0) {
     #if SGNODE_UI_TEST_MINIMAL
-      printOK("build=alpha_0_4_0_ui_harness_minimal");
+      printOK("build=alpha_0_5_0_ui_harness_minimal");
     #else
-      printOK("build=alpha_0_4_0_float_ack_retry_2026_05_23");
+      printOK("build=alpha_0_5_0_float_ack_retry_2026_05_23");
     #endif
     return;
   }

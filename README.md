@@ -1,6 +1,6 @@
 # SGNode Intelligent Fermentation Assistant
 
-**Release:** alpha 0.4.0  
+**Release:** alpha 0.5.0  
 **Platform:** ESP32 float + standalone ESP32 base station with 4-inch touchscreen
 
 SGNode is a self-contained fermentation monitor and assistant. A battery-powered float measures tilt, temperature, and battery voltage. The base station receives data over ESP-NOW, stores batches on SD card, and provides all setup, charts, recommendations, and management directly on the built-in touchscreen.
@@ -222,8 +222,8 @@ Use `DEBUG_INFO` temporarily for setup details such as the base station MAC addr
 
 ## Release Notes
 
-See [RELEASE_NOTES_v0.4.0-alpha.md](RELEASE_NOTES_v0.4.0-alpha.md).
+See [RELEASE_NOTES_v0.5.0-alpha.md](RELEASE_NOTES_v0.5.0-alpha.md).
 
 ## Status
 
-alpha 0.4.0 is ready for hands-on testing. The system is feature-rich but still needs longer fermentation runs to validate battery life, SD flush behavior, fermentation phase thresholds, and UI edge cases.
+alpha 0.5.0 is ready for hands-on testing. Float/Base have completed a first real batch, while SGNode Plug remains alpha until water/fridge validation is complete.

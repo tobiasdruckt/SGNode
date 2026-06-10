@@ -852,7 +852,7 @@ void drawCurrentScreen();
 
 void setup() {
   Serial.begin(115200);
-  LOG_INFOLN("=== SGNode Base Station alpha 0.4.0 starting ===");
+  LOG_INFOLN("=== SGNode Base Station alpha 0.5.0 starting ===");
   
   loadThemePreference();
   #if SGNODE_UI_TEST_HARNESS
@@ -4775,7 +4775,7 @@ void drawBootScreen() {
   tft.setTextColor(currentTheme->textSecondary);
   tft.setFreeFont(FONT_SIZE_SM);
   tft.setCursor(logoX + 60, logoY + logo2_height + 14);  // Adjust for FreeFont baseline
-  tft.println("alpha 0.4.0");
+  tft.println("alpha 0.5.0");
   
   delay(2000); // Show boot screen for 2 seconds
 }
@@ -10545,7 +10545,7 @@ static void batteryDebugHandleCommand(char* command) {
   if (strcmp(command, "help") == 0) {
     batteryDebugPrint(true, "commands=help,build_info,batch_diagnostics,battery_stats,battery_all,battery_dump_csv,float_stats");
   } else if (strcmp(command, "build_info") == 0) {
-    batteryDebugPrint(true, "build=alpha_0_4_0_battery_debug");
+    batteryDebugPrint(true, "build=alpha_0_5_0_battery_debug");
   } else if (strcmp(command, "batch_diagnostics") == 0) {
     batteryDebugPrint(batteryDebugBatchDiagnostics(result, sizeof(result)), result);
   } else if (strcmp(command, "battery_stats") == 0) {
