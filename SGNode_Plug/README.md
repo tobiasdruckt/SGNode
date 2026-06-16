@@ -21,16 +21,21 @@ The relay is initialized OFF before any controller logic runs.
 ## Control behavior
 
 - The Base sends beer target, ramp rate, and batch size by ESP-NOW.
-- The Plug averages the beer probe over up to ten minutes and updates its
-  outer PI controller once per minute.
-- The outer PI controller derives an air target. The inner controller switches
-  the relay with a total hysteresis of 0.8 K.
+- The Plug keeps a rolling beer-probe history and updates its outer controller
+  once per minute.
+- The outer PI/D-brake controller derives an air target. The inner controller
+  switches the relay around that target with asymmetric thresholds above the
+  air target. Current defaults switch off at air target + 0.5 K and on at air
+  target + 1.1 K to compensate for fridge aftercool.
 - If the beer probe fails while the air probe remains valid, the last air
   target is held.
 - If the air probe fails, a complete learned six-hour compressor pattern is
   replayed. Without a complete pattern, the relay remains off.
 - Every Plug status contains both temperatures, targets, controller state,
   faults, relay state, and the rolling ten-minute duty cycle.
+
+Controller parameters are sent by Base with each command. Base stores the
+editable defaults on the SD card in `/data/plug/gov_settings.json`.
 
 The Base learns the MAC of the first valid Plug status packet and stores it in
 EEPROM. Plug control remains disabled by default and can be enabled per batch

@@ -16,20 +16,21 @@ bool check(Print& output, bool condition, const __FlashStringHelper* name) {
 
 bool runPlugSelfChecks(Print& output) {
   AirControllerConfig config;
-  config.hysteresisC = 0.8f;
+  config.turnOffAboveTargetC = 0.5f;
+  config.turnOnAboveTargetC = 1.1f;
   config.minimumOnMs = 0;
   config.minimumOffMs = 0;
   AirController controller(config);
 
   bool passed = true;
-  passed &= check(output, !controller.update(20.3f, true, 20.0f, true, 1),
-                  F("air controller holds inside upper band"));
-  passed &= check(output, controller.update(20.5f, true, 20.0f, true, 2),
-                  F("air controller switches on above upper band"));
-  passed &= check(output, controller.update(19.7f, true, 20.0f, true, 3),
-                  F("air controller holds inside lower band"));
-  passed &= check(output, !controller.update(19.5f, true, 20.0f, true, 4),
-                  F("air controller switches off below lower band"));
+  passed &= check(output, !controller.update(21.0f, true, 20.0f, true, 1),
+                  F("air controller holds below raised on threshold"));
+  passed &= check(output, controller.update(21.2f, true, 20.0f, true, 2),
+                  F("air controller switches on above raised on threshold"));
+  passed &= check(output, controller.update(20.7f, true, 20.0f, true, 3),
+                  F("air controller holds above raised off threshold"));
+  passed &= check(output, !controller.update(20.4f, true, 20.0f, true, 4),
+                  F("air controller switches off before aftercool"));
   passed &= check(output, !controller.update(25.0f, false, 20.0f, true, 5),
                   F("invalid air sensor forces relay off"));
 
@@ -55,17 +56,28 @@ bool runPlugSelfChecks(Print& output) {
                   F("PI Tn follows batch size with 6h/24h clamps"));
 
   BeerPiController pi;
+  BeerPiSettings piSettings;
+  piSettings.kp = 0.5f;
+  piSettings.integralTnHours = 0.75f;
+  piSettings.dBrakeHours = 0.0f;
   for (uint8_t i = 0; i < BeerPiController::AVERAGE_SAMPLES; ++i) {
     pi.addBeerSample(23.0f, true);
   }
-  const float holdAirTarget = pi.update(20.0f, 0.0f, 13.0f, 1);
-  passed &= check(output, fabsf(holdAirTarget - 17.0f) < 0.01f,
-                  F("PI static offset clamps at 3 K"));
+  const float coolingAirTarget = pi.update(20.0f, 0.0f, 13.0f, piSettings, 1);
+  passed &= check(output, fabsf(coolingAirTarget - 18.5f) < 0.01f,
+                  F("PI lowers air target when beer is warm"));
 
   pi.reset();
   pi.addBeerSample(10.0f, true);
-  const float fastAirTarget = pi.update(2.5f, 1.0f, 13.0f, 1);
-  passed &= check(output, fabsf(fastAirTarget - 1.0f) < 0.01f,
-                  F("PI fast-ramp air target respects 1 C minimum"));
+  const float warmupAirTarget = pi.update(12.0f, 0.0f, 13.0f, piSettings, 1);
+  passed &= check(output, fabsf(warmupAirTarget - 13.8f) < 0.01f,
+                  F("PI raises air target when beer is cold"));
+
+  pi.reset();
+  pi.addBeerSample(10.0f, true);
+  piSettings.kp = 1.0f;
+  const float safetyAirTarget = pi.update(2.5f, 1.0f, 13.0f, piSettings, 1);
+  passed &= check(output, fabsf(safetyAirTarget - 1.0f) < 0.01f,
+                  F("PI air target respects 1 C safety minimum"));
   return passed;
 }

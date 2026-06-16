@@ -6,24 +6,24 @@ These notes are intentionally split into small implementation prompts. Each prom
 
 ## Current Implementation Status
 
-SGNode Plug is implemented far enough for bench testing, but remains **alpha** until the water/fridge live test is complete.
+SGNode Plug is implemented and has passed initial bench plus first 13 L water/fridge validation, including clean 9 C and 4 C holds. It remains **alpha** until other fill levels and at least one real fermentation validate the controller.
 
 | Stage | Status | Notes |
 | --- | --- | --- |
 | 1. Hardware validation | Done for current bench hardware | Gosund SP1, ESP8285, power metering removed, GPIO4/GPIO5 freed, relay active-high on GPIO14 |
-| 2. Dual DS18B20 serial test | Prepared locally | `SGNode_Plug_Sensor_Relay_Test` is kept local-only and ignored by Git; real two-sensor validation and routing still need to be run |
+| 2. Dual DS18B20 serial test | Done for current hardware | `SGNode_Plug_Sensor_Relay_Test` is kept local-only and ignored by Git; sensor assignment was validated before Plug firmware testing |
 | 3. Plug firmware skeleton | Implemented | `SGNode_Plug/SGNode_Plug.ino` and supporting modules exist |
-| 4. Local air controller | Implemented | 0.8 K hysteresis controller implemented; compressor timing still needs live validation |
+| 4. Local air controller | Implemented | Asymmetric air thresholds implemented; current defaults are off at air target + 0.5 K and on at air target + 1.1 K |
 | 5. Rolling statistics and fallback | Implemented | 10-minute duty and six-hour pattern fallback implemented; replay behavior needs live validation |
 | 6. ESP-NOW protocol | Implemented | Shared command/status structs, Base MAC learning, persisted Plug MAC, and status handling are present |
-| 7. Outer PI beer controller | Implemented | Batch-size-based `Tn`, clamps, adaptive offset, and air-target derivation are implemented |
+| 7. Outer PI beer controller | Implemented | Explicit Base-sent `Kp`, `Tn`, D-brake, clamps, and air-target derivation are implemented |
 | 8. Base batch/UI integration | Implemented | Brew Wizard Plug toggle, Base command sender, status display, and Plug temperature preference are present |
 | 9. Shared CSV integration | Implemented | Batch CSV includes Plug status fields while remaining backward-compatible |
-| 10. Water tests and tuning | Open | Next required milestone before beta |
+| 10. Water tests and tuning | In progress | First 13 L test produced usable defaults; other fill levels and real fermentation validation remain before beta |
 
 Open validation before beta:
 
-- Flash and validate both DS18B20 probes on real wiring.
+- Validate both DS18B20 probes over longer operation on real wiring.
 - Run low-voltage relay/contact test without 230 V load.
 - Run water/fridge test with several fill levels.
 - Validate PI `Kp`, batch-size-to-`Tn`, 3 K hold clamp, 5 K transition clamp, 1.0 C minimum air target, compressor timing, and fallback behavior.
@@ -99,7 +99,8 @@ Exit criteria:
 ### Stage 4: Local Air Two-Point Controller
 
 - Implement the inner fridge-air controller.
-- Add 0.8 K total hysteresis.
+- Add asymmetric thresholds relative to air target.
+- Current defaults: relay off at air target + 0.5 K, relay on at air target + 1.1 K.
 - Add minimum compressor off/on timing.
 - Test first with a lamp or other non-compressor load if practical.
 
@@ -208,7 +209,8 @@ Initial control strategy:
 - Base sends the requested beer-temperature target from the active batch profile.
 - Plug runs a slow outer beer-temperature controller that derives a fridge-air target.
 - Plug runs an inner two-point fridge-air controller around that derived air target.
-- Inner-loop hysteresis: 0.8 K total band, e.g. cooling on at air target + 0.4 K and off at air target - 0.4 K.
+- Inner-loop thresholds: cooling on at air target + `Air on`, cooling off at air target + `Air off`.
+- Current defaults are `Air off = 0.5 K` and `Air on = 1.1 K` to account for fridge aftercool.
 - Plug sends average actual air temperature to Base every 10 minutes.
 - Plug adapts its air-temperature target slowly based on the difference between immersion-probe temperature and requested beer target.
 - Adaptive correction must be conservative, bounded, autonomous, and visible on Base through status reporting.
@@ -415,9 +417,9 @@ Implement the local two-point fridge controller in the plug firmware.
 
 Initial algorithm:
 
-- Cooling on if `airTemp >= targetTemp + hysteresis / 2`.
-- Cooling off if `airTemp <= targetTemp - hysteresis / 2`.
-- Default hysteresis: 0.8 K.
+- Cooling on if `airTemp >= airTarget + Air on`.
+- Cooling off if `airTemp <= airTarget + Air off`.
+- Default thresholds: `Air off = 0.5 K`, `Air on = 1.1 K`.
 - Enforce minimum compressor off time, default 5 minutes.
 - Optional minimum on time, default 2 minutes.
 - Relay must remain off when mode is disabled or sensor is invalid.
@@ -646,9 +648,9 @@ Outer PI controller concept:
 - `beerError = plugBeerTemp - requestedBeerTarget`.
 - Positive beer error requests a colder fridge-air target.
 - Negative beer error requests a warmer fridge-air target or compressor inactivity.
-- PI integral time `Tn` depends on batch size because batch volume is used as the first approximation of thermal inertia.
-- Base sends batch size to Plug with the control command.
-- Plug derives `Tn` from batch size and reports the active `Tn` to Base.
+- Current implementation: Base sends the active controller parameters with each Plug command.
+- `Tn` is currently an explicit editable value from `/data/plug/gov_settings.json`.
+- Batch-size-dependent `Tn` scaling remains a future refinement after more fill-level tests.
 - Apply anti-windup whenever the controller output reaches its active offset clamp.
 - Freeze or back-calculate the integral term while compressor operation cannot affect the requested direction.
 - Filter beer temperature and rate before feeding the PI controller.
@@ -660,23 +662,28 @@ PI output clamps:
 - Controlled ramps up to and including 0.8 K/h: dynamic output clamp up to 5 K.
 - Cooling ramps above 0.8 K/h: fast-ramp behavior with minimum fridge-air target of 1.0 C.
 
-Initial `Tn` concept:
+Deferred `Tn` scaling concept:
 
 - Larger batches receive a longer `Tn`.
 - Smaller batches receive a shorter `Tn`.
 - Clamp `Tn` to a sensible minimum and maximum so invalid batch sizes cannot create unstable behavior.
 - The exact batch-size-to-`Tn` relationship must be validated experimentally.
-- Keep the relationship configurable in firmware rather than scattering constants through control logic.
+- Keep the relationship configurable rather than scattering constants through control logic.
 
-Initial PI parameters for water testing:
+Current tested controller defaults:
 
 ```text
-Kp = 2.0 K air-target offset per 1.0 K beer-temperature error
-Tn(13 L) = 6 h
-Tn(batchLiters) = clamp(6 h * batchLiters / 13 L, 3 h, 12 h)
+Kp = 0.45
+Tn = 0.75 h
+D brake = 0.80 h
+Air off = +0.50 K above air target
+Air on = +1.10 K above air target
+Beer undershoot lockout = 0.10 K
+D max = 0.90 K
+Warming D factor = 0.25
 ```
 
-Example initial `Tn` values:
+Future example `Tn` values if batch-size scaling is introduced:
 
 | Batch size | Initial Tn |
 | ---: | ---: |
@@ -687,18 +694,16 @@ Example initial `Tn` values:
 | 25 L | 11.5 h |
 | 30 L | 12.0 h, maximum clamp |
 
-Reasoning:
+Current reasoning:
 
-- The observed system response was approximately 1.2 K/h beer cooling at about 10 K air-to-vessel difference.
-- This gives an initial observed rate gain of approximately 0.12 (K/h) per K offset.
-- With `Kp = 2.0`, a 0.5 K beer-temperature error initially requests approximately 1.0 K air offset.
-- At 13 L and a constant 0.5 K error, the integral contribution increases the requested offset by approximately 1.0 K over six hours.
-- These values are intentionally conservative until water tests identify the actual delay, gain, and overshoot behavior.
+- The first clean 13 L water/fridge validation showed the 9 C hold stable enough with these values.
+- The fridge has noticeable aftercool after relay-off, so `Air off` and `Air on` are intentionally above the computed air target.
+- The 4 C hold looked clean on the earlier SD data; additional fill levels and real fermentation heat are still needed before treating these as universal defaults.
 
 Initial controller execution rules:
 
 - Run the outer PI calculation once per minute.
-- Use a filtered immersion-probe temperature, initially a 10-minute moving average.
+- Use a filtered immersion-probe temperature. Current control uses the most recent short control average and a longer history for rate estimation.
 - Use an error deadband of approximately +/- 0.1 K in holding mode.
 - Ramp the beer setpoint internally rather than stepping directly to the final target.
 - Apply conditional-integration anti-windup: do not integrate further when the output is clamped and the current error would drive it farther into saturation.
@@ -734,9 +739,9 @@ Dynamic clamp concept:
 Fast cooling ramp decision:
 
 - For commanded cooling ramps above 0.8 K/h, allow aggressive cooling without the normal dynamic air-to-beer offset clamp.
-- During this fast-ramp mode, clamp the derived fridge-air target to a minimum of 1.0 C.
-- The normal 0.8 K total hysteresis remains active around that target.
-- With a 1.0 C minimum air target and +/- 0.4 K hysteresis, measured fridge-air temperature may intentionally fall to approximately 0.6 C before the compressor switches off.
+- During this fast-ramp mode, clamp the derived fridge-air target to a minimum of 1.0 C unless later tests justify a colder target.
+- The normal asymmetric air thresholds remain active around that target.
+- With a 1.0 C minimum air target and the current `Air off = 0.5 K`, measured fridge-air temperature should normally switch the compressor off around 1.5 C before aftercool.
 - There is no separate 1.0 C measured-air hard shutdown in this mode.
 - The refrigerator itself has an independent hard limiter at 0 C, providing the final physical low-temperature protection.
 - SGNode Plug must not rely on the refrigerator limiter for normal regulation; it remains a last protection layer.
@@ -841,15 +846,15 @@ Tests:
 - Temperature failure without a complete valid six-hour pattern keeps the relay off and reports a fault to Base.
 - Cooling ramps above 0.8 K/h enter fast-ramp mode without the normal dynamic offset clamp.
 - Fast-ramp mode never commands a fridge-air target below 1.0 C.
-- With the standard hysteresis, fast-ramp mode permits measured fridge-air temperature down to approximately 0.6 C.
+- With the current asymmetric thresholds, fast-ramp mode still turns the compressor off above the air target to compensate for aftercool.
 - Refrigerator hard limiter at 0 C remains independent and is not part of the normal Plug control algorithm.
 - Holding mode clamps air-to-beer target offset to 3 K.
 - Controlled cooling ramps at or below 0.8 K/h dynamically clamp air-to-beer target offset to at most 5 K.
 - Larger batch sizes select a longer PI integral time than smaller batch sizes.
 - Invalid batch sizes cannot select a `Tn` outside configured limits.
 - PI integral anti-windup works at the 3 K, 5 K, and fast-ramp output limits.
-- Initial PI defaults are `Kp = 2.0` and `Tn = 6 h` at 13 L.
-- `Tn` scales linearly with batch size and remains within 3-12 h.
+- Current controller defaults are `Kp = 0.45`, `Tn = 0.75 h`, and `D brake = 0.80 h`.
+- Batch-size-based `Tn` scaling is deferred until more fill-level data supports it.
 - Controller uses filtered beer temperature and holding deadband.
 - Mode changes do not create a sudden unsafe air-target jump.
 - Plug Auto Mode selects immersion-probe temperature as authoritative for Base display, logging, and batch analysis.
@@ -918,8 +923,8 @@ Output:
 ## Open Questions
 
 - Verify GPIO4/GPIO5 electrical isolation after removing the power-metering hardware.
-- Validate initial `Kp = 2.0` through water tests.
-- Validate linear batch-size-to-`Tn` scaling and the initial 3-12 h limits through water tests.
+- Validate the current controller defaults on other fill levels and a real fermentation.
+- Decide whether explicit `Tn` remains a global editable setting or becomes batch-size-derived with an editable multiplier.
 
 ## Deferred Topics
 

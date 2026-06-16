@@ -266,7 +266,7 @@ uint32_t lastHistoricalOldestEpoch = 0;
 uint32_t lastHistoricalNewestEpoch = 0;
 
 #define CSV_LINE_BUFFER_SIZE 320
-#define FERMENTATION_LOG_HEADER "timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code,float_temperature,plug_beer_temperature,plug_air_temperature,plug_beer_target,plug_air_target,plug_mode,plug_relay,plug_duty_10m,plug_faults,plug_pi_offset,plug_pi_tn"
+#define FERMENTATION_LOG_HEADER "timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code,float_temperature,plug_beer_temperature,plug_air_temperature,plug_beer_target,plug_air_target,plug_mode,plug_relay,plug_duty_10m,plug_faults,plug_pi_offset,plug_pi_tn,plug_beer_rate,plug_kp,plug_d_brake"
 
 // Separate buffer for discharge rate calculation (25 recent points only)
 payload_t dischargeRateBuffer[25];
@@ -335,7 +335,8 @@ enum ViewMode {
   DASHBOARD_VIEW,
   NEW_YEAST_VIEW,
   MANAGE_YEAST_VIEW,
-  MANAGE_BREW_VIEW
+  MANAGE_BREW_VIEW,
+  PLUG_GOVERNOR_VIEW
 };
 
 ViewMode currentMode = LIVE_VIEW;
@@ -405,6 +406,68 @@ uint32_t latestPlugStatusMs = 0;
 uint16_t plugCommandSequence = 0;
 uint32_t lastPlugCommandMs = 0;
 float latestFloatTemperatureC = NAN;
+float lastValidPlugBeerTemperatureC = NAN;
+constexpr float PLUG_DEFAULT_CONTROLLER_KP = 0.45f;
+constexpr float PLUG_DEFAULT_CONTROLLER_TN_H = 0.75f;
+constexpr float PLUG_DEFAULT_CONTROLLER_D_BRAKE_H = 0.8f;
+float plugControllerKp = PLUG_DEFAULT_CONTROLLER_KP;
+float plugControllerTnHours = PLUG_DEFAULT_CONTROLLER_TN_H;
+float plugControllerDBrakeHours = PLUG_DEFAULT_CONTROLLER_D_BRAKE_H;
+
+struct PlugGovernorSettings {
+  float kp;
+  float integralTnHours;
+  float dBrakeHours;
+  float airTurnOffAboveTargetC;
+  float airTurnOnAboveTargetC;
+  uint16_t airMinimumOnS;
+  uint16_t airMinimumOffS;
+  float coldIntegralBandC;
+  float warmIntegralBandC;
+  float maxPositiveIntegralC;
+  float maxNegativeIntegralC;
+  float integralLeakPerHour;
+  float errorCrossingKeepFactor;
+  float maxDOffsetC;
+  float warmingDFactor;
+  float beerUndershootLockoutC;
+  float fastWarmingRateKPerH;
+  float strongUndershootC;
+  float strongUndershootAirOffsetC;
+  float minAirTargetC;
+  float maxAirTargetC;
+  float targetStepC;
+};
+
+PlugGovernorSettings plugGovSettings = {};
+bool plugGovSettingsLoaded = false;
+bool plugGovSettingsDirty = false;
+bool plugGovLastSaveOk = true;
+uint8_t plugGovSelectedIndex = 0;
+uint8_t plugGovFirstVisibleIndex = 0;
+uint8_t plugDetailsTapCount = 0;
+uint32_t plugDetailsTapWindowStartMs = 0;
+const char PLUG_GOV_SETTINGS_DIR[] = "/data/plug";
+const char PLUG_GOV_SETTINGS_PATH[] = "/data/plug/gov_settings.json";
+constexpr uint8_t PLUG_GOV_SETTING_COUNT = 22;
+
+struct PlugTestPhase {
+  float targetC;
+  uint32_t holdSeconds;
+  float minBeerC;
+  bool hasMinBeerC;
+};
+PlugTestPhase plugTestPhases[5];
+uint8_t plugTestPhaseCount = 0;
+uint8_t plugTestPhaseIndex = 0;
+bool plugTestScheduleLoaded = false;
+bool plugTestScheduleEnabled = false;
+bool plugTestStarted = false;
+bool plugTestPhaseReached = false;
+float plugTestReachToleranceC = 0.3f;
+uint32_t plugTestStartedEpoch = 0;
+uint32_t plugTestPhaseReachedEpoch = 0;
+char plugTestLoadedBatchId[24] = "";
 
 // EEPROM addresses for float MAC storage
 #define EEPROM_BYTES 160
@@ -676,7 +739,9 @@ void sendPlugCommandIfDue();
 bool hasValidPlugBeerTemperature();
 bool hasValidPlugAirTemperature();
 bool hasFreshPlugStatus();
+bool usesPlugTemperatureAsPrimary();
 float effectiveTemperatureC(float floatTemperatureC);
+float latestDisplayedTemperatureC();
 bool ensureFloatPeerRegistered(const uint8_t* mac);
 void setFloatZeroCalStatus(const char* message);
 void sendDataAck(const uint8_t* mac, const payload_t& data);
@@ -705,6 +770,8 @@ float targetModelHourForChartHour(float chartHour);
 float targetChartHourForModelHour(float modelHour);
 float expectedTargetSGAtChartHour(float chartHour);
 float currentTemperatureTargetC(unsigned long nowEpoch);
+void loadPlugTestScheduleIfNeeded();
+float plugTestScheduleTargetC(float fallbackTarget, unsigned long nowEpoch);
 float targetHourForSG(float targetSG, float chartHours);
 float targetHourForAttenuation(float attenuationPercent, float chartHours);
 float eventHourFromEpoch(unsigned long eventEpoch);
@@ -821,6 +888,12 @@ void drawDetailSection(int* y, const char* title);
 void drawDetailRow(int* y, const char* label, const char* value);
 void drawDetailSectionAt(int x, int* y, int w, const char* title);
 void drawDetailRowAt(int x, int* y, int w, const char* label, const char* value);
+void resetPlugGovernorSettingsToDefaults();
+bool ensurePlugGovernorSettingsLoaded();
+bool savePlugGovernorSettingsToSD();
+void drawPlugGovernorView();
+bool handleLiveDetailsTouch(int x, int y);
+bool handlePlugGovernorTouch(int x, int y);
 
 // Graph button handler functions
 void handleGraphButton6h();
@@ -997,6 +1070,9 @@ void loop() {
           break;
         case MANAGE_BREW_VIEW:
           title = "Manage Brew";
+          break;
+        case PLUG_GOVERNOR_VIEW:
+          title = "Plug Setup";
           break;
       }
       
@@ -1391,6 +1467,9 @@ void drawCurrentScreen() {
     case MANAGE_BREW_VIEW:
       drawManageBrewScreen();
       break;
+    case PLUG_GOVERNOR_VIEW:
+      drawPlugGovernorView();
+      break;
   }
 }
 
@@ -1468,6 +1547,11 @@ void onPlugStatusReceived(const uint8_t *mac, const uint8_t *incomingData, int l
   latestPlugStatus = status;
   latestPlugStatusValid = true;
   latestPlugStatusMs = millis();
+  if ((latestPlugStatus.faults & SG_PLUG_FAULT_BEER_SENSOR) == 0 &&
+      !isnan(latestPlugStatus.beer_temp_c) && !isinf(latestPlugStatus.beer_temp_c) &&
+      latestPlugStatus.beer_temp_c > -5.0f && latestPlugStatus.beer_temp_c < 60.0f) {
+    lastValidPlugBeerTemperatureC = latestPlugStatus.beer_temp_c;
+  }
   tileTempDirty = true;
   topbarDirty = true;
   detailsDirty = true;
@@ -1492,14 +1576,37 @@ bool hasFreshPlugStatus() {
   return latestPlugStatusValid && millis() - latestPlugStatusMs <= 5UL * 60000UL;
 }
 
+bool usesPlugTemperatureAsPrimary() {
+  return brewProfileLoaded && activeBrewProfile.plugControlEnabled && !activeBrewProfile.completed;
+}
+
 float effectiveTemperatureC(float floatTemperatureC) {
+  if (usesPlugTemperatureAsPrimary()) {
+    if (hasValidPlugBeerTemperature()) return latestPlugStatus.beer_temp_c;
+    if (!isnan(lastValidPlugBeerTemperatureC) && !isinf(lastValidPlugBeerTemperatureC)) {
+      return lastValidPlugBeerTemperatureC;
+    }
+  }
   return hasValidPlugBeerTemperature() ? latestPlugStatus.beer_temp_c : floatTemperatureC;
+}
+
+float latestDisplayedTemperatureC() {
+  if (hasValidPlugBeerTemperature()) return latestPlugStatus.beer_temp_c;
+  if (usesPlugTemperatureAsPrimary() &&
+      !isnan(lastValidPlugBeerTemperatureC) && !isinf(lastValidPlugBeerTemperatureC)) {
+    return lastValidPlugBeerTemperatureC;
+  }
+  return latestFloatDataValid ? latestFloatData.temperature : NAN;
 }
 
 void sendPlugCommandIfDue() {
   const uint32_t nowMs = millis();
   if (!plugMacKnown || nowMs - lastPlugCommandMs < 60000UL) return;
   lastPlugCommandMs = nowMs;
+  ensurePlugGovernorSettingsLoaded();
+  plugControllerKp = plugGovSettings.kp;
+  plugControllerTnHours = plugGovSettings.integralTnHours;
+  plugControllerDBrakeHours = plugGovSettings.dBrakeHours;
 
   sg_plug_command_t command = {};
   command.packet_type = SG_PLUG_COMMAND_TYPE;
@@ -1519,7 +1626,32 @@ void sendPlugCommandIfDue() {
              command.base_epoch < activeBrewProfile.dRestStartedAt + 12UL * 3600UL) {
     command.ramp_k_per_h = 0.2f;
   }
+  if (plugTestScheduleEnabled && plugTestStarted && hasValidPlugBeerTemperature()) {
+    command.ramp_k_per_h = latestPlugStatus.beer_temp_c > command.beer_target_c + 0.3f ? 1.0f : 0.0f;
+  }
   command.batch_liters = brewProfileLoaded ? activeBrewProfile.batchSizeLiters : 20.0f;
+  command.controller_kp = plugControllerKp;
+  command.controller_tn_h = plugControllerTnHours;
+  command.controller_d_brake_h = plugControllerDBrakeHours;
+  command.air_turn_off_above_target_c = plugGovSettings.airTurnOffAboveTargetC;
+  command.air_turn_on_above_target_c = plugGovSettings.airTurnOnAboveTargetC;
+  command.air_minimum_on_s = plugGovSettings.airMinimumOnS;
+  command.air_minimum_off_s = plugGovSettings.airMinimumOffS;
+  command.cold_integral_band_c = plugGovSettings.coldIntegralBandC;
+  command.warm_integral_band_c = plugGovSettings.warmIntegralBandC;
+  command.max_positive_integral_c = plugGovSettings.maxPositiveIntegralC;
+  command.max_negative_integral_c = plugGovSettings.maxNegativeIntegralC;
+  command.integral_leak_per_hour = plugGovSettings.integralLeakPerHour;
+  command.error_crossing_keep_factor = plugGovSettings.errorCrossingKeepFactor;
+  command.max_d_offset_c = plugGovSettings.maxDOffsetC;
+  command.warming_d_factor = plugGovSettings.warmingDFactor;
+  command.beer_undershoot_lockout_c = plugGovSettings.beerUndershootLockoutC;
+  command.fast_warming_rate_k_per_h = plugGovSettings.fastWarmingRateKPerH;
+  command.strong_undershoot_c = plugGovSettings.strongUndershootC;
+  command.strong_undershoot_air_offset_c = plugGovSettings.strongUndershootAirOffsetC;
+  command.min_air_target_c = plugGovSettings.minAirTargetC;
+  command.max_air_target_c = plugGovSettings.maxAirTargetC;
+  command.target_step_c = plugGovSettings.targetStepC;
   command.flags = brewProfileLoaded && !activeBrewProfile.completed && activeBrewProfile.plugControlEnabled
     ? SG_PLUG_COMMAND_ENABLE
     : 0;
@@ -1989,7 +2121,7 @@ void updateLiveViewDynamic() {
   
   // Update temp tile
   if (tileTempDirty) {
-    snprintf(buffer, sizeof(buffer), "%.1f", latest.temperature);
+    snprintf(buffer, sizeof(buffer), "%.1f", latestDisplayedTemperatureC());
     uiTile(MARGIN, tileY, tileW, tileH, 0, "Temp", buffer, "C", false);
     tileTempDirty = false;
   }
@@ -2252,7 +2384,7 @@ void drawDashboardScreen() {
   tft.setCursor(tempX + 10, contextY + 14);
   tft.print("Temp");
   float tempTarget = currentTemperatureTargetC(getCurrentEpoch());
-  if (hasData) snprintf(text, sizeof(text), "%.1f C | Set %.1f C", latest.temperature, tempTarget);
+  if (hasData) snprintf(text, sizeof(text), "%.1f C | Set %.1f C", latestDisplayedTemperatureC(), tempTarget);
   else snprintf(text, sizeof(text), "-- | Set %.1f C", tempTarget);
   tft.setTextColor(uiColorTextPrimary);
   tft.setCursor(tempX + 10, contextY + 30);
@@ -3161,6 +3293,464 @@ float expectedTargetSGAtChartHour(float chartHour) {
   return TargetCurveGenerator::expectedGravityAtHour(activeBrewProfile, targetModelHourForChartHour(chartHour));
 }
 
+void resetPlugTestScheduleState() {
+  plugTestPhaseCount = 0;
+  plugTestPhaseIndex = 0;
+  plugTestScheduleEnabled = false;
+  plugTestStarted = false;
+  plugTestPhaseReached = false;
+  plugTestReachToleranceC = 0.3f;
+  plugTestStartedEpoch = 0;
+  plugTestPhaseReachedEpoch = 0;
+  plugControllerKp = PLUG_DEFAULT_CONTROLLER_KP;
+  plugControllerTnHours = PLUG_DEFAULT_CONTROLLER_TN_H;
+  plugControllerDBrakeHours = PLUG_DEFAULT_CONTROLLER_D_BRAKE_H;
+}
+
+float parseJsonNumberAfter(const char* start, const char* key, float fallback) {
+  if (!start || !key) return fallback;
+  const char* p = strstr(start, key);
+  if (!p) return fallback;
+  p = strchr(p, ':');
+  if (!p) return fallback;
+  return atof(p + 1);
+}
+
+float boundedOrDefault(float value, float fallback, float minimum, float maximum) {
+  if (isnan(value) || isinf(value)) return fallback;
+  if (value < minimum) return fallback;
+  if (value > maximum) return fallback;
+  return value;
+}
+
+uint16_t boundedSecondsOrDefault(float value, uint16_t fallback, uint16_t minimum, uint16_t maximum) {
+  if (isnan(value) || isinf(value)) return fallback;
+  if (value < minimum) return fallback;
+  if (value > maximum) return fallback;
+  return (uint16_t)(value + 0.5f);
+}
+
+void normalizePlugGovernorSettings() {
+  plugGovSettings.kp = boundedOrDefault(plugGovSettings.kp, PLUG_DEFAULT_CONTROLLER_KP, 0.05f, 5.0f);
+  plugGovSettings.integralTnHours = boundedOrDefault(plugGovSettings.integralTnHours, PLUG_DEFAULT_CONTROLLER_TN_H, 0.0f, 72.0f);
+  plugGovSettings.dBrakeHours = boundedOrDefault(plugGovSettings.dBrakeHours, PLUG_DEFAULT_CONTROLLER_D_BRAKE_H, 0.0f, 6.0f);
+  plugGovSettings.airTurnOffAboveTargetC = boundedOrDefault(plugGovSettings.airTurnOffAboveTargetC, 0.5f, -1.0f, 3.0f);
+  plugGovSettings.airTurnOnAboveTargetC = boundedOrDefault(plugGovSettings.airTurnOnAboveTargetC, 1.1f, 0.0f, 5.0f);
+  if (plugGovSettings.airTurnOnAboveTargetC < plugGovSettings.airTurnOffAboveTargetC) {
+    plugGovSettings.airTurnOnAboveTargetC = plugGovSettings.airTurnOffAboveTargetC;
+  }
+  plugGovSettings.airMinimumOnS = boundedSecondsOrDefault(plugGovSettings.airMinimumOnS, 120, 0, 1800);
+  plugGovSettings.airMinimumOffS = boundedSecondsOrDefault(plugGovSettings.airMinimumOffS, 300, 0, 3600);
+  plugGovSettings.coldIntegralBandC = boundedOrDefault(plugGovSettings.coldIntegralBandC, 1.0f, 0.0f, 5.0f);
+  plugGovSettings.warmIntegralBandC = boundedOrDefault(plugGovSettings.warmIntegralBandC, 0.5f, 0.0f, 5.0f);
+  plugGovSettings.maxPositiveIntegralC = boundedOrDefault(plugGovSettings.maxPositiveIntegralC, 2.0f, 0.0f, 5.0f);
+  plugGovSettings.maxNegativeIntegralC = boundedOrDefault(plugGovSettings.maxNegativeIntegralC, -0.6f, -5.0f, 0.0f);
+  plugGovSettings.integralLeakPerHour = boundedOrDefault(plugGovSettings.integralLeakPerHour, 1.0f, 0.0f, 5.0f);
+  plugGovSettings.errorCrossingKeepFactor = boundedOrDefault(plugGovSettings.errorCrossingKeepFactor, 0.25f, 0.0f, 1.0f);
+  plugGovSettings.maxDOffsetC = boundedOrDefault(plugGovSettings.maxDOffsetC, 0.9f, 0.0f, 5.0f);
+  plugGovSettings.warmingDFactor = boundedOrDefault(plugGovSettings.warmingDFactor, 0.25f, 0.0f, 1.0f);
+  plugGovSettings.beerUndershootLockoutC = boundedOrDefault(plugGovSettings.beerUndershootLockoutC, 0.1f, 0.0f, 2.0f);
+  plugGovSettings.fastWarmingRateKPerH = boundedOrDefault(plugGovSettings.fastWarmingRateKPerH, 1.0f, 0.0f, 5.0f);
+  plugGovSettings.strongUndershootC = boundedOrDefault(plugGovSettings.strongUndershootC, 1.0f, 0.0f, 5.0f);
+  plugGovSettings.strongUndershootAirOffsetC = boundedOrDefault(plugGovSettings.strongUndershootAirOffsetC, 1.8f, 0.0f, 5.0f);
+  plugGovSettings.minAirTargetC = boundedOrDefault(plugGovSettings.minAirTargetC, 1.0f, -5.0f, 20.0f);
+  plugGovSettings.maxAirTargetC = boundedOrDefault(plugGovSettings.maxAirTargetC, 30.0f, 0.0f, 35.0f);
+  if (plugGovSettings.maxAirTargetC <= plugGovSettings.minAirTargetC + 0.5f) {
+    plugGovSettings.maxAirTargetC = plugGovSettings.minAirTargetC + 0.5f;
+  }
+  plugGovSettings.targetStepC = boundedOrDefault(plugGovSettings.targetStepC, 0.25f, 0.0f, 5.0f);
+}
+
+void resetPlugGovernorSettingsToDefaults() {
+  plugGovSettings.kp = PLUG_DEFAULT_CONTROLLER_KP;
+  plugGovSettings.integralTnHours = PLUG_DEFAULT_CONTROLLER_TN_H;
+  plugGovSettings.dBrakeHours = PLUG_DEFAULT_CONTROLLER_D_BRAKE_H;
+  plugGovSettings.airTurnOffAboveTargetC = 0.5f;
+  plugGovSettings.airTurnOnAboveTargetC = 1.1f;
+  plugGovSettings.airMinimumOnS = 120;
+  plugGovSettings.airMinimumOffS = 300;
+  plugGovSettings.coldIntegralBandC = 1.0f;
+  plugGovSettings.warmIntegralBandC = 0.5f;
+  plugGovSettings.maxPositiveIntegralC = 2.0f;
+  plugGovSettings.maxNegativeIntegralC = -0.6f;
+  plugGovSettings.integralLeakPerHour = 1.0f;
+  plugGovSettings.errorCrossingKeepFactor = 0.25f;
+  plugGovSettings.maxDOffsetC = 0.9f;
+  plugGovSettings.warmingDFactor = 0.25f;
+  plugGovSettings.beerUndershootLockoutC = 0.1f;
+  plugGovSettings.fastWarmingRateKPerH = 1.0f;
+  plugGovSettings.strongUndershootC = 1.0f;
+  plugGovSettings.strongUndershootAirOffsetC = 1.8f;
+  plugGovSettings.minAirTargetC = 1.0f;
+  plugGovSettings.maxAirTargetC = 30.0f;
+  plugGovSettings.targetStepC = 0.25f;
+}
+
+bool savePlugGovernorSettingsToSD() {
+  normalizePlugGovernorSettings();
+  bool mountedHere = false;
+  if (!sdInitialized) {
+    if (!mountSDTemporarily()) {
+      plugGovLastSaveOk = false;
+      return false;
+    }
+    mountedHere = true;
+  }
+
+  if (!SD.exists("/data")) SD.mkdir("/data");
+  if (!SD.exists(PLUG_GOV_SETTINGS_DIR)) SD.mkdir(PLUG_GOV_SETTINGS_DIR);
+  if (SD.exists(PLUG_GOV_SETTINGS_PATH)) SD.remove(PLUG_GOV_SETTINGS_PATH);
+  File file = SD.open(PLUG_GOV_SETTINGS_PATH, FILE_WRITE);
+  if (!file) {
+    if (mountedHere) dismountSD();
+    plugGovLastSaveOk = false;
+    return false;
+  }
+
+  file.println("{");
+  file.println("  \"version\": 1,");
+  file.printf("  \"kp\": %.3f,\n", plugGovSettings.kp);
+  file.printf("  \"integralTnHours\": %.3f,\n", plugGovSettings.integralTnHours);
+  file.printf("  \"dBrakeHours\": %.3f,\n", plugGovSettings.dBrakeHours);
+  file.printf("  \"airTurnOffAboveTargetC\": %.3f,\n", plugGovSettings.airTurnOffAboveTargetC);
+  file.printf("  \"airTurnOnAboveTargetC\": %.3f,\n", plugGovSettings.airTurnOnAboveTargetC);
+  file.printf("  \"airMinimumOnS\": %u,\n", plugGovSettings.airMinimumOnS);
+  file.printf("  \"airMinimumOffS\": %u,\n", plugGovSettings.airMinimumOffS);
+  file.printf("  \"coldIntegralBandC\": %.3f,\n", plugGovSettings.coldIntegralBandC);
+  file.printf("  \"warmIntegralBandC\": %.3f,\n", plugGovSettings.warmIntegralBandC);
+  file.printf("  \"maxPositiveIntegralC\": %.3f,\n", plugGovSettings.maxPositiveIntegralC);
+  file.printf("  \"maxNegativeIntegralC\": %.3f,\n", plugGovSettings.maxNegativeIntegralC);
+  file.printf("  \"integralLeakPerHour\": %.3f,\n", plugGovSettings.integralLeakPerHour);
+  file.printf("  \"errorCrossingKeepFactor\": %.3f,\n", plugGovSettings.errorCrossingKeepFactor);
+  file.printf("  \"maxDOffsetC\": %.3f,\n", plugGovSettings.maxDOffsetC);
+  file.printf("  \"warmingDFactor\": %.3f,\n", plugGovSettings.warmingDFactor);
+  file.printf("  \"beerUndershootLockoutC\": %.3f,\n", plugGovSettings.beerUndershootLockoutC);
+  file.printf("  \"fastWarmingRateKPerH\": %.3f,\n", plugGovSettings.fastWarmingRateKPerH);
+  file.printf("  \"strongUndershootC\": %.3f,\n", plugGovSettings.strongUndershootC);
+  file.printf("  \"strongUndershootAirOffsetC\": %.3f,\n", plugGovSettings.strongUndershootAirOffsetC);
+  file.printf("  \"minAirTargetC\": %.3f,\n", plugGovSettings.minAirTargetC);
+  file.printf("  \"maxAirTargetC\": %.3f,\n", plugGovSettings.maxAirTargetC);
+  file.printf("  \"targetStepC\": %.3f\n", plugGovSettings.targetStepC);
+  file.println("}");
+  file.close();
+  if (mountedHere) dismountSD();
+  plugGovSettingsDirty = false;
+  plugGovLastSaveOk = true;
+  return true;
+}
+
+bool ensurePlugGovernorSettingsLoaded() {
+  if (plugGovSettingsLoaded) return true;
+  resetPlugGovernorSettingsToDefaults();
+
+  bool mountedHere = false;
+  if (!sdInitialized) {
+    if (!mountSDTemporarily()) {
+      plugGovSettingsLoaded = true;
+      plugGovLastSaveOk = false;
+      return false;
+    }
+    mountedHere = true;
+  }
+
+  if (!SD.exists(PLUG_GOV_SETTINGS_PATH)) {
+    if (mountedHere) dismountSD();
+    plugGovSettingsLoaded = true;
+    return savePlugGovernorSettingsToSD();
+  }
+
+  File file = SD.open(PLUG_GOV_SETTINGS_PATH, FILE_READ);
+  if (!file) {
+    if (mountedHere) dismountSD();
+    plugGovSettingsLoaded = true;
+    plugGovLastSaveOk = false;
+    return false;
+  }
+
+  static char json[1536];
+  size_t size = file.size();
+  if (size > sizeof(json) - 1) size = sizeof(json) - 1;
+  size_t read = file.readBytes(json, size);
+  json[read] = '\0';
+  file.close();
+  if (mountedHere) dismountSD();
+
+  plugGovSettings.kp = parseJsonNumberAfter(json, "\"kp\"", plugGovSettings.kp);
+  plugGovSettings.integralTnHours = parseJsonNumberAfter(json, "\"integralTnHours\"", plugGovSettings.integralTnHours);
+  plugGovSettings.dBrakeHours = parseJsonNumberAfter(json, "\"dBrakeHours\"", plugGovSettings.dBrakeHours);
+  plugGovSettings.airTurnOffAboveTargetC = parseJsonNumberAfter(json, "\"airTurnOffAboveTargetC\"", plugGovSettings.airTurnOffAboveTargetC);
+  plugGovSettings.airTurnOnAboveTargetC = parseJsonNumberAfter(json, "\"airTurnOnAboveTargetC\"", plugGovSettings.airTurnOnAboveTargetC);
+  plugGovSettings.airMinimumOnS = boundedSecondsOrDefault(parseJsonNumberAfter(json, "\"airMinimumOnS\"", plugGovSettings.airMinimumOnS), plugGovSettings.airMinimumOnS, 0, 1800);
+  plugGovSettings.airMinimumOffS = boundedSecondsOrDefault(parseJsonNumberAfter(json, "\"airMinimumOffS\"", plugGovSettings.airMinimumOffS), plugGovSettings.airMinimumOffS, 0, 3600);
+  plugGovSettings.coldIntegralBandC = parseJsonNumberAfter(json, "\"coldIntegralBandC\"", plugGovSettings.coldIntegralBandC);
+  plugGovSettings.warmIntegralBandC = parseJsonNumberAfter(json, "\"warmIntegralBandC\"", plugGovSettings.warmIntegralBandC);
+  plugGovSettings.maxPositiveIntegralC = parseJsonNumberAfter(json, "\"maxPositiveIntegralC\"", plugGovSettings.maxPositiveIntegralC);
+  plugGovSettings.maxNegativeIntegralC = parseJsonNumberAfter(json, "\"maxNegativeIntegralC\"", plugGovSettings.maxNegativeIntegralC);
+  plugGovSettings.integralLeakPerHour = parseJsonNumberAfter(json, "\"integralLeakPerHour\"", plugGovSettings.integralLeakPerHour);
+  plugGovSettings.errorCrossingKeepFactor = parseJsonNumberAfter(json, "\"errorCrossingKeepFactor\"", plugGovSettings.errorCrossingKeepFactor);
+  plugGovSettings.maxDOffsetC = parseJsonNumberAfter(json, "\"maxDOffsetC\"", plugGovSettings.maxDOffsetC);
+  plugGovSettings.warmingDFactor = parseJsonNumberAfter(json, "\"warmingDFactor\"", plugGovSettings.warmingDFactor);
+  plugGovSettings.beerUndershootLockoutC = parseJsonNumberAfter(json, "\"beerUndershootLockoutC\"", plugGovSettings.beerUndershootLockoutC);
+  plugGovSettings.fastWarmingRateKPerH = parseJsonNumberAfter(json, "\"fastWarmingRateKPerH\"", plugGovSettings.fastWarmingRateKPerH);
+  plugGovSettings.strongUndershootC = parseJsonNumberAfter(json, "\"strongUndershootC\"", plugGovSettings.strongUndershootC);
+  plugGovSettings.strongUndershootAirOffsetC = parseJsonNumberAfter(json, "\"strongUndershootAirOffsetC\"", plugGovSettings.strongUndershootAirOffsetC);
+  plugGovSettings.minAirTargetC = parseJsonNumberAfter(json, "\"minAirTargetC\"", plugGovSettings.minAirTargetC);
+  plugGovSettings.maxAirTargetC = parseJsonNumberAfter(json, "\"maxAirTargetC\"", plugGovSettings.maxAirTargetC);
+  plugGovSettings.targetStepC = parseJsonNumberAfter(json, "\"targetStepC\"", plugGovSettings.targetStepC);
+  normalizePlugGovernorSettings();
+  plugGovSettingsLoaded = true;
+  plugGovSettingsDirty = false;
+  plugGovLastSaveOk = true;
+  return true;
+}
+
+const char* plugGovernorSettingLabel(uint8_t index) {
+  switch (index) {
+    case 0: return "P";
+    case 1: return "I Tn";
+    case 2: return "D brake";
+    case 3: return "Air off";
+    case 4: return "Air on";
+    case 5: return "Min on";
+    case 6: return "Min off";
+    case 7: return "I cold band";
+    case 8: return "I warm band";
+    case 9: return "I max +";
+    case 10: return "I max -";
+    case 11: return "I leak";
+    case 12: return "Cross keep";
+    case 13: return "D max";
+    case 14: return "D warm";
+    case 15: return "Beer lock";
+    case 16: return "Warm rate";
+    case 17: return "Under err";
+    case 18: return "Under air";
+    case 19: return "Air min";
+    case 20: return "Air max";
+    case 21: return "Target step";
+    default: return "--";
+  }
+}
+
+float plugGovernorSettingValue(uint8_t index) {
+  switch (index) {
+    case 0: return plugGovSettings.kp;
+    case 1: return plugGovSettings.integralTnHours;
+    case 2: return plugGovSettings.dBrakeHours;
+    case 3: return plugGovSettings.airTurnOffAboveTargetC;
+    case 4: return plugGovSettings.airTurnOnAboveTargetC;
+    case 5: return plugGovSettings.airMinimumOnS;
+    case 6: return plugGovSettings.airMinimumOffS;
+    case 7: return plugGovSettings.coldIntegralBandC;
+    case 8: return plugGovSettings.warmIntegralBandC;
+    case 9: return plugGovSettings.maxPositiveIntegralC;
+    case 10: return plugGovSettings.maxNegativeIntegralC;
+    case 11: return plugGovSettings.integralLeakPerHour;
+    case 12: return plugGovSettings.errorCrossingKeepFactor;
+    case 13: return plugGovSettings.maxDOffsetC;
+    case 14: return plugGovSettings.warmingDFactor;
+    case 15: return plugGovSettings.beerUndershootLockoutC;
+    case 16: return plugGovSettings.fastWarmingRateKPerH;
+    case 17: return plugGovSettings.strongUndershootC;
+    case 18: return plugGovSettings.strongUndershootAirOffsetC;
+    case 19: return plugGovSettings.minAirTargetC;
+    case 20: return plugGovSettings.maxAirTargetC;
+    case 21: return plugGovSettings.targetStepC;
+    default: return 0.0f;
+  }
+}
+
+void setPlugGovernorSettingValue(uint8_t index, float value) {
+  switch (index) {
+    case 0: plugGovSettings.kp = value; break;
+    case 1: plugGovSettings.integralTnHours = value; break;
+    case 2: plugGovSettings.dBrakeHours = value; break;
+    case 3: plugGovSettings.airTurnOffAboveTargetC = value; break;
+    case 4: plugGovSettings.airTurnOnAboveTargetC = value; break;
+    case 5: plugGovSettings.airMinimumOnS = (uint16_t)(value + 0.5f); break;
+    case 6: plugGovSettings.airMinimumOffS = (uint16_t)(value + 0.5f); break;
+    case 7: plugGovSettings.coldIntegralBandC = value; break;
+    case 8: plugGovSettings.warmIntegralBandC = value; break;
+    case 9: plugGovSettings.maxPositiveIntegralC = value; break;
+    case 10: plugGovSettings.maxNegativeIntegralC = value; break;
+    case 11: plugGovSettings.integralLeakPerHour = value; break;
+    case 12: plugGovSettings.errorCrossingKeepFactor = value; break;
+    case 13: plugGovSettings.maxDOffsetC = value; break;
+    case 14: plugGovSettings.warmingDFactor = value; break;
+    case 15: plugGovSettings.beerUndershootLockoutC = value; break;
+    case 16: plugGovSettings.fastWarmingRateKPerH = value; break;
+    case 17: plugGovSettings.strongUndershootC = value; break;
+    case 18: plugGovSettings.strongUndershootAirOffsetC = value; break;
+    case 19: plugGovSettings.minAirTargetC = value; break;
+    case 20: plugGovSettings.maxAirTargetC = value; break;
+    case 21: plugGovSettings.targetStepC = value; break;
+  }
+  normalizePlugGovernorSettings();
+  plugGovSettingsDirty = true;
+}
+
+float plugGovernorSettingStep(uint8_t index) {
+  switch (index) {
+    case 0: return 0.05f;
+    case 1: return 0.25f;
+    case 2: return 0.1f;
+    case 5:
+    case 6: return 30.0f;
+    case 12:
+    case 14: return 0.05f;
+    default: return 0.1f;
+  }
+}
+
+void formatPlugGovernorSettingValue(uint8_t index, char* buffer, size_t bufferSize) {
+  float value = plugGovernorSettingValue(index);
+  switch (index) {
+    case 0:
+    case 12:
+    case 14:
+      snprintf(buffer, bufferSize, "%.2f", value);
+      break;
+    case 1:
+    case 2:
+      snprintf(buffer, bufferSize, "%.2fh", value);
+      break;
+    case 5:
+    case 6:
+      snprintf(buffer, bufferSize, "%.0fs", value);
+      break;
+    case 16:
+      snprintf(buffer, bufferSize, "%.1fK/h", value);
+      break;
+    default:
+      snprintf(buffer, bufferSize, "%.1fK", value);
+      break;
+  }
+}
+
+void adjustPlugGovernorSetting(int direction) {
+  ensurePlugGovernorSettingsLoaded();
+  if (plugGovSelectedIndex >= PLUG_GOV_SETTING_COUNT) plugGovSelectedIndex = 0;
+  const float step = plugGovernorSettingStep(plugGovSelectedIndex);
+  float value = plugGovernorSettingValue(plugGovSelectedIndex);
+  setPlugGovernorSettingValue(plugGovSelectedIndex, value + step * direction);
+}
+
+void loadPlugTestScheduleIfNeeded() {
+  if (!brewProfileLoaded || activeBrewProfile.batchId[0] == '\0') {
+    resetPlugTestScheduleState();
+    plugTestScheduleLoaded = true;
+    plugTestLoadedBatchId[0] = '\0';
+    return;
+  }
+  if (plugTestScheduleLoaded && strcmp(plugTestLoadedBatchId, activeBrewProfile.batchId) == 0) {
+    return;
+  }
+
+  resetPlugTestScheduleState();
+  strncpy(plugTestLoadedBatchId, activeBrewProfile.batchId, sizeof(plugTestLoadedBatchId) - 1);
+  plugTestLoadedBatchId[sizeof(plugTestLoadedBatchId) - 1] = '\0';
+
+  char path[96];
+  snprintf(path, sizeof(path), "/data/batches/%s/plug_test_schedule.json", activeBrewProfile.batchId);
+  bool mountedHere = false;
+  if (!sdInitialized) {
+    if (!mountSDTemporarily()) {
+      plugTestScheduleLoaded = false;
+      plugTestLoadedBatchId[0] = '\0';
+      return;
+    }
+    mountedHere = true;
+  }
+  File file = SD.open(path, FILE_READ);
+  if (!file) {
+    plugTestLoadedBatchId[0] = '\0';
+    plugTestScheduleLoaded = false;
+    if (mountedHere) dismountSD();
+    return;
+  }
+
+  static char json[1024];
+  size_t size = file.size();
+  if (size > sizeof(json) - 1) size = sizeof(json) - 1;
+  size_t read = file.readBytes(json, size);
+  json[read] = '\0';
+  file.close();
+  if (mountedHere) dismountSD();
+  plugTestScheduleLoaded = true;
+
+  plugTestScheduleEnabled = strstr(json, "\"enabled\"") && strstr(json, "true");
+  plugTestReachToleranceC = boundedOrDefault(parseJsonNumberAfter(json, "\"reachToleranceC\"", 0.3f),
+                                             0.3f, 0.05f, 2.0f);
+  const char* p = json;
+  while (plugTestPhaseCount < 5) {
+    p = strstr(p, "\"targetC\"");
+    if (!p) break;
+    float target = parseJsonNumberAfter(p, "\"targetC\"", NAN);
+    float holdHours = parseJsonNumberAfter(p, "\"holdHoursAfterReached\"", 5.0f);
+    float minBeerC = parseJsonNumberAfter(p, "\"minBeerC\"", NAN);
+    if (!isnan(target) && target >= -5.0f && target <= 35.0f && holdHours >= 0.0f && holdHours <= 48.0f) {
+      plugTestPhases[plugTestPhaseCount].targetC = target;
+      plugTestPhases[plugTestPhaseCount].holdSeconds = (uint32_t)(holdHours * 3600.0f);
+      plugTestPhases[plugTestPhaseCount].minBeerC = minBeerC;
+      plugTestPhases[plugTestPhaseCount].hasMinBeerC =
+        !isnan(minBeerC) && minBeerC >= -5.0f && minBeerC <= 35.0f;
+      plugTestPhaseCount++;
+    }
+    p += 9;
+  }
+  if (plugTestPhaseCount == 0) plugTestScheduleEnabled = false;
+}
+
+float plugTestScheduleTargetC(float fallbackTarget, unsigned long nowEpoch) {
+  loadPlugTestScheduleIfNeeded();
+  if (!plugTestScheduleEnabled || !activeBrewProfile.plugControlEnabled || plugTestPhaseCount == 0) {
+    return fallbackTarget;
+  }
+  if (!hasFreshPlugStatus() || !hasValidPlugBeerTemperature() || !isEpochValid(nowEpoch)) {
+    return plugTestStarted && plugTestPhaseIndex < plugTestPhaseCount
+      ? plugTestPhases[plugTestPhaseIndex].targetC
+      : fallbackTarget;
+  }
+
+  if (!plugTestStarted) {
+    plugTestStarted = true;
+    plugTestStartedEpoch = nowEpoch;
+    plugTestPhaseIndex = 0;
+    plugTestPhaseReached = false;
+    plugTestPhaseReachedEpoch = 0;
+  }
+
+  if (plugTestPhaseIndex >= plugTestPhaseCount) {
+    return plugTestPhases[plugTestPhaseCount - 1].targetC;
+  }
+
+  PlugTestPhase& phase = plugTestPhases[plugTestPhaseIndex];
+  const float error = latestPlugStatus.beer_temp_c - phase.targetC;
+  if (phase.hasMinBeerC) {
+    if (latestPlugStatus.beer_temp_c >= phase.minBeerC) {
+      if (!plugTestPhaseReached) {
+        plugTestPhaseReached = true;
+        plugTestPhaseReachedEpoch = nowEpoch;
+      }
+    } else {
+      plugTestPhaseReached = false;
+      plugTestPhaseReachedEpoch = 0;
+    }
+  } else if (!plugTestPhaseReached && fabs(error) <= plugTestReachToleranceC) {
+      plugTestPhaseReached = true;
+      plugTestPhaseReachedEpoch = nowEpoch;
+  }
+
+  if (plugTestPhaseReached && nowEpoch >= plugTestPhaseReachedEpoch + phase.holdSeconds &&
+      plugTestPhaseIndex + 1 < plugTestPhaseCount) {
+    plugTestPhaseIndex++;
+    plugTestPhaseReached = false;
+    plugTestPhaseReachedEpoch = 0;
+  }
+
+  return plugTestPhases[plugTestPhaseIndex].targetC;
+}
+
 float currentTemperatureTargetC(unsigned long nowEpoch) {
   float yeastLow = activeBrewProfile.recommendedTempMinC > 0.0f ? activeBrewProfile.recommendedTempMinC : 18.0f;
   float yeastHigh = activeBrewProfile.recommendedTempMaxC > yeastLow ? activeBrewProfile.recommendedTempMaxC : yeastLow + 4.0f;
@@ -3190,7 +3780,7 @@ float currentTemperatureTargetC(unsigned long nowEpoch) {
     if (progress > 1.0f) progress = 1.0f;
     target += (coldCrashTarget - target) * progress;
   }
-  return target;
+  return plugTestScheduleTargetC(target, nowEpoch);
 }
 
 float targetHourForSG(float targetSG, float chartHours) {
@@ -4128,7 +4718,7 @@ void drawGraphForMetric(GraphMetric metric) {
     tft.setTextColor(uiColorGold);
     tft.setFreeFont(FONT_SIZE_XS);
     if (metric == METRIC_TEMPERATURE) {
-      snprintf(buf, sizeof(buf), "%.1f C", latest.temperature);
+      snprintf(buf, sizeof(buf), "%.1f C", latestDisplayedTemperatureC());
     } else if (metric == METRIC_ANGLE) {
       snprintf(buf, sizeof(buf), "%.1f deg", latest.angle);
     } else if (metric == METRIC_ABV && ogCaptured) {
@@ -4848,6 +5438,12 @@ void checkTouch() {
       return;
     }
 
+    if (currentMode == PLUG_GOVERNOR_VIEW) {
+      handlePlugGovernorTouch(touchX, touchY);
+      delay(50);
+      return;
+    }
+
     if (currentMode == OG_VERIFICATION_VIEW) {
       if (touchX >= MARGIN && touchX <= MARGIN + 200 &&
           touchY >= 242 && touchY <= 286) {
@@ -4892,6 +5488,13 @@ void checkTouch() {
       screenDirty = true;
       delay(50);
       return;
+    }
+
+    if (currentMode == LIVE_DETAILS_VIEW && touchY < UI_H - NAV_H) {
+      if (handleLiveDetailsTouch(touchX, touchY)) {
+        delay(50);
+        return;
+      }
     }
     
     // Handle Create New Fermentation dialog touches (highest priority)
@@ -5683,6 +6286,38 @@ void onCalibrationCommandFromFloat(const uint8_t *mac, const uint8_t *incomingDa
   }
 }
 
+bool copyCsvField(const char* line, int fieldIndex, char* out, size_t outSize) {
+  if (!line || !out || outSize == 0 || fieldIndex < 0) return false;
+  const char* start = line;
+  for (int i = 0; i < fieldIndex; i++) {
+    start = strchr(start, ',');
+    if (!start) return false;
+    start++;
+  }
+  const char* end = strchr(start, ',');
+  size_t len = end ? (size_t)(end - start) : strlen(start);
+  while (len > 0 && (start[len - 1] == '\r' || start[len - 1] == '\n')) len--;
+  if (len >= outSize) len = outSize - 1;
+  memcpy(out, start, len);
+  out[len] = '\0';
+  return true;
+}
+
+bool parseCsvFloatField(const char* line, int fieldIndex, float* valueOut) {
+  if (!valueOut) return false;
+  char field[24];
+  if (!copyCsvField(line, fieldIndex, field, sizeof(field)) || field[0] == '\0') return false;
+  char* end = nullptr;
+  float value = strtof(field, &end);
+  if (end == field || isnan(value) || isinf(value)) return false;
+  *valueOut = value;
+  return true;
+}
+
+bool isPlausibleCsvBeerTemperature(float value) {
+  return !isnan(value) && !isinf(value) && value > -5.0f && value < 60.0f;
+}
+
 bool parseCSVDataLine(const char* line, payload_t* data, uint32_t* epoch_s, uint8_t* battery_percent) {
   char timestampText[24] = {0};
   unsigned long parsedEpoch = 0;
@@ -5706,6 +6341,13 @@ bool parseCSVDataLine(const char* line, payload_t* data, uint32_t* epoch_s, uint
     data->uptime_s = (uint32_t)parsedUptime;
     if (!isEpochValid(*epoch_s)) {
       *epoch_s = parseDateTimeToEpoch(timestampText);
+    }
+    if (brewProfileLoaded && activeBrewProfile.plugControlEnabled) {
+      float plugBeerTemperature = NAN;
+      if (parseCsvFloatField(line, 13, &plugBeerTemperature) &&
+          isPlausibleCsvBeerTemperature(plugBeerTemperature)) {
+        data->temperature = plugBeerTemperature;
+      }
     }
     return true;
   }
@@ -7119,9 +7761,12 @@ bool logDataToSD(payload_t data, uint32_t epoch_s) {
   uint16_t plugFaultsForLog = freshPlugStatusForLog ? latestPlugStatus.faults : 0;
   float plugPiOffsetForLog = freshPlugStatusForLog ? latestPlugStatus.pi_offset_c : NAN;
   float plugPiTnForLog = freshPlugStatusForLog ? latestPlugStatus.pi_tn_hours : NAN;
+  float plugBeerRateForLog = freshPlugStatusForLog ? latestPlugStatus.beer_rate_c_per_h : NAN;
+  float plugKpForLog = freshPlugStatusForLog ? latestPlugStatus.controller_kp : NAN;
+  float plugDBrakeForLog = freshPlugStatusForLog ? latestPlugStatus.controller_d_brake_h : NAN;
   LOG_VERBOSE("Writing to SD - SG:%.4f, Temp:%.2f, Batt:%.2fV\n", 
                 data.density, data.temperature, data.battery_voltage);
-  int bytesWritten = file.printf("%s,%lu,%lu,%.2f,%.4f,%.2f,%.2f,%d,%s,%.2f,%.2f,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%u,%.1f,%u,%.2f,%.2f\n",
+  int bytesWritten = file.printf("%s,%lu,%lu,%.2f,%.4f,%.2f,%.2f,%d,%s,%.2f,%.2f,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%u,%.1f,%u,%.2f,%.2f,%.3f,%.2f,%.2f\n",
              timestamp, (unsigned long)epoch_s, (unsigned long)data.uptime_s, data.angle, data.density,
              data.temperature, data.battery_voltage, batteryPercent,
              fermentationStateMachine.phaseName(),
@@ -7138,7 +7783,10 @@ bool logDataToSD(payload_t data, uint32_t epoch_s) {
              plugDutyForLog,
              plugFaultsForLog,
              plugPiOffsetForLog,
-             plugPiTnForLog);
+             plugPiTnForLog,
+             plugBeerRateForLog,
+             plugKpForLog,
+             plugDBrakeForLog);
   
   // Check for timeout
   if (millis() - startTime > SD_TIMEOUT) {
@@ -7743,15 +8391,6 @@ void drawLiveDetailsView() {
   int leftY = colY;
   int rightY = colY;
 
-  drawDetailSectionAt(leftX, &leftY, colW, "BATCH");
-  snprintf(value, sizeof(value), "%s", brewProfileLoaded ? activeBrewProfile.batchName : "--");
-  drawDetailRowAt(leftX, &leftY, colW, "Name", value);
-  snprintf(value, sizeof(value), "%s", brewProfileLoaded ? activeBrewProfile.beerStyle : "--");
-  drawDetailRowAt(leftX, &leftY, colW, "Style", value);
-  snprintf(value, sizeof(value), "%s", brewProfileLoaded ? activeBrewProfile.yeastName : "--");
-  drawDetailRowAt(leftX, &leftY, colW, brewProfileLoaded && activeBrewProfile.autoModeEnabled ? "Preset" : "Yeast", value);
-
-  leftY += 4;
   drawDetailSectionAt(leftX, &leftY, colW, "FERMENTATION");
   snprintf(value, sizeof(value), "%s", brewProfileLoaded ? fermentationStateMachine.phaseName() : "--");
   drawDetailRowAt(leftX, &leftY, colW, "Phase", value);
@@ -7770,11 +8409,17 @@ void drawLiveDetailsView() {
   drawDetailRowAt(leftX, &leftY, colW, "Log/Buf", value);
   snprintf(value, sizeof(value), "%d/%d", lastHistoricalSkippedLines, lastHistoricalParseErrors);
   drawDetailRowAt(leftX, &leftY, colW, "Skip/Err", value);
+  leftY += 4;
+  drawDetailSectionAt(leftX, &leftY, colW, "RADIO");
+  snprintf(value, sizeof(value), "%u / %lu", lastAckedFloatSeq, (unsigned long)duplicateFloatPackets);
+  drawDetailRowAt(leftX, &leftY, colW, "ACK/Dup", value);
+  snprintf(value, sizeof(value), "%d dBm", lastRSSI);
+  drawDetailRowAt(leftX, &leftY, colW, "RSSI", rssiAvailable ? value : "--");
 
   drawDetailSectionAt(rightX, &rightY, colW, "FLOAT");
   float floatTemp = !isnan(latestFloatTemperatureC) && !isinf(latestFloatTemperatureC)
     ? latestFloatTemperatureC
-    : latest.temperature;
+    : latestDisplayedTemperatureC();
   snprintf(value, sizeof(value), "%.1f C / %.1f deg", floatTemp, latest.angle);
   drawDetailRowAt(rightX, &rightY, colW, "Temp/Ang", hasData ? value : "--");
   uint8_t battPercent = hasData ? calculateBatteryPercentage(latest.battery_voltage) : 0;
@@ -7793,6 +8438,17 @@ void drawLiveDetailsView() {
   if (freshPlug) snprintf(value, sizeof(value), "%.1f/%.1f C", latestPlugStatus.beer_target_c, latestPlugStatus.air_target_c);
   else strcpy(value, "--");
   drawDetailRowAt(rightX, &rightY, colW, "Target", value);
+  if (freshPlug) snprintf(value, sizeof(value), "%.2f/%.2f K/h",
+                          latestPlugStatus.ramp_k_per_h,
+                          latestPlugStatus.beer_rate_c_per_h);
+  else strcpy(value, "--");
+  drawDetailRowAt(rightX, &rightY, colW, "Ramp S/I", value);
+  if (freshPlug) snprintf(value, sizeof(value), "P%.2f I%.2fh D%.1f",
+                          latestPlugStatus.controller_kp,
+                          latestPlugStatus.pi_tn_hours,
+                          latestPlugStatus.controller_d_brake_h);
+  else strcpy(value, "--");
+  drawDetailRowAt(rightX, &rightY, colW, "Ctrl", value);
   if (freshPlug) snprintf(value, sizeof(value), "%s %.0f%%", latestPlugStatus.relay_on ? "ON" : "OFF", latestPlugStatus.duty_10m_percent);
   else strcpy(value, "--");
   drawDetailRowAt(rightX, &rightY, colW, "Relay", value);
@@ -7800,15 +8456,145 @@ void drawLiveDetailsView() {
   else strcpy(value, "--");
   drawDetailRowAt(rightX, &rightY, colW, "Mode", value);
 
-  rightY += 4;
-  drawDetailSectionAt(rightX, &rightY, colW, "RADIO");
-  snprintf(value, sizeof(value), "%u / %lu", lastAckedFloatSeq, (unsigned long)duplicateFloatPackets);
-  drawDetailRowAt(rightX, &rightY, colW, "ACK/Dup", value);
-  snprintf(value, sizeof(value), "%d dBm", lastRSSI);
-  drawDetailRowAt(rightX, &rightY, colW, "RSSI", rssiAvailable ? value : "--");
-
   uiDrawBottomNav(TAB_LIVE);
   detailsDirty = false;
+}
+
+void drawPlugGovernorView() {
+  ensurePlugGovernorSettingsLoaded();
+  tft.fillScreen(uiColorBackground);
+  drawViewTopbar("Plug Setup");
+
+  const int listX = MARGIN;
+  const int listY = TOPBAR_H + MARGIN;
+  const int listW = UI_W - MARGIN * 2;
+  const int rowH = 24;
+  const uint8_t visibleRows = 8;
+  if (plugGovSelectedIndex >= PLUG_GOV_SETTING_COUNT) plugGovSelectedIndex = 0;
+  if (plugGovSelectedIndex < plugGovFirstVisibleIndex) {
+    plugGovFirstVisibleIndex = plugGovSelectedIndex;
+  }
+  if (plugGovSelectedIndex >= plugGovFirstVisibleIndex + visibleRows) {
+    plugGovFirstVisibleIndex = plugGovSelectedIndex - visibleRows + 1;
+  }
+  if (plugGovFirstVisibleIndex + visibleRows > PLUG_GOV_SETTING_COUNT) {
+    plugGovFirstVisibleIndex = PLUG_GOV_SETTING_COUNT > visibleRows
+      ? PLUG_GOV_SETTING_COUNT - visibleRows
+      : 0;
+  }
+
+  char value[24];
+  for (uint8_t row = 0; row < visibleRows; row++) {
+    const uint8_t index = plugGovFirstVisibleIndex + row;
+    if (index >= PLUG_GOV_SETTING_COUNT) break;
+    const int y = listY + row * rowH;
+    const bool selected = index == plugGovSelectedIndex;
+    if (selected) {
+      tft.fillRoundRect(listX, y - 2, listW, rowH - 2, 6, uiColorAccent);
+    }
+    tft.setFreeFont(selected ? FONT_SIZE_SM_BOLD : FONT_SIZE_SM);
+    tft.setTextColor(selected ? uiColorTextPrimary : uiColorTextSecondary);
+    tft.setCursor(listX + 10, y + 15);
+    tft.print(plugGovernorSettingLabel(index));
+    formatPlugGovernorSettingValue(index, value, sizeof(value));
+    uiTextRight(listX + 190, y + 1, listW - 202, 18, value,
+                FONT_SIZE_SM, selected ? uiColorTextPrimary : uiColorTextSecondary);
+  }
+
+  tft.setFreeFont(FONT_SIZE_XS);
+  tft.setTextColor(plugGovSettingsDirty ? uiColorWarning : (plugGovLastSaveOk ? uiColorSuccess : uiColorError));
+  tft.setCursor(MARGIN + 8, 258);
+  if (plugGovSettingsDirty) tft.print("Changed");
+  else tft.print(plugGovLastSaveOk ? "Saved" : "SD save failed");
+
+  drawButton(MARGIN, 276, 68, 34, "BACK", false);
+  drawButton(MARGIN + 78, 276, 52, 34, "UP", false);
+  drawButton(MARGIN + 140, 276, 52, 34, "DN", false);
+  drawButton(MARGIN + 204, 276, 52, 34, "-", false);
+  drawButton(MARGIN + 266, 276, 52, 34, "+", false);
+  drawButton(UI_W - MARGIN - 100, 276, 100, 34, "SAVE", true);
+}
+
+bool handleLiveDetailsTouch(int x, int y) {
+  int contentY = TOPBAR_H + MARGIN;
+  int contentW = UI_W - MARGIN * 2;
+  int colW = (contentW - GAP) / 2;
+  int rightX = MARGIN + colW + GAP;
+  int colY = contentY + 61;
+  int plugY = colY + 12 + 28 + 4;
+  int plugH = 12 + 7 * 14;
+  if (x < rightX || x > rightX + colW || y < plugY || y > plugY + plugH) {
+    plugDetailsTapCount = 0;
+    return false;
+  }
+
+  const uint32_t nowMs = millis();
+  if (nowMs - plugDetailsTapWindowStartMs > 3500UL) {
+    plugDetailsTapWindowStartMs = nowMs;
+    plugDetailsTapCount = 0;
+  }
+  plugDetailsTapCount++;
+  if (plugDetailsTapCount >= 5) {
+    plugDetailsTapCount = 0;
+    ensurePlugGovernorSettingsLoaded();
+    currentMode = PLUG_GOVERNOR_VIEW;
+    screenDirty = true;
+    staticElementsDrawn = false;
+    return true;
+  }
+  return true;
+}
+
+bool handlePlugGovernorTouch(int x, int y) {
+  ensurePlugGovernorSettingsLoaded();
+  const int listY = TOPBAR_H + MARGIN;
+  const int rowH = 24;
+  const uint8_t visibleRows = 8;
+
+  if (y >= listY && y < listY + visibleRows * rowH) {
+    int row = (y - listY) / rowH;
+    uint8_t index = plugGovFirstVisibleIndex + row;
+    if (index < PLUG_GOV_SETTING_COUNT) {
+      plugGovSelectedIndex = index;
+      screenDirty = true;
+      return true;
+    }
+  }
+
+  if (y >= 276 && y <= 310) {
+    if (x >= MARGIN && x <= MARGIN + 68) {
+      if (plugGovSettingsDirty) savePlugGovernorSettingsToSD();
+      currentMode = LIVE_DETAILS_VIEW;
+      screenDirty = true;
+      return true;
+    }
+    if (x >= MARGIN + 78 && x <= MARGIN + 130) {
+      if (plugGovSelectedIndex > 0) plugGovSelectedIndex--;
+      screenDirty = true;
+      return true;
+    }
+    if (x >= MARGIN + 140 && x <= MARGIN + 192) {
+      if (plugGovSelectedIndex + 1 < PLUG_GOV_SETTING_COUNT) plugGovSelectedIndex++;
+      screenDirty = true;
+      return true;
+    }
+    if (x >= MARGIN + 204 && x <= MARGIN + 256) {
+      adjustPlugGovernorSetting(-1);
+      screenDirty = true;
+      return true;
+    }
+    if (x >= MARGIN + 266 && x <= MARGIN + 318) {
+      adjustPlugGovernorSetting(1);
+      screenDirty = true;
+      return true;
+    }
+    if (x >= UI_W - MARGIN - 100 && x <= UI_W - MARGIN) {
+      savePlugGovernorSettingsToSD();
+      screenDirty = true;
+      return true;
+    }
+  }
+  return true;
 }
 
 // Time-based SPI separation implementation
@@ -8471,6 +9257,7 @@ const char* uiTestScreenName() {
     case NEW_YEAST_VIEW: return "NewYeastScreen";
     case MANAGE_YEAST_VIEW: return "ManageYeastScreen";
     case MANAGE_BREW_VIEW: return "ManageBrewScreen";
+    case PLUG_GOVERNOR_VIEW: return "PlugGovernorScreen";
     default: return "UnknownScreen";
   }
 }

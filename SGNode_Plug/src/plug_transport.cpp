@@ -15,6 +15,14 @@ bool macMatches(const uint8_t* left, const uint8_t* right) {
   return memcmp(left, right, 6) == 0;
 }
 
+bool validFloat(float value, float minimum, float maximum) {
+  return isfinite(value) && value >= minimum && value <= maximum;
+}
+
+bool validSeconds(uint16_t value, uint16_t minimum, uint16_t maximum) {
+  return value >= minimum && value <= maximum;
+}
+
 }  // namespace
 
 PlugTransport* PlugTransport::instance_ = nullptr;
@@ -72,12 +80,33 @@ void PlugTransport::onReceive(uint8_t* mac, uint8_t* data, uint8_t len) {
       incoming.version != SG_PROTOCOL_VERSION || incoming.crc != crc) {
     return;
   }
-  if (!isfinite(incoming.beer_target_c) || incoming.beer_target_c < -5.0f ||
-      incoming.beer_target_c > 35.0f ||
-      !isfinite(incoming.ramp_k_per_h) || incoming.ramp_k_per_h < 0.0f ||
-      incoming.ramp_k_per_h > 2.0f ||
-      !isfinite(incoming.batch_liters) || incoming.batch_liters < 1.0f ||
-      incoming.batch_liters > 100.0f) {
+  if (!validFloat(incoming.beer_target_c, -5.0f, 35.0f) ||
+      !validFloat(incoming.ramp_k_per_h, 0.0f, 2.0f) ||
+      !validFloat(incoming.batch_liters, 1.0f, 100.0f) ||
+      !validFloat(incoming.controller_kp, 0.05f, 5.0f) ||
+      !validFloat(incoming.controller_tn_h, 0.0f, 72.0f) ||
+      !validFloat(incoming.controller_d_brake_h, 0.0f, 6.0f) ||
+      !validFloat(incoming.air_turn_off_above_target_c, -1.0f, 3.0f) ||
+      !validFloat(incoming.air_turn_on_above_target_c, 0.0f, 5.0f) ||
+      !validSeconds(incoming.air_minimum_on_s, 0, 1800) ||
+      !validSeconds(incoming.air_minimum_off_s, 0, 3600) ||
+      !validFloat(incoming.cold_integral_band_c, 0.0f, 5.0f) ||
+      !validFloat(incoming.warm_integral_band_c, 0.0f, 5.0f) ||
+      !validFloat(incoming.max_positive_integral_c, 0.0f, 5.0f) ||
+      !validFloat(incoming.max_negative_integral_c, -5.0f, 0.0f) ||
+      !validFloat(incoming.integral_leak_per_hour, 0.0f, 5.0f) ||
+      !validFloat(incoming.error_crossing_keep_factor, 0.0f, 1.0f) ||
+      !validFloat(incoming.max_d_offset_c, 0.0f, 5.0f) ||
+      !validFloat(incoming.warming_d_factor, 0.0f, 1.0f) ||
+      !validFloat(incoming.beer_undershoot_lockout_c, 0.0f, 2.0f) ||
+      !validFloat(incoming.fast_warming_rate_k_per_h, 0.0f, 5.0f) ||
+      !validFloat(incoming.strong_undershoot_c, 0.0f, 5.0f) ||
+      !validFloat(incoming.strong_undershoot_air_offset_c, 0.0f, 5.0f) ||
+      !validFloat(incoming.min_air_target_c, -5.0f, 20.0f) ||
+      !validFloat(incoming.max_air_target_c, 0.0f, 35.0f) ||
+      incoming.max_air_target_c <= incoming.min_air_target_c ||
+      !validFloat(incoming.target_step_c, 0.0f, 5.0f) ||
+      incoming.air_turn_on_above_target_c < incoming.air_turn_off_above_target_c) {
     return;
   }
 
