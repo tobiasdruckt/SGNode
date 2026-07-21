@@ -12,6 +12,8 @@
 
 #include <WiFi.h>
 #include <esp_now.h>
+#include <WebServer.h>
+#include <Update.h>
 #include <TFT_eSPI.h>
 #include <FS.h>
 #include <SD.h>
@@ -34,6 +36,7 @@
 #include "src/calculations/eta_predictor.h"
 #include "src/domain/batch_action.h"
 #include "src/domain/yeast_preset_repository.h"
+#include "src/domain/temperature_profile.h"
 #ifndef SGNODE_UI_TEST_HARNESS
 #define SGNODE_UI_TEST_HARNESS 0  // Debug-only serial UI harness. Keep disabled for production builds.
 #endif
@@ -46,6 +49,7 @@
 #endif
 #include "src/test/ui_test_harness.h"
 #include "../SGNode_Shared/sg_protocol.h"
+#include "../SGNode_Shared/sg_logo_png.h"
 #include "src/calculations/polynomial_calibration.h"
 
 #define ACK_PACKET_TYPE 0xA5
@@ -244,6 +248,11 @@ payload_t displayDataBuffer[MAX_DATA_POINTS];
 uint32_t displayTimestampBuffer[MAX_DATA_POINTS];
 int displayDataIndex = 0;
 int displayDataCount = 0;
+float postPackageTempGraphValues[MAX_DATA_POINTS];
+uint32_t postPackageTempGraphEpochs[MAX_DATA_POINTS];
+int postPackageTempGraphCount = 0;
+bool postPackageTempGraphLoadAttempted = false;
+char postPackageTempGraphLoadedFile[80] = "";
 payload_t latestFloatData = {0};
 uint32_t latestFloatEpoch = 0;
 bool latestFloatDataValid = false;
@@ -264,9 +273,15 @@ int lastHistoricalCutoffFilteredLines = 0;
 bool lastHistoricalBatchStartRelaxed = false;
 uint32_t lastHistoricalOldestEpoch = 0;
 uint32_t lastHistoricalNewestEpoch = 0;
+uint32_t lastPostPackageTempLogMs = 0;
+uint32_t lastPostPackageFloatPacketMs = 0;
+payload_t lastPostPackageFloatPacket = {0};
+uint32_t lastPostPackageFloatPacketEpoch = 0;
+bool lastPostPackageFloatPacketValid = false;
 
-#define CSV_LINE_BUFFER_SIZE 320
-#define FERMENTATION_LOG_HEADER "timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code,float_temperature,plug_beer_temperature,plug_air_temperature,plug_beer_target,plug_air_target,plug_mode,plug_relay,plug_duty_10m,plug_faults,plug_pi_offset,plug_pi_tn,plug_beer_rate,plug_kp,plug_d_brake"
+#define CSV_LINE_BUFFER_SIZE 384
+#define FERMENTATION_LOG_HEADER "timestamp,epoch_s,uptime_s,angle,density,temperature,battery_voltage,battery_percent,state,current_attenuation,estimated_abv,recommendation_code,float_temperature,plug_beer_temperature,plug_air_temperature,plug_beer_target,plug_air_target,plug_mode,plug_relay,plug_duty_10m,plug_faults,plug_pi_offset,plug_pi_tn,plug_beer_rate,plug_kp,plug_d_brake,plug_p_offset,plug_i_offset,plug_d_offset,plug_ramp_trim,plug_ramp_i,plug_ramp_rate_error,plug_beer_rate_raw"
+#define POST_PACKAGE_TEMP_LOG_INTERVAL_MS (10UL * 60UL * 1000UL)
 
 // Separate buffer for discharge rate calculation (25 recent points only)
 payload_t dischargeRateBuffer[25];
@@ -343,6 +358,8 @@ ViewMode currentMode = LIVE_VIEW;
 
 // Graph metric types for parameterized graph drawing
 enum GraphMetric { METRIC_DENSITY, METRIC_TEMPERATURE, METRIC_ANGLE, METRIC_ABV };
+enum TempGraphMode { TEMP_GRAPH_FERMENT, TEMP_GRAPH_POST_PACKAGE };
+TempGraphMode tempGraphMode = TEMP_GRAPH_FERMENT;
 
 // Calibration state
 enum CalibMode {
@@ -403,10 +420,19 @@ bool plugMacKnown = false;
 sg_plug_status_t latestPlugStatus = {};
 bool latestPlugStatusValid = false;
 uint32_t latestPlugStatusMs = 0;
+float latestPlugPComponentC = NAN;
+float latestPlugIComponentC = NAN;
+float latestPlugDComponentC = NAN;
+float latestPlugRampTrimC = NAN;
+float latestPlugRampITrimC = NAN;
+float latestPlugRampRateErrorKPerHour = NAN;
+float latestPlugBeerRateRawCPerHour = NAN;
+bool latestPlugComponentsValid = false;
 uint16_t plugCommandSequence = 0;
 uint32_t lastPlugCommandMs = 0;
 float latestFloatTemperatureC = NAN;
 float lastValidPlugBeerTemperatureC = NAN;
+uint8_t plugBeerTemperatureMissCount = 0;
 constexpr float PLUG_DEFAULT_CONTROLLER_KP = 0.45f;
 constexpr float PLUG_DEFAULT_CONTROLLER_TN_H = 0.75f;
 constexpr float PLUG_DEFAULT_CONTROLLER_D_BRAKE_H = 0.8f;
@@ -437,6 +463,11 @@ struct PlugGovernorSettings {
   float minAirTargetC;
   float maxAirTargetC;
   float targetStepC;
+  float rampControllerKpHours;
+  float rampControllerTnHours;
+  float maxRampTrimC;
+  float rampFadeDistanceC;
+  float rateFilterSamples;
 };
 
 PlugGovernorSettings plugGovSettings = {};
@@ -449,7 +480,7 @@ uint8_t plugDetailsTapCount = 0;
 uint32_t plugDetailsTapWindowStartMs = 0;
 const char PLUG_GOV_SETTINGS_DIR[] = "/data/plug";
 const char PLUG_GOV_SETTINGS_PATH[] = "/data/plug/gov_settings.json";
-constexpr uint8_t PLUG_GOV_SETTING_COUNT = 22;
+constexpr uint8_t PLUG_GOV_SETTING_COUNT = 27;
 
 struct PlugTestPhase {
   float targetC;
@@ -477,9 +508,17 @@ char plugTestLoadedBatchId[24] = "";
 #define EEPROM_THEME_VALUE 124
 #define EEPROM_PLUG_MAC_MAGIC 132
 #define EEPROM_PLUG_MAC_ADDR 136
+#define EEPROM_BRIGHTNESS_MAGIC 148
+#define EEPROM_BRIGHTNESS_VALUE 152
 #define FLOAT_MAC_MAGIC 0x4D414346 // "MACF" in hex
 #define THEME_MAGIC 0x54484D45 // "THME" in hex
 #define PLUG_MAC_MAGIC 0x4D414350 // "MACP" in hex
+#define BRIGHTNESS_MAGIC 0x54494C42 // "BLIT" in hex
+
+#define TFT_BACKLIGHT_PIN 27
+#define BACKLIGHT_PWM_CHANNEL 7
+#define BACKLIGHT_PWM_FREQ 5000
+#define BACKLIGHT_PWM_RESOLUTION 8
 
 // Touch handling
 uint16_t touchX, touchY;
@@ -590,6 +629,28 @@ bool floatZeroCalAwaitingConfirmation = false;
 uint8_t floatZeroCalCommandId = 0;
 char floatZeroCalStatus[80] = "";
 
+WebServer baseOtaServer(80);
+bool baseOtaActive = false;
+bool baseOtaUploadInProgress = false;
+unsigned long baseOtaStartedMs = 0;
+unsigned long baseOtaLastClientMs = 0;
+char baseOtaSsid[32] = "";
+bool baseOtaConfirmVisible = false;
+bool baseOtaStaticDrawn = false;
+
+bool floatOtaPopupVisible = false;
+char floatOtaPopupSsid[32] = "";
+char floatOtaPopupIp[18] = "";
+uint16_t floatOtaPopupTimeoutS = 0;
+
+bool topbarPulldownVisible = false;
+bool topbarDragCandidate = false;
+uint16_t topbarDragStartY = 0;
+unsigned long topbarDragStartMs = 0;
+
+uint8_t backlightLevel = 2;
+const uint8_t BACKLIGHT_DUTY_LEVELS[] = {10, 50, 120, 255};
+
 enum NewYeastStep {
   NY_NAME,
   NY_CATEGORY,
@@ -644,6 +705,7 @@ bool manageBrewCompleteConfirm = false;
 struct ManagedBatchSummary {
   bool loaded;
   bool completed;
+  bool postPackageTracking;
   char style[24];
   float liters;
   int points;
@@ -737,9 +799,13 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len);
 void onPlugStatusReceived(const uint8_t *mac, const uint8_t *incomingData, int len);
 void sendPlugCommandIfDue();
 bool hasValidPlugBeerTemperature();
+float currentPlugBeerTemperatureC();
 bool hasValidPlugAirTemperature();
 bool hasFreshPlugStatus();
 bool usesPlugTemperatureAsPrimary();
+bool isPostPackageTemperaturePhase();
+bool isFloatInactiveAfterPackaging();
+bool shouldShowFloatStillActiveWarning();
 float effectiveTemperatureC(float floatTemperatureC);
 float latestDisplayedTemperatureC();
 bool ensureFloatPeerRegistered(const uint8_t* mac);
@@ -751,6 +817,7 @@ void onCalibrationResponse(const uint8_t *mac, const uint8_t *incomingData, int 
 void onCalibrationCommandFromFloat(const uint8_t *mac, const uint8_t *incomingData, int len);
 void onCalibrationCoefficients(const uint8_t *mac, const uint8_t *incomingData, int len);
 void drawLiveView();
+void drawFloatOffAngleTile(int x, int y, int w, int h);
 void drawGraphView();
 void drawCalibrationView();
 void drawBatteryView();
@@ -758,18 +825,26 @@ void drawMoreView();
 void drawLiveDetailsView();
 void drawPolynomialGraph();
 void drawTempGraphView();
+void drawTempGraphModeToggle(int contentY);
 void drawAngleGraphView();
 void drawAbvGraphView();
 void drawBrewWizardScreen();
 void drawOGVerificationScreen();
 void drawTargetVsActualChart();
 float targetChartHours();
+float temperatureChartHours();
+float postPackageTemperatureChartHours();
+uint32_t postPackageTemperatureStartEpoch();
+float postPackageTemperatureStartHour();
 float targetStartOffsetHours();
 unsigned long fermentationElapsedSecondsAt(unsigned long epoch);
 float targetModelHourForChartHour(float chartHour);
 float targetChartHourForModelHour(float modelHour);
 float expectedTargetSGAtChartHour(float chartHour);
 float currentTemperatureTargetC(unsigned long nowEpoch);
+TemperatureProfileRuntimePhase currentTemperaturePhase(unsigned long nowEpoch);
+float currentTemperatureRampKPerHour(unsigned long nowEpoch);
+const char* currentDisplayPhaseName(unsigned long nowEpoch);
 void loadPlugTestScheduleIfNeeded();
 float plugTestScheduleTargetC(float fallbackTarget, unsigned long nowEpoch);
 float targetHourForSG(float targetSG, float chartHours);
@@ -781,7 +856,8 @@ void drawTargetEventMarker(int gx, int gy, int gw, int gh, float chartHours,
                            float hour, const char* label, uint16_t color, int labelSlot, int labelSide);
 void drawTargetChartSpanLabel(int gx, int gy, int gw, float chartHours,
                               float startHour, float endHour, const char* label, uint16_t color, int row);
-void drawTargetChartEventMarkers(int gx, int gy, int gw, int gh, float chartHours);
+void drawTargetChartEventMarkers(int gx, int gy, int gw, int gh, float chartHours, bool includePostPackage = true);
+void drawPostPackageTemperatureEventMarkers(int gx, int gy, int gw, int gh, float chartHours);
 void drawTargetChartXAxis(int gx, int gy, int gw, int gh, float chartHours);
 void drawDashboardScreen();
 void drawNewYeastScreen();
@@ -814,6 +890,7 @@ int calibrationAddAmount(int index);
 void sendExitCalibrationCommand();
 void abortCalibrationFlow();
 bool logDataToSD(payload_t data, uint32_t epoch_s);
+void logPostPackagingTemperatureIfDue();
 void createNewFermentationFile();
 bool ensureFermentationLogFile(const char* batchId);
 bool createFreshBatchLogFile(const char* batchId);
@@ -826,6 +903,10 @@ bool loadHistoricalDataFromCSV(const char* filename,
                                int maxPoints = MAX_DATA_POINTS,
                                int samplingStep = 1);
 bool parseCSVDataLine(const char* line, payload_t* data, uint32_t* epoch_s, uint8_t* battery_percent);
+bool isPostPackageCsvTemperaturePoint(const payload_t& data, uint32_t epoch_s);
+void clearPostPackageTemperatureGraphData();
+void appendPostPackageTemperatureGraphData(uint32_t epoch_s, float temperatureC);
+bool loadPostPackageTemperatureGraphData();
 void checkOGStability(float currentSG);
 void logOGToSD();
 float calculateABV(float og, float currentSG);
@@ -859,6 +940,7 @@ void formatDurationShort(unsigned long seconds, char* buffer, size_t bufferSize)
 void handleOGChoice(bool useMeasuredOG);
 void saveYeastPerformanceSummary(float finalGravity, uint32_t completedAt);
 void refreshCurrentBatchAction(float currentSG, unsigned long nowEpoch);
+bool autoStartColdCrashIfPlugReady(unsigned long nowEpoch);
 BatchAction evaluateBatchActionWithHysteresis(FermentationPhase phase, float attenuation,
                                               float currentSG, float gravityDeltaPerHour,
                                               unsigned long nowEpoch);
@@ -919,6 +1001,20 @@ bool isLogoBackgroundPixel(uint16_t color);
 void toggleTheme();
 void loadThemePreference();
 void saveThemePreference();
+void initBacklight();
+void applyBacklightLevel();
+void cycleBacklightLevel();
+void loadBacklightPreference();
+void saveBacklightPreference();
+void startBaseOtaMode();
+void handleBaseOtaMode();
+void stopBaseOtaAndReboot();
+void drawBaseOtaScreen();
+void drawBaseOtaConfirmDialog();
+void drawFloatOtaPopup();
+void drawTopbarPulldown();
+bool handleOverlayTouch(int x, int y);
+void onFloatOtaStatusReceived(const uint8_t* mac, const uint8_t* data, int len);
 void drawBootScreen();
 void uiInitColors();
 void drawCurrentScreen();
@@ -928,6 +1024,7 @@ void setup() {
   LOG_INFOLN("=== SGNode Base Station alpha 0.5.0 starting ===");
   
   loadThemePreference();
+  loadBacklightPreference();
   #if SGNODE_UI_TEST_HARNESS
     // Keep harness sessions visually stable and clearly readable.
     darkMode = true;
@@ -937,6 +1034,7 @@ void setup() {
   uiInitColors();
   
   initDisplay();
+  initBacklight();
   initTouch();
   initCalibration();
   initRTC();
@@ -974,6 +1072,16 @@ void setup() {
 }
 
 void loop() {
+  if (baseOtaActive) {
+    if (millis() - lastTouchCheck > TOUCH_CHECK_INTERVAL) {
+      checkTouch();
+      lastTouchCheck = millis();
+    }
+    handleBaseOtaMode();
+    delay(5);
+    return;
+  }
+
   #if SGNODE_UI_TEST_HARNESS
     handleUITestHarness();
   #endif
@@ -1002,6 +1110,8 @@ void loop() {
     writeBufferedDataToSD();
     lastSDWrite = millis();
   }
+
+  logPostPackagingTemperatureIfDue();
   
   // Update display only when screen is dirty
   if (screenDirty) {
@@ -1039,7 +1149,7 @@ void loop() {
           title = "Polynomial";
           break;
         case LIVE_DETAILS_VIEW:
-          title = "Details";
+          title = "Diagnostic";
           break;
         case TEMP_GRAPH_VIEW:
           title = "Temp";
@@ -1299,8 +1409,11 @@ void initESPNow() {
     }
     
     // Typed Plug packets are dispatched before legacy size-based Float packets.
-    if (len == sizeof(sg_plug_status_t) && data[0] == SG_PLUG_STATUS_TYPE) {
+    if ((len == sizeof(sg_plug_status_t) || len == sizeof(sg_plug_status_v2_t)) &&
+        data[0] == SG_PLUG_STATUS_TYPE) {
       onPlugStatusReceived(recv_info->src_addr, data, len);
+    } else if (len == sizeof(sg_float_ota_status_t) && data[0] == SG_FLOAT_OTA_STATUS_TYPE) {
+      onFloatOtaStatusReceived(recv_info->src_addr, data, len);
     } else if (len == sizeof(calib_response_t)) { // 42 bytes - Calibration response
       onCalibrationResponse(recv_info->src_addr, data, len);
     } else if (len == sizeof(calib_coeffs_t)) { // 26 bytes - Calibration coefficients
@@ -1410,6 +1523,11 @@ void initDisplay() {
 }
 
 void drawCurrentScreen() {
+  if (baseOtaActive) {
+    drawBaseOtaScreen();
+    return;
+  }
+
   if (showingCreateNewDialog) {
     drawCreateNewDialog();
     return;
@@ -1471,6 +1589,16 @@ void drawCurrentScreen() {
       drawPlugGovernorView();
       break;
   }
+
+  if (baseOtaConfirmVisible) {
+    drawBaseOtaConfirmDialog();
+  }
+  if (floatOtaPopupVisible) {
+    drawFloatOtaPopup();
+  }
+  if (topbarPulldownVisible) {
+    drawTopbarPulldown();
+  }
 }
 
 void initTouch() {
@@ -1514,15 +1642,48 @@ bool ensureFloatPeerRegistered(const uint8_t* mac) {
 }
 
 void onPlugStatusReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
-  if (!mac || !incomingData || len != sizeof(sg_plug_status_t)) return;
+  if (!mac || !incomingData ||
+      (len != sizeof(sg_plug_status_t) && len != sizeof(sg_plug_status_v2_t))) return;
 
-  sg_plug_status_t status;
-  memcpy(&status, incomingData, sizeof(status));
-  uint16_t calculatedCrc = sg_crc16((const uint8_t*)&status, offsetof(sg_plug_status_t, crc));
-  if (status.packet_type != SG_PLUG_STATUS_TYPE ||
-      status.version != SG_PROTOCOL_VERSION || status.crc != calculatedCrc) {
-    LOG_ERRORLN("Rejected invalid SGNode Plug status packet");
-    return;
+  sg_plug_status_t status = {};
+  float pOffsetC = NAN;
+  float iOffsetC = NAN;
+  float dOffsetC = NAN;
+  float rampTrimC = NAN;
+  float rampITrimC = NAN;
+  float rampRateErrorKPerHour = NAN;
+  float beerRateRawCPerHour = NAN;
+  bool componentsValid = false;
+
+  if (len == sizeof(sg_plug_status_v2_t)) {
+    sg_plug_status_v2_t statusV2;
+    memcpy(&statusV2, incomingData, sizeof(statusV2));
+    uint16_t calculatedCrc = sg_crc16((const uint8_t*)&statusV2, offsetof(sg_plug_status_v2_t, crc));
+    if (statusV2.packet_type != SG_PLUG_STATUS_TYPE ||
+        statusV2.version != SG_PROTOCOL_VERSION || statusV2.crc != calculatedCrc) {
+      LOG_ERRORLN("Rejected invalid SGNode Plug status packet");
+      return;
+    }
+    memcpy(&status, &statusV2, offsetof(sg_plug_status_t, crc));
+    status.crc = statusV2.crc;
+    pOffsetC = statusV2.p_offset_c;
+    iOffsetC = statusV2.i_offset_c;
+    dOffsetC = statusV2.d_offset_c;
+    rampTrimC = statusV2.ramp_trim_c;
+    rampITrimC = statusV2.ramp_i_offset_c;
+    rampRateErrorKPerHour = statusV2.ramp_rate_error_k_per_h;
+    beerRateRawCPerHour = statusV2.beer_rate_raw_c_per_h;
+    componentsValid = isfinite(pOffsetC) && isfinite(iOffsetC) && isfinite(dOffsetC) &&
+                      isfinite(rampTrimC) && isfinite(rampITrimC) &&
+                      isfinite(rampRateErrorKPerHour) && isfinite(beerRateRawCPerHour);
+  } else {
+    memcpy(&status, incomingData, sizeof(status));
+    uint16_t calculatedCrc = sg_crc16((const uint8_t*)&status, offsetof(sg_plug_status_t, crc));
+    if (status.packet_type != SG_PLUG_STATUS_TYPE ||
+        status.version != SG_PROTOCOL_VERSION || status.crc != calculatedCrc) {
+      LOG_ERRORLN("Rejected invalid SGNode Plug status packet");
+      return;
+    }
   }
 
   if (!plugMacKnown) {
@@ -1544,13 +1705,26 @@ void onPlugStatusReceived(const uint8_t *mac, const uint8_t *incomingData, int l
     return;
   }
 
+  bool beerTemperatureValid = (status.faults & SG_PLUG_FAULT_BEER_SENSOR) == 0 &&
+    !isnan(status.beer_temp_c) && !isinf(status.beer_temp_c) &&
+    status.beer_temp_c > -5.0f && status.beer_temp_c < 60.0f;
+
   latestPlugStatus = status;
   latestPlugStatusValid = true;
   latestPlugStatusMs = millis();
-  if ((latestPlugStatus.faults & SG_PLUG_FAULT_BEER_SENSOR) == 0 &&
-      !isnan(latestPlugStatus.beer_temp_c) && !isinf(latestPlugStatus.beer_temp_c) &&
-      latestPlugStatus.beer_temp_c > -5.0f && latestPlugStatus.beer_temp_c < 60.0f) {
+  latestPlugPComponentC = pOffsetC;
+  latestPlugIComponentC = iOffsetC;
+  latestPlugDComponentC = dOffsetC;
+  latestPlugRampTrimC = rampTrimC;
+  latestPlugRampITrimC = rampITrimC;
+  latestPlugRampRateErrorKPerHour = rampRateErrorKPerHour;
+  latestPlugBeerRateRawCPerHour = beerRateRawCPerHour;
+  latestPlugComponentsValid = componentsValid;
+  if (beerTemperatureValid) {
     lastValidPlugBeerTemperatureC = latestPlugStatus.beer_temp_c;
+    plugBeerTemperatureMissCount = 0;
+  } else if (plugBeerTemperatureMissCount < 255) {
+    plugBeerTemperatureMissCount++;
   }
   tileTempDirty = true;
   topbarDirty = true;
@@ -1560,9 +1734,25 @@ void onPlugStatusReceived(const uint8_t *mac, const uint8_t *incomingData, int l
 
 bool hasValidPlugBeerTemperature() {
   if (!latestPlugStatusValid || millis() - latestPlugStatusMs > 5UL * 60000UL) return false;
-  if ((latestPlugStatus.faults & SG_PLUG_FAULT_BEER_SENSOR) != 0) return false;
-  return !isnan(latestPlugStatus.beer_temp_c) && !isinf(latestPlugStatus.beer_temp_c) &&
-         latestPlugStatus.beer_temp_c > -5.0f && latestPlugStatus.beer_temp_c < 60.0f;
+  bool directValid = (latestPlugStatus.faults & SG_PLUG_FAULT_BEER_SENSOR) == 0 &&
+    !isnan(latestPlugStatus.beer_temp_c) && !isinf(latestPlugStatus.beer_temp_c) &&
+    latestPlugStatus.beer_temp_c > -5.0f && latestPlugStatus.beer_temp_c < 60.0f;
+  if (directValid) return true;
+  return plugBeerTemperatureMissCount > 0 && plugBeerTemperatureMissCount <= 3 &&
+         !isnan(lastValidPlugBeerTemperatureC) && !isinf(lastValidPlugBeerTemperatureC);
+}
+
+float currentPlugBeerTemperatureC() {
+  if (!latestPlugStatusValid || millis() - latestPlugStatusMs > 5UL * 60000UL) return NAN;
+  bool directValid = (latestPlugStatus.faults & SG_PLUG_FAULT_BEER_SENSOR) == 0 &&
+    !isnan(latestPlugStatus.beer_temp_c) && !isinf(latestPlugStatus.beer_temp_c) &&
+    latestPlugStatus.beer_temp_c > -5.0f && latestPlugStatus.beer_temp_c < 60.0f;
+  if (directValid) return latestPlugStatus.beer_temp_c;
+  if (plugBeerTemperatureMissCount > 0 && plugBeerTemperatureMissCount <= 3 &&
+      !isnan(lastValidPlugBeerTemperatureC) && !isinf(lastValidPlugBeerTemperatureC)) {
+    return lastValidPlugBeerTemperatureC;
+  }
+  return NAN;
 }
 
 bool hasValidPlugAirTemperature() {
@@ -1580,22 +1770,41 @@ bool usesPlugTemperatureAsPrimary() {
   return brewProfileLoaded && activeBrewProfile.plugControlEnabled && !activeBrewProfile.completed;
 }
 
+bool isPostPackageTemperaturePhase() {
+  return brewProfileLoaded &&
+         (activeBrewProfile.packageStarted || activeBrewProfile.packageDone) &&
+         !activeBrewProfile.packageSkipped &&
+         !activeBrewProfile.completed;
+}
+
+bool isFloatInactiveAfterPackaging() {
+  return isPostPackageTemperaturePhase();
+}
+
+bool shouldShowFloatStillActiveWarning() {
+  return isFloatInactiveAfterPackaging() &&
+         lastPostPackageFloatPacketMs > 0 &&
+         millis() - lastPostPackageFloatPacketMs < 15UL * 60UL * 1000UL;
+}
+
 float effectiveTemperatureC(float floatTemperatureC) {
-  if (usesPlugTemperatureAsPrimary()) {
-    if (hasValidPlugBeerTemperature()) return latestPlugStatus.beer_temp_c;
-    if (!isnan(lastValidPlugBeerTemperatureC) && !isinf(lastValidPlugBeerTemperatureC)) {
-      return lastValidPlugBeerTemperatureC;
-    }
+  if (isPostPackageTemperaturePhase()) {
+    return hasValidPlugAirTemperature() ? latestPlugStatus.air_temp_c : NAN;
   }
-  return hasValidPlugBeerTemperature() ? latestPlugStatus.beer_temp_c : floatTemperatureC;
+  if (usesPlugTemperatureAsPrimary()) {
+    float plugBeerC = currentPlugBeerTemperatureC();
+    if (!isnan(plugBeerC) && !isinf(plugBeerC)) return plugBeerC;
+  }
+  float plugBeerC = currentPlugBeerTemperatureC();
+  return !isnan(plugBeerC) && !isinf(plugBeerC) ? plugBeerC : floatTemperatureC;
 }
 
 float latestDisplayedTemperatureC() {
-  if (hasValidPlugBeerTemperature()) return latestPlugStatus.beer_temp_c;
-  if (usesPlugTemperatureAsPrimary() &&
-      !isnan(lastValidPlugBeerTemperatureC) && !isinf(lastValidPlugBeerTemperatureC)) {
-    return lastValidPlugBeerTemperatureC;
+  if (isPostPackageTemperaturePhase()) {
+    return hasValidPlugAirTemperature() ? latestPlugStatus.air_temp_c : NAN;
   }
+  float plugBeerC = currentPlugBeerTemperatureC();
+  if (!isnan(plugBeerC) && !isinf(plugBeerC)) return plugBeerC;
   return latestFloatDataValid ? latestFloatData.temperature : NAN;
 }
 
@@ -1614,20 +1823,10 @@ void sendPlugCommandIfDue() {
   command.sequence_id = ++plugCommandSequence;
   command.base_epoch = getCurrentEpoch();
   command.beer_target_c = brewProfileLoaded ? currentTemperatureTargetC(command.base_epoch) : 20.0f;
-  command.ramp_k_per_h = 0.0f;
-  if (brewProfileLoaded && activeBrewProfile.coldCrashDone &&
-      !activeBrewProfile.coldCrashSkipped &&
-      isEpochValid(activeBrewProfile.coldCrashStartedAt) &&
-      command.base_epoch < activeBrewProfile.coldCrashStartedAt + 24UL * 3600UL) {
-    command.ramp_k_per_h = 1.0f;
-  } else if (brewProfileLoaded && activeBrewProfile.dRestDone &&
-             !activeBrewProfile.dRestSkipped &&
-             isEpochValid(activeBrewProfile.dRestStartedAt) &&
-             command.base_epoch < activeBrewProfile.dRestStartedAt + 12UL * 3600UL) {
-    command.ramp_k_per_h = 0.2f;
-  }
-  if (plugTestScheduleEnabled && plugTestStarted && hasValidPlugBeerTemperature()) {
-    command.ramp_k_per_h = latestPlugStatus.beer_temp_c > command.beer_target_c + 0.3f ? 1.0f : 0.0f;
+  command.ramp_k_per_h = brewProfileLoaded ? currentTemperatureRampKPerHour(command.base_epoch) : 0.0f;
+  float plugBeerC = currentPlugBeerTemperatureC();
+  if (plugTestScheduleEnabled && plugTestStarted && !isnan(plugBeerC) && !isinf(plugBeerC)) {
+    command.ramp_k_per_h = plugBeerC > command.beer_target_c + 0.3f ? 1.0f : 0.0f;
   }
   command.batch_liters = brewProfileLoaded ? activeBrewProfile.batchSizeLiters : 20.0f;
   command.controller_kp = plugControllerKp;
@@ -1652,6 +1851,11 @@ void sendPlugCommandIfDue() {
   command.min_air_target_c = plugGovSettings.minAirTargetC;
   command.max_air_target_c = plugGovSettings.maxAirTargetC;
   command.target_step_c = plugGovSettings.targetStepC;
+  command.ramp_controller_kp_h = plugGovSettings.rampControllerKpHours;
+  command.ramp_controller_tn_h = plugGovSettings.rampControllerTnHours;
+  command.max_ramp_trim_c = plugGovSettings.maxRampTrimC;
+  command.ramp_fade_distance_c = plugGovSettings.rampFadeDistanceC;
+  command.rate_filter_samples = plugGovSettings.rateFilterSamples;
   command.flags = brewProfileLoaded && !activeBrewProfile.completed && activeBrewProfile.plugControlEnabled
     ? SG_PLUG_COMMAND_ENABLE
     : 0;
@@ -1742,13 +1946,26 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
                 receivedData.battery_voltage, normalizedData.battery_voltage);
     }
 
-    latestFloatTemperatureC = receivedData.temperature;
-    normalizedData.temperature = effectiveTemperatureC(receivedData.temperature);
+    bool ignoreFloatForBatch = isPostPackageTemperaturePhase();
+    if (ignoreFloatForBatch) {
+      lastPostPackageFloatPacketMs = millis();
+      lastPostPackageFloatPacket = normalizedData;
+      lastPostPackageFloatPacketEpoch = receivedEpoch;
+      lastPostPackageFloatPacketValid = true;
+      topbarDirty = true;
+      detailsDirty = true;
+      screenDirty = true;
+    }
+    if (!ignoreFloatForBatch) {
+      latestFloatTemperatureC = receivedData.temperature;
+      normalizedData.temperature = effectiveTemperatureC(receivedData.temperature);
+
+      latestFloatData = normalizedData;
+      latestFloatEpoch = receivedEpoch;
+      latestFloatDataValid = true;
+    }
 
     uint8_t batteryPercent = calculateBatteryPercentage(normalizedData.battery_voltage);
-    latestFloatData = normalizedData;
-    latestFloatEpoch = receivedEpoch;
-    latestFloatDataValid = true;
 
     if ((receivedData.flags & SG_PAYLOAD_FLAG_ZERO_CAL_OK) != 0 && brewProfileLoaded) {
       floatZeroCalCommandPending = false;
@@ -1789,7 +2006,7 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
     }
     
     // Update charging state only with plausible battery values
-    if (batteryPlausible) {
+    if (batteryPlausible && !ignoreFloatForBatch) {
       updateChargingState(normalizedData.battery_voltage);
     }
     
@@ -1800,6 +2017,12 @@ void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
                   chargingState == DISCHARGING ? "DISCHARGING" : "UNKNOWN");
     
     if (!duplicatePacket) {
+      if (ignoreFloatForBatch) {
+        LOG_VERBOSE("Ignoring float packet seq=%u after packaging\n", receivedData.sequence_id);
+        markScreenDirtyForFloatData();
+        return;
+      }
+
       bool recordBatchFloatData = shouldRecordBatchFloatData();
 
       // Check OG stability if not yet captured
@@ -1910,6 +2133,7 @@ void clearBufferedSensorData() {
 bool shouldRecordBatchFloatData() {
   if (!brewProfileLoaded) return fermentationFileOpen && currentFermentationFile[0] != '\0';
   if (activeBrewProfile.completed) return false;
+  if (isPostPackageTemperaturePhase()) return false;
   return activeBrewProfile.floatInBrewConfirmed || activeBrewProfile.ogVerified;
 }
 
@@ -2016,9 +2240,10 @@ void drawLiveViewStatic() {
   
   int contentY = calibrationModeActive ? TOPBAR_H + MARGIN + 14 : TOPBAR_H + MARGIN;
   int contentH = UI_H - contentY - NAV_H;
+  bool floatOff = isFloatInactiveAfterPackaging();
   
   // No data state
-  if (displayDataCount == 0) {
+  if (displayDataCount == 0 && !floatOff) {
     int cardX = UI_W / 2 - 100;
     int cardY = contentY + contentH / 2 - 40;
     uiCard(cardX, cardY, 200, 80, CARD_RADIUS);
@@ -2032,21 +2257,35 @@ void drawLiveViewStatic() {
   }
   
   // Hero card (full width)
-  payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+  payload_t latest = {0};
+  if (displayDataCount > 0) {
+    latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+  }
   int heroH = contentH / 2;
   uiCard(MARGIN, contentY, UI_W - MARGIN * 2, heroH, CARD_RADIUS);
   
-  // Prepare sparkline data (last ~20 SG readings)
-  float sparklineData[20];
-  int sparklineCount = 0;
-  int pointsToShow = min(displayDataCount, 20);
-  for (int i = 0; i < pointsToShow; i++) {
-    int idx = (displayDataIndex - pointsToShow + i + MAX_DATA_POINTS) % MAX_DATA_POINTS;
-    sparklineData[i] = displayDataBuffer[idx].density;
-    sparklineCount++;
+  if (floatOff) {
+    uiTextCenter(MARGIN, contentY + 0, UI_W - MARGIN * 2, 26,
+                 "Packaged", FONT_SIZE_MD, uiColorInfo);
+    char finalLine[32];
+    if (brewProfileLoaded) snprintf(finalLine, sizeof(finalLine), "Final SG %.3f", activeBrewProfile.expectedFinalGravity);
+    else strncpy(finalLine, "Float off", sizeof(finalLine) - 1);
+    finalLine[sizeof(finalLine) - 1] = '\0';
+    uiTextCenter(MARGIN, contentY + 34, UI_W - MARGIN * 2, 22,
+                 finalLine, FONT_SIZE_SM, uiColorTextSecondary);
+  } else {
+    // Prepare sparkline data (last ~20 SG readings)
+    float sparklineData[20];
+    int sparklineCount = 0;
+    int pointsToShow = min(displayDataCount, 20);
+    for (int i = 0; i < pointsToShow; i++) {
+      int idx = (displayDataIndex - pointsToShow + i + MAX_DATA_POINTS) % MAX_DATA_POINTS;
+      sparklineData[i] = displayDataBuffer[idx].density;
+      sparklineCount++;
+    }
+
+    uiHeroSG(MARGIN, contentY, UI_W - MARGIN * 2, heroH, latest.density, "", sparklineData, sparklineCount);
   }
-  
-  uiHeroSG(MARGIN, contentY, UI_W - MARGIN * 2, heroH, latest.density, "", sparklineData, sparklineCount);
   
   // 3 tiles below hero (Temp, Angle, ABV) - Batt moved to LIVE_DETAILS_VIEW
   int tileY = contentY + heroH + GAP - 6;  // Lifted by 6px
@@ -2054,8 +2293,9 @@ void drawLiveViewStatic() {
   int tileH = contentH - heroH - GAP;
   
   uiTile(MARGIN, tileY, tileW, tileH, 0, "Temp", "--", "C", false);
-  uiTile(MARGIN + tileW + GAP, tileY, tileW, tileH, 0, "Angle", "--", "deg", false);
-  uiTile(MARGIN + tileW * 2 + GAP * 2, tileY, tileW, tileH, 0, "ABV", "Set OG", "%", true);
+  if (floatOff) drawFloatOffAngleTile(MARGIN + tileW + GAP, tileY, tileW, tileH);
+  else uiTile(MARGIN + tileW + GAP, tileY, tileW, tileH, 0, "Angle", "--", "deg", false);
+  uiTile(MARGIN + tileW * 2 + GAP * 2, tileY, tileW, tileH, 0, "ABV", floatOff ? "Final" : "Set OG", "%", true);
   
   // Bottom navigation
   uiDrawBottomNav(TAB_LIVE);
@@ -2069,12 +2309,16 @@ void drawLiveViewStatic() {
 }
 
 void updateLiveViewDynamic() {
-  if (displayDataCount == 0) {
+  bool floatOff = isFloatInactiveAfterPackaging();
+  if (displayDataCount == 0 && !floatOff) {
     return;
   }
   
   // Get latest data
-  payload_t latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+  payload_t latest = {0};
+  if (displayDataCount > 0) {
+    latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
+  }
   uint8_t batteryPercent = calculateBatteryPercentage(latest.battery_voltage);
   
   int contentY = calibrationModeActive ? TOPBAR_H + MARGIN + 14 : TOPBAR_H + MARGIN;
@@ -2088,6 +2332,18 @@ void updateLiveViewDynamic() {
   
   // Update hero SG value with trend and sparkline
   if (heroDirty) {
+    if (floatOff) {
+      uiCard(MARGIN, contentY, UI_W - MARGIN * 2, heroH, CARD_RADIUS);
+      uiTextCenter(MARGIN, contentY + 0, UI_W - MARGIN * 2, 26,
+                   "Packaged", FONT_SIZE_MD, uiColorInfo);
+      char finalLine[32];
+      if (brewProfileLoaded) snprintf(finalLine, sizeof(finalLine), "Final SG %.3f", activeBrewProfile.expectedFinalGravity);
+      else strncpy(finalLine, "Float off", sizeof(finalLine) - 1);
+      finalLine[sizeof(finalLine) - 1] = '\0';
+      uiTextCenter(MARGIN, contentY + 34, UI_W - MARGIN * 2, 22,
+                   finalLine, FONT_SIZE_SM, uiColorTextSecondary);
+      heroDirty = false;
+    } else {
     // Calculate trend against the reading closest to at least 5 real minutes ago.
     char trendBuf[16] = "";
     float trend = 0.0;
@@ -2117,6 +2373,7 @@ void updateLiveViewDynamic() {
     uiHeroSG(MARGIN, contentY, UI_W - MARGIN * 2, heroH, latest.density, 
              trendBuf[0] ? trendBuf : "", sparklineData, sparklineCount);
     heroDirty = false;
+    }
   }
   
   // Update temp tile
@@ -2128,8 +2385,12 @@ void updateLiveViewDynamic() {
   
   // Update angle tile
   if (tileAngleDirty) {
-    snprintf(buffer, sizeof(buffer), "%.1f", latest.angle);
-    uiTile(MARGIN + tileW + GAP, tileY, tileW, tileH, 0, "Angle", buffer, "deg", false);
+    if (floatOff) {
+      drawFloatOffAngleTile(MARGIN + tileW + GAP, tileY, tileW, tileH);
+    } else {
+      snprintf(buffer, sizeof(buffer), "%.1f", latest.angle);
+      uiTile(MARGIN + tileW + GAP, tileY, tileW, tileH, 0, "Angle", buffer, "deg", false);
+    }
     tileAngleDirty = false;
   }
   
@@ -2137,12 +2398,30 @@ void updateLiveViewDynamic() {
   if (tileAbvDirty) {
     if (ogCaptured) {
       snprintf(buffer, sizeof(buffer), "%.1f", currentABV);
-      uiTile(MARGIN + tileW * 2 + GAP * 2, tileY, tileW, tileH, 0, "ABV", buffer, "%", false);
+      uiTile(MARGIN + tileW * 2 + GAP * 2, tileY, tileW, tileH, 0,
+             floatOff ? "Final ABV" : "ABV", buffer, "%", false);
     } else {
       uiTile(MARGIN + tileW * 2 + GAP * 2, tileY, tileW, tileH, 0, "ABV", "Set OG", "%", true);
     }
     tileAbvDirty = false;
   }
+}
+
+void drawFloatOffAngleTile(int x, int y, int w, int h) {
+  uiCard(x, y, w, h, CARD_RADIUS);
+  tft.setTextColor(uiColorTextMuted);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(x + 16, y + 25);
+  tft.print("Angle");
+
+  const char* value = "Float off";
+  tft.setFreeFont(FONT_SIZE_MD);
+  int valueW = tft.textWidth(value);
+  int valueH = tft.fontHeight();
+  int valueX = x + (w - valueW) / 2;
+  int valueY = y + h / 2 + valueH / 2 - 2;
+  tft.setCursor(valueX, valueY);
+  tft.print(value);
 }
 
 void drawLiveView() {
@@ -2293,7 +2572,8 @@ void drawDashboardScreen() {
   tft.setCursor(MARGIN + 10, contentY + 14);
   tft.print(text);
   char phaseText[64];
-  snprintf(phaseText, sizeof(phaseText), "%s | %s", activeBrewProfile.beerStyle, fermentationStateMachine.phaseName());
+  snprintf(phaseText, sizeof(phaseText), "%s | %s", activeBrewProfile.beerStyle,
+           currentDisplayPhaseName(getCurrentEpoch()));
   uiEllipsize(phaseText, contentW - 22, text, sizeof(text));
   tft.setTextColor(uiColorTextMuted);
   tft.setCursor(MARGIN + 10, contentY + 30);
@@ -2313,7 +2593,8 @@ void drawDashboardScreen() {
   uiEllipsize(currentBatchAction.title, contentW - 20, text, sizeof(text));
   tft.setCursor(MARGIN + 10, actionY + 34);
   tft.print(text);
-  bool singleActionButton = currentBatchAction.type == ACTION_FLOAT_IN_BREW;
+  bool singleActionButton = currentBatchAction.type == ACTION_FLOAT_IN_BREW ||
+                            currentBatchAction.type == ACTION_PACKAGE_COMPLETE;
   drawWrappedText(MARGIN + 10, actionY + 50, contentW - (currentBatchAction.requiresChoice ? (singleActionButton ? 106 : 196) : 20),
                   currentBatchAction.type == ACTION_NONE ? currentRecommendation.message : currentBatchAction.message,
                   uiColorTextSecondary);
@@ -2328,9 +2609,11 @@ void drawDashboardScreen() {
       uiTextCenter(skipX, buttonY, buttonW, 28, "SKIP", FONT_SIZE_XS, uiColorTextPrimary);
     }
     tft.fillRoundRect(doneX, buttonY, buttonW, 28, 8, uiColorGold);
+    const char* doneLabel = "DONE";
+    if (currentBatchAction.type == ACTION_FLOAT_ZERO_CAL) doneLabel = "READY";
+    if (currentBatchAction.type == ACTION_PACKAGE_START) doneLabel = "START";
     uiTextCenter(doneX, buttonY, buttonW, 28,
-                 currentBatchAction.type == ACTION_FLOAT_ZERO_CAL ? "READY" : "DONE",
-                 FONT_SIZE_XS, uiColorPrimaryText);
+                 doneLabel, FONT_SIZE_XS, uiColorPrimaryText);
   }
 
   // 4 core metrics in one calm row
@@ -2384,8 +2667,20 @@ void drawDashboardScreen() {
   tft.setCursor(tempX + 10, contextY + 14);
   tft.print("Temp");
   float tempTarget = currentTemperatureTargetC(getCurrentEpoch());
-  if (hasData) snprintf(text, sizeof(text), "%.1f C | Set %.1f C", latestDisplayedTemperatureC(), tempTarget);
-  else snprintf(text, sizeof(text), "-- | Set %.1f C", tempTarget);
+  float displayTempC = latestDisplayedTemperatureC();
+  bool hasDisplayTemp = !isnan(displayTempC) && !isinf(displayTempC);
+  if (currentBatchAction.type == ACTION_PACKAGE_START &&
+      activeBrewProfile.temperatureProfile.enabled &&
+      !activeBrewProfile.packageDone &&
+      !activeBrewProfile.packageSkipped) {
+    float nextTarget = activeBrewProfile.temperatureProfile.advanced.carbonationC;
+    if (hasDisplayTemp) snprintf(text, sizeof(text), "%.1f C | Pack %.1f C", displayTempC, nextTarget);
+    else snprintf(text, sizeof(text), "-- | Pack %.1f C", nextTarget);
+  } else if (hasDisplayTemp) {
+    snprintf(text, sizeof(text), "%.1f C | Set %.1f C", displayTempC, tempTarget);
+  } else {
+    snprintf(text, sizeof(text), "-- | Set %.1f C", tempTarget);
+  }
   tft.setTextColor(uiColorTextPrimary);
   tft.setCursor(tempX + 10, contextY + 30);
   tft.print(text);
@@ -2922,6 +3217,8 @@ void copyManagedBatch(const char* batchId) {
     p.coldCrashDone = false;
     p.coldCrashSkipped = false;
     p.coldCrashStartedAt = 0;
+    p.packageStarted = false;
+    p.packageStartedAt = 0;
     p.packageDone = false;
     p.packageSkipped = false;
     p.packagedAt = 0;
@@ -3046,9 +3343,10 @@ void loadManagedBatchSummary(const char* batchId, ManagedBatchSummary* summary) 
   if (BrewProfileStore::load(batchId, &p)) {
     summary->loaded = true;
     summary->completed = p.completed;
+    summary->postPackageTracking = (p.packageStarted || p.packageDone) && !p.packageSkipped && !p.completed;
     strncpy(summary->style, p.beerStyle, sizeof(summary->style) - 1);
     summary->liters = p.batchSizeLiters;
-    strcpy(summary->status, p.completed ? "Completed" : "Active");
+    strcpy(summary->status, p.completed ? "Completed" : (summary->postPackageTracking ? "Post-package" : "Active"));
 
     char logPath[80];
     BrewProfileStore::logPath(batchId, logPath, sizeof(logPath));
@@ -3078,6 +3376,8 @@ void loadManagedBatchSummary(const char* batchId, ManagedBatchSummary* summary) 
       strcpy(summary->evaluation, "OG needs verify");
     } else if (p.completed) {
       strcpy(summary->evaluation, "Archived batch");
+    } else if (summary->postPackageTracking) {
+      strcpy(summary->evaluation, "Temperature support");
     } else if (summary->points < 6) {
       strcpy(summary->evaluation, "Collecting data");
     } else {
@@ -3133,7 +3433,9 @@ void drawManageBrewScreen() {
   drawButton(MANAGE_BREW_CONT_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_ACTION_W, MANAGE_BREW_ROW_H, "CONT", summary.completed);
   drawButton(MANAGE_BREW_COPY_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_ACTION_W, MANAGE_BREW_ROW_H, "COPY", false);
   drawButton(MANAGE_BREW_DELETE_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_ACTION_W, MANAGE_BREW_ROW_H, "DELETE", false);
-  drawButton(MARGIN + 84, 226, 150, 34, "COMPLETE", summary.completed);
+  drawButton(MARGIN + 84, 226, 150, 34,
+             summary.postPackageTracking ? "END TRACK" : "COMPLETE",
+             summary.completed);
   drawButton(MARGIN + 246, 226, 174, 34, summary.completed ? "ARCHIVED" : "ACTIVE", true);
   drawButton(MARGIN, 276, 120, 36, "BACK", false);
 
@@ -3144,7 +3446,9 @@ void drawManageBrewScreen() {
     int dh = 132;
     tft.fillRoundRect(dx, dy, dw, dh, 8, uiColorCardBackground);
     tft.drawRoundRect(dx, dy, dw, dh, 8, uiColorBorder);
-    uiTextCenter(dx, dy + 18, dw, 30, "Mark batch completed?", FONT_SIZE_MD, uiColorTextPrimary);
+    uiTextCenter(dx, dy + 18, dw, 30,
+                 summary.postPackageTracking ? "End temp tracking?" : "Mark batch completed?",
+                 FONT_SIZE_MD, uiColorTextPrimary);
     tft.drawRoundRect(dx + 14, dy + 68, 116, 38, 8, uiColorBorder);
     uiTextCenter(dx + 14, dy + 68, 116, 38, "NO", FONT_SIZE_SM, uiColorTextPrimary);
     tft.fillRoundRect(dx + dw - 130, dy + 68, 116, 38, 8, uiColorGold);
@@ -3255,6 +3559,53 @@ float targetChartHours() {
   return chartHours;
 }
 
+float temperatureChartHours() {
+  if (tempGraphMode == TEMP_GRAPH_POST_PACKAGE) {
+    return postPackageTemperatureChartHours();
+  }
+
+  float chartHours = targetChartHours();
+  if (brewProfileLoaded &&
+      (activeBrewProfile.packageStarted || activeBrewProfile.packageDone) &&
+      !activeBrewProfile.packageSkipped) {
+    float packageHour = postPackageTemperatureStartHour();
+    if (packageHour > 0.0f) {
+      chartHours = packageHour + 6.0f;
+      if (chartHours < 24.0f) chartHours = 24.0f;
+    }
+  }
+  if (chartHours > 384.0f) chartHours = 384.0f;
+  return chartHours;
+}
+
+uint32_t postPackageTemperatureStartEpoch() {
+  if (!brewProfileLoaded) return 0;
+  if (isEpochValid(activeBrewProfile.packageStartedAt)) return activeBrewProfile.packageStartedAt;
+  if (isEpochValid(activeBrewProfile.packagedAt)) return activeBrewProfile.packagedAt;
+  return 0;
+}
+
+float postPackageTemperatureStartHour() {
+  uint32_t startEpoch = postPackageTemperatureStartEpoch();
+  if (!isEpochValid(startEpoch) || !isEpochValid(activeBrewProfile.createdAt) ||
+      startEpoch < activeBrewProfile.createdAt) {
+    return 0.0f;
+  }
+  return (startEpoch - activeBrewProfile.createdAt) / 3600.0f;
+}
+
+float postPackageTemperatureChartHours() {
+  if (!brewProfileLoaded || !activeBrewProfile.temperatureProfile.enabled) return 168.0f;
+  float storagePreviewHours = activeBrewProfile.temperatureProfile.advanced.storageDaysHint * 24.0f;
+  if (storagePreviewHours < 72.0f) storagePreviewHours = 72.0f;
+  if (storagePreviewHours > 168.0f) storagePreviewHours = 168.0f;
+  float chartHours = activeBrewProfile.temperatureProfile.advanced.carbonationDays * 24.0f +
+                     storagePreviewHours;
+  if (chartHours < 96.0f) chartHours = 96.0f;
+  if (chartHours > 672.0f) chartHours = 672.0f;
+  return chartHours;
+}
+
 float targetStartOffsetHours() {
   if (!brewProfileLoaded) return 0.0f;
   if (!isEpochValid(activeBrewProfile.createdAt) ||
@@ -3359,6 +3710,11 @@ void normalizePlugGovernorSettings() {
     plugGovSettings.maxAirTargetC = plugGovSettings.minAirTargetC + 0.5f;
   }
   plugGovSettings.targetStepC = boundedOrDefault(plugGovSettings.targetStepC, 0.25f, 0.0f, 5.0f);
+  plugGovSettings.rampControllerKpHours = boundedOrDefault(plugGovSettings.rampControllerKpHours, 0.8f, 0.0f, 6.0f);
+  plugGovSettings.rampControllerTnHours = boundedOrDefault(plugGovSettings.rampControllerTnHours, 3.0f, 0.0f, 24.0f);
+  plugGovSettings.maxRampTrimC = boundedOrDefault(plugGovSettings.maxRampTrimC, 1.0f, 0.0f, 3.0f);
+  plugGovSettings.rampFadeDistanceC = boundedOrDefault(plugGovSettings.rampFadeDistanceC, 1.0f, 0.0f, 5.0f);
+  plugGovSettings.rateFilterSamples = boundedOrDefault(plugGovSettings.rateFilterSamples, 5.0f, 1.0f, 20.0f);
 }
 
 void resetPlugGovernorSettingsToDefaults() {
@@ -3384,6 +3740,11 @@ void resetPlugGovernorSettingsToDefaults() {
   plugGovSettings.minAirTargetC = 1.0f;
   plugGovSettings.maxAirTargetC = 30.0f;
   plugGovSettings.targetStepC = 0.25f;
+  plugGovSettings.rampControllerKpHours = 0.8f;
+  plugGovSettings.rampControllerTnHours = 3.0f;
+  plugGovSettings.maxRampTrimC = 1.0f;
+  plugGovSettings.rampFadeDistanceC = 1.0f;
+  plugGovSettings.rateFilterSamples = 5.0f;
 }
 
 bool savePlugGovernorSettingsToSD() {
@@ -3430,7 +3791,12 @@ bool savePlugGovernorSettingsToSD() {
   file.printf("  \"strongUndershootAirOffsetC\": %.3f,\n", plugGovSettings.strongUndershootAirOffsetC);
   file.printf("  \"minAirTargetC\": %.3f,\n", plugGovSettings.minAirTargetC);
   file.printf("  \"maxAirTargetC\": %.3f,\n", plugGovSettings.maxAirTargetC);
-  file.printf("  \"targetStepC\": %.3f\n", plugGovSettings.targetStepC);
+  file.printf("  \"targetStepC\": %.3f,\n", plugGovSettings.targetStepC);
+  file.printf("  \"rampControllerKpHours\": %.3f,\n", plugGovSettings.rampControllerKpHours);
+  file.printf("  \"rampControllerTnHours\": %.3f,\n", plugGovSettings.rampControllerTnHours);
+  file.printf("  \"maxRampTrimC\": %.3f,\n", plugGovSettings.maxRampTrimC);
+  file.printf("  \"rampFadeDistanceC\": %.3f,\n", plugGovSettings.rampFadeDistanceC);
+  file.printf("  \"rateFilterSamples\": %.3f\n", plugGovSettings.rateFilterSamples);
   file.println("}");
   file.close();
   if (mountedHere) dismountSD();
@@ -3467,7 +3833,7 @@ bool ensurePlugGovernorSettingsLoaded() {
     return false;
   }
 
-  static char json[1536];
+  static char json[2048];
   size_t size = file.size();
   if (size > sizeof(json) - 1) size = sizeof(json) - 1;
   size_t read = file.readBytes(json, size);
@@ -3497,6 +3863,11 @@ bool ensurePlugGovernorSettingsLoaded() {
   plugGovSettings.minAirTargetC = parseJsonNumberAfter(json, "\"minAirTargetC\"", plugGovSettings.minAirTargetC);
   plugGovSettings.maxAirTargetC = parseJsonNumberAfter(json, "\"maxAirTargetC\"", plugGovSettings.maxAirTargetC);
   plugGovSettings.targetStepC = parseJsonNumberAfter(json, "\"targetStepC\"", plugGovSettings.targetStepC);
+  plugGovSettings.rampControllerKpHours = parseJsonNumberAfter(json, "\"rampControllerKpHours\"", plugGovSettings.rampControllerKpHours);
+  plugGovSettings.rampControllerTnHours = parseJsonNumberAfter(json, "\"rampControllerTnHours\"", plugGovSettings.rampControllerTnHours);
+  plugGovSettings.maxRampTrimC = parseJsonNumberAfter(json, "\"maxRampTrimC\"", plugGovSettings.maxRampTrimC);
+  plugGovSettings.rampFadeDistanceC = parseJsonNumberAfter(json, "\"rampFadeDistanceC\"", plugGovSettings.rampFadeDistanceC);
+  plugGovSettings.rateFilterSamples = parseJsonNumberAfter(json, "\"rateFilterSamples\"", plugGovSettings.rateFilterSamples);
   normalizePlugGovernorSettings();
   plugGovSettingsLoaded = true;
   plugGovSettingsDirty = false;
@@ -3528,6 +3899,11 @@ const char* plugGovernorSettingLabel(uint8_t index) {
     case 19: return "Air min";
     case 20: return "Air max";
     case 21: return "Target step";
+    case 22: return "Ramp P";
+    case 23: return "Ramp I Tn";
+    case 24: return "Ramp max";
+    case 25: return "Ramp fade";
+    case 26: return "Rate PT1";
     default: return "--";
   }
 }
@@ -3556,6 +3932,11 @@ float plugGovernorSettingValue(uint8_t index) {
     case 19: return plugGovSettings.minAirTargetC;
     case 20: return plugGovSettings.maxAirTargetC;
     case 21: return plugGovSettings.targetStepC;
+    case 22: return plugGovSettings.rampControllerKpHours;
+    case 23: return plugGovSettings.rampControllerTnHours;
+    case 24: return plugGovSettings.maxRampTrimC;
+    case 25: return plugGovSettings.rampFadeDistanceC;
+    case 26: return plugGovSettings.rateFilterSamples;
     default: return 0.0f;
   }
 }
@@ -3584,6 +3965,11 @@ void setPlugGovernorSettingValue(uint8_t index, float value) {
     case 19: plugGovSettings.minAirTargetC = value; break;
     case 20: plugGovSettings.maxAirTargetC = value; break;
     case 21: plugGovSettings.targetStepC = value; break;
+    case 22: plugGovSettings.rampControllerKpHours = value; break;
+    case 23: plugGovSettings.rampControllerTnHours = value; break;
+    case 24: plugGovSettings.maxRampTrimC = value; break;
+    case 25: plugGovSettings.rampFadeDistanceC = value; break;
+    case 26: plugGovSettings.rateFilterSamples = value; break;
   }
   normalizePlugGovernorSettings();
   plugGovSettingsDirty = true;
@@ -3598,6 +3984,9 @@ float plugGovernorSettingStep(uint8_t index) {
     case 6: return 30.0f;
     case 12:
     case 14: return 0.05f;
+    case 22: return 0.1f;
+    case 23: return 0.25f;
+    case 26: return 1.0f;
     default: return 0.1f;
   }
 }
@@ -3612,11 +4001,16 @@ void formatPlugGovernorSettingValue(uint8_t index, char* buffer, size_t bufferSi
       break;
     case 1:
     case 2:
+    case 22:
+    case 23:
       snprintf(buffer, bufferSize, "%.2fh", value);
       break;
     case 5:
     case 6:
       snprintf(buffer, bufferSize, "%.0fs", value);
+      break;
+    case 26:
+      snprintf(buffer, bufferSize, "%.0f", value);
       break;
     case 16:
       snprintf(buffer, bufferSize, "%.1fK/h", value);
@@ -3706,7 +4100,8 @@ float plugTestScheduleTargetC(float fallbackTarget, unsigned long nowEpoch) {
   if (!plugTestScheduleEnabled || !activeBrewProfile.plugControlEnabled || plugTestPhaseCount == 0) {
     return fallbackTarget;
   }
-  if (!hasFreshPlugStatus() || !hasValidPlugBeerTemperature() || !isEpochValid(nowEpoch)) {
+  float plugBeerC = currentPlugBeerTemperatureC();
+  if (!hasFreshPlugStatus() || isnan(plugBeerC) || isinf(plugBeerC) || !isEpochValid(nowEpoch)) {
     return plugTestStarted && plugTestPhaseIndex < plugTestPhaseCount
       ? plugTestPhases[plugTestPhaseIndex].targetC
       : fallbackTarget;
@@ -3725,9 +4120,9 @@ float plugTestScheduleTargetC(float fallbackTarget, unsigned long nowEpoch) {
   }
 
   PlugTestPhase& phase = plugTestPhases[plugTestPhaseIndex];
-  const float error = latestPlugStatus.beer_temp_c - phase.targetC;
+  const float error = plugBeerC - phase.targetC;
   if (phase.hasMinBeerC) {
-    if (latestPlugStatus.beer_temp_c >= phase.minBeerC) {
+    if (plugBeerC >= phase.minBeerC) {
       if (!plugTestPhaseReached) {
         plugTestPhaseReached = true;
         plugTestPhaseReachedEpoch = nowEpoch;
@@ -3751,7 +4146,7 @@ float plugTestScheduleTargetC(float fallbackTarget, unsigned long nowEpoch) {
   return plugTestPhases[plugTestPhaseIndex].targetC;
 }
 
-float currentTemperatureTargetC(unsigned long nowEpoch) {
+float legacyTemperatureTargetC(unsigned long nowEpoch) {
   float yeastLow = activeBrewProfile.recommendedTempMinC > 0.0f ? activeBrewProfile.recommendedTempMinC : 18.0f;
   float yeastHigh = activeBrewProfile.recommendedTempMaxC > yeastLow ? activeBrewProfile.recommendedTempMaxC : yeastLow + 4.0f;
   float target = (yeastLow + yeastHigh) * 0.5f;
@@ -3780,7 +4175,58 @@ float currentTemperatureTargetC(unsigned long nowEpoch) {
     if (progress > 1.0f) progress = 1.0f;
     target += (coldCrashTarget - target) * progress;
   }
+  return target;
+}
+
+TemperatureProfileRuntimePhase currentTemperaturePhase(unsigned long nowEpoch) {
+  if (!brewProfileLoaded) return TEMP_PHASE_NONE;
+  if (activeBrewProfile.temperatureProfile.enabled) {
+    TemperatureProfileRuntimePhase phase = TEMP_PHASE_NONE;
+    TemperatureProfileEngine::targetForProfile(activeBrewProfile, nowEpoch, &phase);
+    return phase;
+  }
+  if ((activeBrewProfile.packageStarted || activeBrewProfile.packageDone) &&
+      !activeBrewProfile.packageSkipped) return TEMP_PHASE_CARBONATION;
+  if (activeBrewProfile.coldCrashDone && !activeBrewProfile.coldCrashSkipped) return TEMP_PHASE_COLD_CRASH;
+  if (activeBrewProfile.dRestDone && !activeBrewProfile.dRestSkipped) return TEMP_PHASE_D_REST;
+  return activeBrewProfile.fermentationStartAt == 0 ? TEMP_PHASE_PITCH : TEMP_PHASE_MAIN;
+}
+
+float currentTemperatureTargetC(unsigned long nowEpoch) {
+  float target = 20.0f;
+  TemperatureProfileRuntimePhase phase = TEMP_PHASE_NONE;
+  if (brewProfileLoaded && activeBrewProfile.temperatureProfile.enabled) {
+    target = TemperatureProfileEngine::targetForProfile(activeBrewProfile, nowEpoch, &phase);
+    strncpy(activeBrewProfile.temperatureProfile.status.activePhaseId,
+            TemperatureProfileEngine::phaseId(phase),
+            sizeof(activeBrewProfile.temperatureProfile.status.activePhaseId) - 1);
+    activeBrewProfile.temperatureProfile.status.activePhaseId[
+      sizeof(activeBrewProfile.temperatureProfile.status.activePhaseId) - 1] = '\0';
+    return target;
+  } else if (brewProfileLoaded) {
+    target = legacyTemperatureTargetC(nowEpoch);
+  }
   return plugTestScheduleTargetC(target, nowEpoch);
+}
+
+float currentTemperatureRampKPerHour(unsigned long nowEpoch) {
+  if (!brewProfileLoaded) return 0.0f;
+  TemperatureProfileRuntimePhase phase = currentTemperaturePhase(nowEpoch);
+  if (activeBrewProfile.temperatureProfile.enabled) {
+    return TemperatureProfileEngine::rampForPhase(activeBrewProfile, phase);
+  }
+  if (phase == TEMP_PHASE_COLD_CRASH) return 1.0f;
+  if (phase == TEMP_PHASE_D_REST) return 0.2f;
+  return 0.0f;
+}
+
+const char* currentDisplayPhaseName(unsigned long nowEpoch) {
+  if (brewProfileLoaded && (activeBrewProfile.packageStarted || activeBrewProfile.packageDone) &&
+      !activeBrewProfile.packageSkipped &&
+      activeBrewProfile.temperatureProfile.enabled) {
+    return TemperatureProfileEngine::phaseLabel(currentTemperaturePhase(nowEpoch));
+  }
+  return fermentationStateMachine.phaseName();
 }
 
 float targetHourForSG(float targetSG, float chartHours) {
@@ -3817,6 +4263,127 @@ int graphXForHour(float hour, int graphX, int graphW, float chartHours) {
   if (hour < 0.0f) hour = 0.0f;
   if (hour > chartHours) hour = chartHours;
   return graphX + (int)((hour / chartHours) * graphW);
+}
+
+float rampedProfileTemperatureAtHour(float hour, TemperatureProfileRuntimePhase* phaseOut) {
+  if (!brewProfileLoaded || !activeBrewProfile.temperatureProfile.enabled ||
+      !isEpochValid(activeBrewProfile.createdAt)) {
+    if (phaseOut) *phaseOut = TEMP_PHASE_NONE;
+    return currentTemperatureTargetC(getCurrentEpoch());
+  }
+
+  unsigned long pointEpoch = activeBrewProfile.createdAt + (unsigned long)(hour * 3600.0f);
+  TemperatureProfileRuntimePhase phase = TEMP_PHASE_NONE;
+  float target = TemperatureProfileEngine::targetForProfile(activeBrewProfile, pointEpoch, &phase);
+  bool postPackageChart = tempGraphMode == TEMP_GRAPH_POST_PACKAGE;
+
+  if (!postPackageChart &&
+      (phase == TEMP_PHASE_CARBONATION || phase == TEMP_PHASE_STORAGE)) {
+    if (activeBrewProfile.coldCrashDone && !activeBrewProfile.coldCrashSkipped) {
+      phase = TEMP_PHASE_COLD_CRASH;
+      target = activeBrewProfile.temperatureProfile.advanced.crashC;
+    } else if (activeBrewProfile.dRestDone && !activeBrewProfile.dRestSkipped) {
+      phase = TEMP_PHASE_D_REST;
+      target = activeBrewProfile.temperatureProfile.advanced.dRestC;
+    } else if (activeBrewProfile.fermentationStartAt == 0) {
+      phase = TEMP_PHASE_PITCH;
+      target = activeBrewProfile.temperatureProfile.advanced.pitchC;
+    } else {
+      phase = TEMP_PHASE_MAIN;
+      target = activeBrewProfile.temperatureProfile.advanced.mainC;
+    }
+  }
+
+  if (!postPackageChart) {
+    const TemperatureProfileAdvanced& adv = activeBrewProfile.temperatureProfile.advanced;
+    float normalRamp = adv.normalRampKPerH > 0.01f ? adv.normalRampKPerH : 0.2f;
+    float crashRamp = adv.coldCrashRampKPerH > 0.01f ? adv.coldCrashRampKPerH : 1.0f;
+    float pitchHour = 0.0f;
+    float mainHour = eventHourFromEpoch(activeBrewProfile.fermentationStartAt);
+    if (mainHour < 0.0f) mainHour = activeBrewProfile.fermentationStartAt == 0 ? 0.0f : 1.0f;
+    float dRestHour = activeBrewProfile.dRestDone && !activeBrewProfile.dRestSkipped
+      ? eventHourFromEpoch(activeBrewProfile.dRestStartedAt)
+      : -1.0f;
+    float coldHour = activeBrewProfile.coldCrashDone && !activeBrewProfile.coldCrashSkipped
+      ? eventHourFromEpoch(activeBrewProfile.coldCrashStartedAt)
+      : -1.0f;
+
+    float anchorHour = pitchHour;
+    float anchorTemp = adv.pitchC;
+    float nextHour = mainHour;
+    float nextTemp = adv.mainC;
+    TemperatureProfileRuntimePhase nextPhase = TEMP_PHASE_MAIN;
+
+    if (dRestHour >= 0.0f && hour >= dRestHour) {
+      anchorHour = dRestHour;
+      anchorTemp = adv.mainC;
+      nextHour = dRestHour;
+      nextTemp = adv.dRestC;
+      nextPhase = TEMP_PHASE_D_REST;
+    }
+    if (coldHour >= 0.0f && hour >= coldHour) {
+      anchorHour = coldHour;
+      anchorTemp = (dRestHour >= 0.0f && adv.dRestHoldHours > 0) ? adv.dRestC : adv.mainC;
+      nextHour = coldHour;
+      nextTemp = adv.crashC;
+      nextPhase = TEMP_PHASE_COLD_CRASH;
+    }
+
+    float ramp = nextPhase == TEMP_PHASE_COLD_CRASH ? crashRamp : normalRamp;
+    float rampHours = fabs(nextTemp - anchorTemp) / ramp;
+    if (hour < mainHour) {
+      phase = TEMP_PHASE_PITCH;
+      target = adv.pitchC;
+    } else if (rampHours > 0.01f && hour < nextHour + rampHours) {
+      float t = (hour - nextHour) / rampHours;
+      if (t < 0.0f) t = 0.0f;
+      if (t > 1.0f) t = 1.0f;
+      target = anchorTemp + (nextTemp - anchorTemp) * t;
+      phase = nextPhase;
+    } else {
+      target = nextTemp;
+      phase = nextPhase;
+    }
+  }
+
+  if (postPackageChart &&
+      (activeBrewProfile.packageStarted || activeBrewProfile.packageDone) &&
+      !activeBrewProfile.packageSkipped) {
+    float packageHour = eventHourFromEpoch(activeBrewProfile.packageStartedAt);
+    if (packageHour >= 0.0f && hour >= packageHour) {
+      float rampKPerHour = activeBrewProfile.temperatureProfile.advanced.normalRampKPerH;
+      if (rampKPerHour <= 0.01f) rampKPerHour = 0.2f;
+
+      float crashC = activeBrewProfile.temperatureProfile.advanced.crashC;
+      float carbonationC = activeBrewProfile.temperatureProfile.advanced.carbonationC;
+      float storageC = activeBrewProfile.temperatureProfile.advanced.storageC;
+      float carbRampHours = fabs(carbonationC - crashC) / rampKPerHour;
+      float completedHour = eventHourFromEpoch(activeBrewProfile.packagedAt);
+      float storageStartHour = activeBrewProfile.packageDone && completedHour >= 0.0f
+        ? completedHour + activeBrewProfile.temperatureProfile.advanced.carbonationDays * 24.0f
+        : -1.0f;
+      float storageRampHours = fabs(storageC - carbonationC) / rampKPerHour;
+
+      phase = TEMP_PHASE_CARBONATION;
+      if (hour < packageHour + carbRampHours && carbRampHours > 0.01f) {
+        float t = (hour - packageHour) / carbRampHours;
+        target = crashC + (carbonationC - crashC) * t;
+      } else if (storageStartHour < 0.0f || hour < storageStartHour) {
+        target = carbonationC;
+      } else {
+        phase = TEMP_PHASE_STORAGE;
+        if (hour < storageStartHour + storageRampHours && storageRampHours > 0.01f) {
+          float t = (hour - storageStartHour) / storageRampHours;
+          target = carbonationC + (storageC - carbonationC) * t;
+        } else {
+          target = storageC;
+        }
+      }
+    }
+  }
+
+  if (phaseOut) *phaseOut = phase;
+  return target;
 }
 
 float pointHourForBatchChart(int pointIndex) {
@@ -3907,12 +4474,14 @@ void drawTargetChartXAxis(int gx, int gy, int gw, int gh, float chartHours) {
   }
 }
 
-void drawTargetChartEventMarkers(int gx, int gy, int gw, int gh, float chartHours) {
+void drawTargetChartEventMarkers(int gx, int gy, int gw, int gh, float chartHours, bool includePostPackage) {
   int slot = 0;
   float dRestHour = -1.0f;
   float dryHopHour = -1.0f;
   float removeHour = -1.0f;
   float coldHour = -1.0f;
+  float packageHour = -1.0f;
+  float storageHour = -1.0f;
 
   if (activeBrewProfile.diacetylRestEnabled || activeBrewProfile.diacetylRestRecommendedByYeast ||
       activeBrewProfile.dRestDone || activeBrewProfile.dRestSkipped) {
@@ -3954,6 +4523,19 @@ void drawTargetChartEventMarkers(int gx, int gy, int gw, int gh, float chartHour
     }
   }
 
+  if (includePostPackage &&
+      (activeBrewProfile.packageStarted || activeBrewProfile.packageDone) &&
+      !activeBrewProfile.packageSkipped) {
+    packageHour = eventHourFromEpoch(activeBrewProfile.packageStartedAt);
+    if (activeBrewProfile.packageDone) {
+      float completedHour = eventHourFromEpoch(activeBrewProfile.packagedAt);
+      if (completedHour >= 0.0f) packageHour = packageHour >= 0.0f ? packageHour : completedHour;
+      if (completedHour >= 0.0f && activeBrewProfile.temperatureProfile.enabled) {
+        storageHour = completedHour + activeBrewProfile.temperatureProfile.advanced.carbonationDays * 24.0f;
+      }
+    }
+  }
+
   float yeastEnd = chartHours;
   if (dRestHour >= 0.0f && dRestHour < yeastEnd) yeastEnd = dRestHour;
   if (dryHopHour >= 0.0f && dryHopHour < yeastEnd) yeastEnd = dryHopHour;
@@ -3978,7 +4560,35 @@ void drawTargetChartEventMarkers(int gx, int gy, int gw, int gh, float chartHour
 
   if (coldHour >= 0.0f) {
     drawTargetEventMarker(gx, gy, gw, gh, chartHours, coldHour, "", currentTheme->graphBlue, slot++, 1);
-    drawTargetChartSpanLabel(gx, gy, gw, chartHours, coldHour, chartHours, "Cold crush", currentTheme->graphBlue, 0);
+    float coldEnd = chartHours;
+    if (packageHour > coldHour && packageHour < coldEnd) coldEnd = packageHour;
+    drawTargetChartSpanLabel(gx, gy, gw, chartHours, coldHour, coldEnd, "Cold Crash", currentTheme->graphBlue, 0);
+  }
+
+  if (packageHour >= 0.0f) {
+    drawTargetEventMarker(gx, gy, gw, gh, chartHours, packageHour, "", uiColorInfo, slot++, 1);
+    float carbonationEnd = storageHour >= 0.0f ? storageHour : chartHours;
+    drawTargetChartSpanLabel(gx, gy, gw, chartHours, packageHour, carbonationEnd,
+                             "Carbonation", uiColorInfo, 1);
+  }
+  if (storageHour >= 0.0f) {
+    drawTargetEventMarker(gx, gy, gw, gh, chartHours, storageHour, "", currentTheme->graphBlue, slot++, -1);
+    drawTargetChartSpanLabel(gx, gy, gw, chartHours, storageHour, chartHours,
+                             "Storage", currentTheme->graphBlue, 1);
+  }
+}
+
+void drawPostPackageTemperatureEventMarkers(int gx, int gy, int gw, int gh, float chartHours) {
+  if (!brewProfileLoaded || !activeBrewProfile.temperatureProfile.enabled) return;
+  drawTargetEventMarker(gx, gy, gw, gh, chartHours, 0.0f, "", uiColorInfo, 0, 1);
+  drawTargetChartSpanLabel(gx, gy, gw, chartHours, 0.0f,
+                           activeBrewProfile.temperatureProfile.advanced.carbonationDays * 24.0f,
+                           "Carbonation", uiColorInfo, 0);
+  float storageHour = activeBrewProfile.temperatureProfile.advanced.carbonationDays * 24.0f;
+  if (storageHour > 0.0f && storageHour < chartHours) {
+    drawTargetEventMarker(gx, gy, gw, gh, chartHours, storageHour, "", currentTheme->graphBlue, 1, -1);
+    drawTargetChartSpanLabel(gx, gy, gw, chartHours, storageHour, chartHours,
+                             "Storage", currentTheme->graphBlue, 0);
   }
 }
 
@@ -4305,7 +4915,8 @@ void drawGraph() {
 
 // Parameterized graph drawing function for different metrics
 void drawGraphForMetric(GraphMetric metric) {
-  if (displayDataCount < 2) return;
+  bool postPackageTempMode = metric == METRIC_TEMPERATURE && tempGraphMode == TEMP_GRAPH_POST_PACKAGE;
+  if (!postPackageTempMode && displayDataCount < 2) return;
   
   // Graph area inside the card with margins for axis labels
   int axisMarginLeft = 45;
@@ -4314,6 +4925,10 @@ void drawGraphForMetric(GraphMetric metric) {
   int graphY = TOPBAR_H + MARGIN + 10;
   int graphW = UI_W - MARGIN * 2 - 20 - axisMarginLeft;
   int graphH = UI_H - graphY - NAV_H - MARGIN - axisMarginBottom;
+  if (metric == METRIC_TEMPERATURE) {
+    graphY += 34;
+    graphH -= 34;
+  }
   
   // Find min/max values for the specific metric
   float minValue = 0, maxValue = 0;
@@ -4420,7 +5035,8 @@ void drawGraphForMetric(GraphMetric metric) {
   tft.setCursor(graphX - 35, graphY + graphH);
   tft.print(buf);
   
-  float chartHours = targetChartHours();
+  float chartHours = metric == METRIC_TEMPERATURE ? temperatureChartHours() : targetChartHours();
+  float postPackageStartHour = postPackageTempMode ? postPackageTemperatureStartHour() : 0.0f;
   bool useTargetTimebase = brewProfileLoaded && (metric == METRIC_TEMPERATURE || metric == METRIC_ABV);
 
   // Calculate time range for X-axis labels
@@ -4472,7 +5088,50 @@ void drawGraphForMetric(GraphMetric metric) {
     }
   }
 
-  if (metric == METRIC_TEMPERATURE && brewProfileLoaded) {
+  if (metric == METRIC_TEMPERATURE && brewProfileLoaded && activeBrewProfile.temperatureProfile.enabled) {
+    int prevTargetX = -1;
+    int prevTargetY = -1;
+    TemperatureProfileRuntimePhase prevPhase = TEMP_PHASE_NONE;
+    for (int i = 0; i <= 160; i++) {
+      float hour = chartHours * (float)i / 160.0f;
+      TemperatureProfileRuntimePhase phase = TEMP_PHASE_NONE;
+      float targetC = rampedProfileTemperatureAtHour(postPackageTempMode ? postPackageStartHour + hour : hour, &phase);
+      int x = graphXForHour(hour, graphX, graphW, chartHours);
+      int y = graphY + graphH - ((targetC - minValue) / valueRange * graphH);
+      if (y < graphY) y = graphY;
+      if (y > graphY + graphH) y = graphY + graphH;
+
+      uint16_t lineColor = currentTheme->graphPurple;
+      if (phase == TEMP_PHASE_D_REST) lineColor = uiColorError;
+      if (phase == TEMP_PHASE_COLD_CRASH || phase == TEMP_PHASE_STORAGE) lineColor = currentTheme->graphBlue;
+      if (phase == TEMP_PHASE_CARBONATION) lineColor = uiColorInfo;
+
+      if (prevTargetX >= 0 && prevTargetY >= 0) {
+        uint16_t segmentColor = prevPhase == phase ? lineColor : uiColorInfo;
+        drawGraphLine(prevTargetX, prevTargetY, x, y, segmentColor);
+      }
+      prevTargetX = x;
+      prevTargetY = y;
+      prevPhase = phase;
+    }
+
+    uint32_t nowEpoch = getCurrentEpoch();
+    float currentTarget = currentTemperatureTargetC(nowEpoch);
+    int yCurrentTarget = graphY + graphH - ((currentTarget - minValue) / valueRange * graphH);
+    if (yCurrentTarget < graphY) yCurrentTarget = graphY;
+    if (yCurrentTarget > graphY + graphH) yCurrentTarget = graphY + graphH;
+
+    tft.setTextColor(uiColorInfo);
+    tft.setFreeFont(FONT_SIZE_XS);
+    snprintf(buf, sizeof(buf), "%.0f", currentTarget);
+    tft.setCursor(graphX - 35, yCurrentTarget + 4);
+    tft.print(buf);
+    if (postPackageTempMode) {
+      drawPostPackageTemperatureEventMarkers(graphX, graphY, graphW, graphH, chartHours);
+    } else {
+      drawTargetChartEventMarkers(graphX, graphY, graphW, graphH, chartHours, false);
+    }
+  } else if (metric == METRIC_TEMPERATURE && brewProfileLoaded) {
     float yeastLow = activeBrewProfile.recommendedTempMinC > 0.0f ? activeBrewProfile.recommendedTempMinC : 18.0f;
     float yeastHigh = activeBrewProfile.recommendedTempMaxC > yeastLow ? activeBrewProfile.recommendedTempMaxC : yeastLow + 4.0f;
     float dRestLow = yeastHigh + 1.0f;
@@ -4663,7 +5322,49 @@ void drawGraphForMetric(GraphMetric metric) {
     tft.setFreeFont(FONT_SIZE_XS);
     tft.setCursor(graphX + 4, graphY + 14);
     tft.print("Expected ABV");
-    drawTargetChartEventMarkers(graphX, graphY, graphW, graphH, chartHours);
+    drawTargetChartEventMarkers(graphX, graphY, graphW, graphH, chartHours, false);
+  }
+
+  if (postPackageTempMode) {
+    int prevX = -1;
+    int prevY = -1;
+    for (int i = 0; i < postPackageTempGraphCount; i++) {
+      uint32_t epoch_s = postPackageTempGraphEpochs[i];
+      uint32_t startEpoch = postPackageTemperatureStartEpoch();
+      if (!isEpochValid(startEpoch) || !isEpochValid(epoch_s) || epoch_s < startEpoch) continue;
+      float hour = (epoch_s - startEpoch) / 3600.0f;
+      if (hour < 0.0f || hour > chartHours) continue;
+      float value = postPackageTempGraphValues[i];
+      int x = graphXForHour(hour, graphX, graphW, chartHours);
+      int y = graphY + graphH - ((value - minValue) / valueRange * graphH);
+      if (y < graphY) y = graphY;
+      if (y > graphY + graphH) y = graphY + graphH;
+      if (prevX >= 0 && prevY >= 0) {
+        drawGraphLine(prevX, prevY, x, y, uiColorGold);
+      }
+      prevX = x;
+      prevY = y;
+    }
+
+    if (prevX >= 0 && prevY >= 0 && postPackageTempGraphCount > 0) {
+      tft.fillCircle(prevX, prevY, 4, uiColorGold);
+      snprintf(buf, sizeof(buf), "%.1f C", postPackageTempGraphValues[postPackageTempGraphCount - 1]);
+      tft.setTextColor(uiColorGold);
+      tft.setFreeFont(FONT_SIZE_XS);
+      int labelX = prevX + 8;
+      if (labelX + tft.textWidth(buf) > graphX + graphW) labelX = graphX + graphW - tft.textWidth(buf);
+      int labelY = prevY - 4;
+      if (labelY < graphY + 10) labelY = graphY + 10;
+      if (labelY > graphY + graphH - 4) labelY = graphY + graphH - 4;
+      tft.setCursor(labelX, labelY);
+      tft.print(buf);
+    } else {
+      tft.setTextColor(uiColorTextMuted);
+      tft.setFreeFont(FONT_SIZE_XS);
+      tft.setCursor(graphX + 4, graphY + graphH - 8);
+      tft.print("Waiting for 10 min air log");
+    }
+    return;
   }
 
   // Draw gold polyline
@@ -4973,6 +5674,17 @@ void drawBatteryView() {
   
   int contentY = TOPBAR_H + MARGIN;
   int contentH = UI_H - contentY - NAV_H - MARGIN;
+
+  if (isFloatInactiveAfterPackaging()) {
+    uiCard(MARGIN, contentY, UI_W - MARGIN * 2, contentH, CARD_RADIUS);
+    uiTextCenter(MARGIN, contentY + 74, UI_W - MARGIN * 2, 28,
+                 "Float battery not live", FONT_SIZE_SM, uiColorTextMuted);
+    uiTextCenter(MARGIN, contentY + 108, UI_W - MARGIN * 2, 20,
+                 shouldShowFloatStillActiveWarning() ? "Float still sends packets" : "Float off after packaging",
+                 FONT_SIZE_XS, shouldShowFloatStillActiveWarning() ? uiColorError : uiColorTextMuted);
+    uiDrawBottomNav(TAB_DASHBOARD);
+    return;
+  }
   
   bool hasLiveBattery = latestFloatDataValid &&
                         latestFloatData.battery_voltage >= 2.5f &&
@@ -5211,12 +5923,33 @@ void drawBatteryView() {
 void drawTempGraphView() {
   tft.fillScreen(uiColorBackground);
   
-  drawViewTopbar("Temp Target");
+  drawViewTopbar(tempGraphMode == TEMP_GRAPH_POST_PACKAGE ? "Post-Packing" : "Pre-Packing");
   
   int contentY = TOPBAR_H + MARGIN;
   int contentH = UI_H - contentY - NAV_H - MARGIN;
   
-  if (displayDataCount < 3) {
+  if (tempGraphMode == TEMP_GRAPH_POST_PACKAGE) {
+    if (!brewProfileLoaded || !activeBrewProfile.temperatureProfile.enabled ||
+        !isPostPackageTemperaturePhase()) {
+      uiCard(MARGIN, contentY, UI_W - MARGIN * 2, contentH, CARD_RADIUS);
+      uiTextCenter(MARGIN, contentY + 82, UI_W - MARGIN * 2, 24,
+                   "No post-package phase", FONT_SIZE_SM, uiColorTextMuted);
+      uiTextCenter(MARGIN, contentY + 112, UI_W - MARGIN * 2, 20,
+                   "Start packaging first", FONT_SIZE_XS, uiColorTextMuted);
+      drawTempGraphModeToggle(contentY);
+      uiDrawBottomNav(TAB_LIVE);
+      return;
+    }
+    if (!postPackageTempGraphLoadAttempted ||
+        strcmp(postPackageTempGraphLoadedFile, currentFermentationFile) != 0) {
+      if (mountSDTemporarily()) {
+        loadPostPackageTemperatureGraphData();
+        dismountSD();
+      } else {
+        postPackageTempGraphLoadAttempted = true;
+      }
+    }
+  } else if (displayDataCount < 3) {
     drawNoDataCard("No graph data", "Collect a few points first", TAB_LIVE);
     return;
   }
@@ -5224,8 +5957,29 @@ void drawTempGraphView() {
   // Draw graph card
   uiCard(MARGIN, contentY, UI_W - MARGIN * 2, contentH, CARD_RADIUS);
   drawGraphForMetric(METRIC_TEMPERATURE);
+  drawTempGraphModeToggle(contentY);
   
   uiDrawBottomNav(TAB_LIVE);
+}
+
+void drawTempGraphModeToggle(int contentY) {
+  const int toggleW = 220;
+  const int toggleH = 30;
+  const int toggleX = UI_W - MARGIN - toggleW - 6;
+  const int toggleY = contentY + 6;
+  const int halfW = toggleW / 2;
+  bool preActive = tempGraphMode == TEMP_GRAPH_FERMENT;
+  bool postActive = tempGraphMode == TEMP_GRAPH_POST_PACKAGE;
+  uint16_t preText = tempGraphMode == TEMP_GRAPH_FERMENT ? uiColorPrimaryText : uiColorTextPrimary;
+  uint16_t postText = tempGraphMode == TEMP_GRAPH_POST_PACKAGE ? uiColorPrimaryText : uiColorTextPrimary;
+
+  tft.fillRoundRect(toggleX, toggleY, toggleW, toggleH, 6, uiColorCardBackground);
+  tft.drawRoundRect(toggleX, toggleY, toggleW, toggleH, 6, uiColorBorder);
+  if (preActive) tft.fillRoundRect(toggleX + 2, toggleY + 2, halfW - 4, toggleH - 4, 5, uiColorInfo);
+  if (postActive) tft.fillRoundRect(toggleX + halfW + 2, toggleY + 2, halfW - 4, toggleH - 4, 5, uiColorInfo);
+  tft.drawFastVLine(toggleX + halfW, toggleY + 2, toggleH - 4, uiColorBorder);
+  uiTextCenter(toggleX, toggleY + 5, halfW, 18, "Pre-Packing", FONT_SIZE_XS, preText);
+  uiTextCenter(toggleX + halfW, toggleY + 5, halfW, 18, "Post-Packing", FONT_SIZE_XS, postText);
 }
 
 void drawAngleGraphView() {
@@ -5343,6 +6097,438 @@ bool isLogoBackgroundPixel(uint16_t color) {
   return r >= 238 && g >= 238 && b >= 238;
 }
 
+void loadBacklightPreference() {
+  EEPROM.begin(EEPROM_BYTES);
+  uint32_t magic = 0;
+  EEPROM.get(EEPROM_BRIGHTNESS_MAGIC, magic);
+  if (magic == BRIGHTNESS_MAGIC) {
+    uint8_t saved = EEPROM.read(EEPROM_BRIGHTNESS_VALUE);
+    backlightLevel = saved < 4 ? saved : 2;
+  } else {
+    backlightLevel = 2;
+  }
+}
+
+void saveBacklightPreference() {
+  EEPROM.begin(EEPROM_BYTES);
+  EEPROM.put(EEPROM_BRIGHTNESS_MAGIC, BRIGHTNESS_MAGIC);
+  EEPROM.write(EEPROM_BRIGHTNESS_VALUE, backlightLevel);
+  if (!EEPROM.commit()) {
+    LOG_ERRORLN("ERROR: Failed to save brightness");
+  }
+}
+
+void applyBacklightLevel() {
+  if (backlightLevel > 3) backlightLevel = 2;
+  ledcWrite(TFT_BACKLIGHT_PIN, BACKLIGHT_DUTY_LEVELS[backlightLevel]);
+}
+
+void initBacklight() {
+  pinMode(TFT_BACKLIGHT_PIN, OUTPUT);
+  digitalWrite(TFT_BACKLIGHT_PIN, HIGH);
+  ledcAttach(TFT_BACKLIGHT_PIN, BACKLIGHT_PWM_FREQ, BACKLIGHT_PWM_RESOLUTION);
+  applyBacklightLevel();
+}
+
+void cycleBacklightLevel() {
+  backlightLevel = (backlightLevel + 1) % 4;
+  applyBacklightLevel();
+  saveBacklightPreference();
+}
+
+String baseOtaDiagHtml() {
+  String html;
+  html.reserve(1200);
+  bool clientConnected = WiFi.softAPgetStationNum() > 0;
+  uint32_t idle = (millis() - baseOtaLastClientMs) / 1000UL;
+  uint32_t remain = clientConnected ? 0UL : (idle < 180UL ? 180UL - idle : 0UL);
+  html += "<pre>";
+  html += "Firmware: SGNode Base ";
+  html += __DATE__;
+  html += " ";
+  html += __TIME__;
+  html += "\nChip: ";
+  html += String((uint32_t)ESP.getEfuseMac(), HEX);
+  html += "\nFlash: ";
+  html += String(ESP.getFlashChipSize());
+  html += "\nSketch: ";
+  html += String(ESP.getSketchSize());
+  html += "\nFree sketch: ";
+  html += String(ESP.getFreeSketchSpace());
+  html += "\nFree heap: ";
+  html += String(ESP.getFreeHeap());
+  html += "\nUptime: ";
+  html += String(millis() / 1000UL);
+  html += " s\nReset: ";
+  html += String((int)esp_reset_reason());
+  html += "\nAP SSID: ";
+  html += baseOtaSsid;
+  html += "\nAP IP: ";
+  html += WiFi.softAPIP().toString();
+  html += "\nNo-client timeout: ";
+  html += clientConnected ? String("paused") : String(remain) + " s";
+  html += "\nClients: ";
+  html += String(WiFi.softAPgetStationNum());
+  html += "\nSD: ";
+  html += fermentationFileOpen ? "log open" : "no open log";
+  html += "\nFloat last: ";
+  html += String(lastPostPackageFloatPacketMs > 0 ? (millis() - lastPostPackageFloatPacketMs) / 1000UL : 0UL);
+  html += " s\nPlug mode: ";
+  html += String((int)latestPlugStatus.control_mode);
+  html += "\nESP-NOW channel: ";
+  html += String(ESPNOW_CHANNEL);
+  html += "\nBase time: ";
+  {
+    char ts[24];
+    formatTimestamp(getCurrentEpoch(), ts, sizeof(ts));
+    html += ts;
+  }
+  html += "</pre>";
+  return html;
+}
+
+String baseOtaPageHtml() {
+  String html;
+  html.reserve(2200);
+  html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>SGNode Base OTA</title><style>body{font-family:sans-serif;margin:24px;max-width:720px}";
+  html += "button,input{font-size:16px;padding:10px;margin:6px 0}pre{background:#f3f4f6;padding:12px;overflow:auto}";
+  html += ".hdr{display:flex;align-items:center;gap:14px;margin-bottom:16px}.logo{width:96px;height:auto}</style></head><body>";
+  html += "<div class='hdr'><img class='logo' src='/logo.png' alt='SGNode'><h2>Base OTA</h2></div>";
+  html += "<form method='POST' action='/update' enctype='multipart/form-data'>";
+  html += "<input type='file' name='update'><br><button type='submit'>Upload firmware</button></form>";
+  html += "<p><button type='button' onclick='syncTime()'>Systemzeit vom Computer &uuml;bernehmen</button>";
+  html += " <span id='timeStatus'></span></p>";
+  html += "<p><a href='/diag'>Refresh diagnostics</a> | <a href='/reboot'>Reboot normal mode</a></p>";
+  html += baseOtaDiagHtml();
+  html += "<script>";
+  html += "function syncTime(){";
+  html += "var st=document.getElementById('timeStatus');";
+  html += "st.innerText='sende...';";
+  html += "var d=new Date();";
+  html += "var p=new URLSearchParams({y:d.getFullYear(),mo:d.getMonth()+1,d:d.getDate(),";
+  html += "h:d.getHours(),mi:d.getMinutes(),s:d.getSeconds()});";
+  html += "fetch('/settime?'+p.toString()).then(function(r){return r.text();})";
+  html += ".then(function(t){st.innerText=t;})";
+  html += ".catch(function(){st.innerText='Fehler beim Senden';});";
+  html += "}";
+  html += "</script>";
+  html += "</body></html>";
+  return html;
+}
+
+void startBaseOtaMode() {
+  LOG_INFOLN("Starting Base OTA mode");
+  esp_now_deinit();
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_AP);
+  snprintf(baseOtaSsid, sizeof(baseOtaSsid), "SGNode-Base-OTA-%06X", (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
+  WiFi.softAP(baseOtaSsid);
+  baseOtaStartedMs = millis();
+  baseOtaLastClientMs = millis();
+  baseOtaUploadInProgress = false;
+
+  baseOtaServer.on("/", HTTP_GET, []() {
+    baseOtaServer.send(200, "text/html", baseOtaPageHtml());
+  });
+  baseOtaServer.on("/diag", HTTP_GET, []() {
+    baseOtaServer.send(200, "text/html", baseOtaPageHtml());
+  });
+  baseOtaServer.on("/logo.png", HTTP_GET, []() {
+    baseOtaServer.send_P(200, "image/png", (const char*)SGNODE_LOGO_PNG, SGNODE_LOGO_PNG_SIZE);
+  });
+  baseOtaServer.on("/reboot", HTTP_GET, []() {
+    baseOtaServer.send(200, "text/html", "<html><body>Rebooting...</body></html>");
+    delay(100);
+    stopBaseOtaAndReboot();
+  });
+  baseOtaServer.on("/settime", HTTP_GET, []() {
+    if (!baseOtaServer.hasArg("y") || !baseOtaServer.hasArg("mo") || !baseOtaServer.hasArg("d") ||
+        !baseOtaServer.hasArg("h") || !baseOtaServer.hasArg("mi") || !baseOtaServer.hasArg("s")) {
+      baseOtaServer.send(400, "text/plain", "Fehlende Parameter");
+      return;
+    }
+    int year   = baseOtaServer.arg("y").toInt();
+    int month  = baseOtaServer.arg("mo").toInt();
+    int day    = baseOtaServer.arg("d").toInt();
+    int hour   = baseOtaServer.arg("h").toInt();
+    int minute = baseOtaServer.arg("mi").toInt();
+    int second = baseOtaServer.arg("s").toInt();
+
+    if (year < RTC_VALID_FROM_YEAR || year > 2099 || month < 1 || month > 12 ||
+        day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
+        second < 0 || second > 59) {
+      baseOtaServer.send(400, "text/plain", "Ungueltige Zeitangabe");
+      return;
+    }
+
+    if (setRTCDateTime((uint16_t)year, (uint8_t)month, (uint8_t)day,
+                        (uint8_t)hour, (uint8_t)minute, (uint8_t)second)) {
+      uint32_t epoch = dateTimeToEpoch((uint16_t)year, (uint8_t)month, (uint8_t)day,
+                                        (uint8_t)hour, (uint8_t)minute, (uint8_t)second);
+      syncSystemTimeFromRTC(epoch);
+      char ts[24];
+      formatTimestamp(epoch, ts, sizeof(ts));
+      LOG_INFO("Base RTC via Browser gesetzt: %s\n", ts);
+      baseOtaServer.send(200, "text/plain", String("OK: ") + ts);
+    } else {
+      baseOtaServer.send(500, "text/plain", "RTC Schreibfehler (I2C)");
+    }
+  });
+  baseOtaServer.on("/update", HTTP_POST, []() {
+    bool ok = !Update.hasError();
+    baseOtaServer.send(ok ? 200 : 500, "text/html", ok ? "<html><body>OK. Rebooting...</body></html>" : "<html><body>Update failed.</body></html>");
+    delay(250);
+    if (ok) stopBaseOtaAndReboot();
+  }, []() {
+    HTTPUpload& upload = baseOtaServer.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      baseOtaUploadInProgress = true;
+      Update.begin(UPDATE_SIZE_UNKNOWN);
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        LOG_ERRORLN("OTA write failed");
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      Update.end(true);
+      baseOtaUploadInProgress = false;
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+      Update.end();
+      baseOtaUploadInProgress = false;
+    }
+  });
+  baseOtaServer.begin();
+  baseOtaActive = true;
+  baseOtaConfirmVisible = false;
+  baseOtaStaticDrawn = false;
+  screenDirty = true;
+}
+
+void stopBaseOtaAndReboot() {
+  baseOtaServer.stop();
+  WiFi.softAPdisconnect(true);
+  delay(100);
+  ESP.restart();
+}
+
+void handleBaseOtaMode() {
+  baseOtaServer.handleClient();
+  if (WiFi.softAPgetStationNum() > 0) {
+    baseOtaLastClientMs = millis();
+  }
+  if (!baseOtaUploadInProgress && WiFi.softAPgetStationNum() == 0 &&
+      millis() - baseOtaLastClientMs > 180000UL) {
+    stopBaseOtaAndReboot();
+  }
+  static unsigned long lastOtaScreenRefresh = 0;
+  if (millis() - lastOtaScreenRefresh > 1000UL) {
+    drawBaseOtaScreen();
+    lastOtaScreenRefresh = millis();
+  }
+  if (screenDirty) {
+    drawBaseOtaScreen();
+    screenDirty = false;
+  }
+}
+
+void drawCenteredDialogFrame(int boxX, int boxY, int boxW, int boxH) {
+  tft.fillRoundRect(boxX, boxY, boxW, boxH, CARD_RADIUS, uiColorCardBackground);
+  tft.drawRoundRect(boxX, boxY, boxW, boxH, CARD_RADIUS, uiColorBorder);
+}
+
+void drawBaseOtaScreen() {
+  if (!baseOtaStaticDrawn) {
+    tft.fillScreen(uiColorBackground);
+    drawViewTopbar("Base OTA");
+    int y = TOPBAR_H + 28;
+    tft.setTextColor(uiColorTextPrimary);
+    tft.setFreeFont(FONT_SIZE_MD);
+    tft.setCursor(MARGIN, y);
+    tft.print("Base OTA Active");
+    tft.setFreeFont(FONT_SIZE_SM);
+    y += 42;
+    tft.setCursor(MARGIN, y);
+    tft.print("SSID: ");
+    tft.print(baseOtaSsid);
+    y += 28;
+    tft.setCursor(MARGIN, y);
+    tft.print("IP:   ");
+    tft.print(WiFi.softAPIP().toString());
+    drawButton(MARGIN, UI_H - NAV_H - 48, UI_W - MARGIN * 2, 36, "Reboot Normal Mode", true);
+    baseOtaStaticDrawn = true;
+  }
+
+  int y = TOPBAR_H + 28 + 42 + 28 + 28;
+  tft.fillRect(MARGIN, y - 18, UI_W - MARGIN * 2, 62, uiColorBackground);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(MARGIN, y);
+  bool clientConnected = WiFi.softAPgetStationNum() > 0;
+  tft.print("Client: ");
+  tft.print(clientConnected ? "connected" : "waiting");
+  y += 28;
+  uint32_t idle = (millis() - baseOtaLastClientMs) / 1000UL;
+  tft.setCursor(MARGIN, y);
+  tft.print("No-client timeout: ");
+  if (clientConnected) {
+    tft.print("paused");
+  } else {
+    tft.print(idle < 180UL ? 180UL - idle : 0UL);
+    tft.print(" s");
+  }
+}
+
+void drawBaseOtaConfirmDialog() {
+  int boxW = 360;
+  int boxH = 150;
+  int boxX = (UI_W - boxW) / 2;
+  int boxY = (UI_H - boxH) / 2;
+  drawCenteredDialogFrame(boxX, boxY, boxW, boxH);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_MD);
+  tft.setCursor(boxX + 24, boxY + 42);
+  tft.print("Start Base OTA?");
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(boxX + 24, boxY + 70);
+  tft.print("ESP-NOW pauses.");
+  tft.setCursor(boxX + 24, boxY + 90);
+  tft.print("SoftAP starts.");
+  drawButton(boxX + 24, boxY + 100, 130, 34, "Cancel", false);
+  drawButton(boxX + boxW - 154, boxY + 100, 130, 34, "Start", true);
+}
+
+void drawFloatOtaPopup() {
+  int boxW = 360;
+  int boxH = 150;
+  int boxX = (UI_W - boxW) / 2;
+  int boxY = (UI_H - boxH) / 2;
+  drawCenteredDialogFrame(boxX, boxY, boxW, boxH);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_MD);
+  tft.setCursor(boxX + 24, boxY + 38);
+  tft.print("Float OTA Active");
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(boxX + 24, boxY + 68);
+  tft.print("SSID: ");
+  tft.print(floatOtaPopupSsid);
+  tft.setCursor(boxX + 24, boxY + 94);
+  tft.print("IP: ");
+  tft.print(floatOtaPopupIp);
+  if (floatOtaPopupTimeoutS > 0) {
+    tft.print("  ");
+    tft.print(floatOtaPopupTimeoutS / 60);
+    tft.print(" min");
+  }
+  drawButton(boxX + boxW - 118, boxY + 106, 94, 32, "OK", true);
+}
+
+void drawTopbarPulldown() {
+  int panelH = 118;
+  tft.fillRect(0, 0, UI_W, panelH, uiColorCardBackground);
+  tft.drawFastHLine(0, panelH - 1, UI_W, uiColorBorder);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(MARGIN, 28);
+  tft.print("Quick Settings");
+
+  const char* blLabels[] = {"Low", "Mid", "High", "Max"};
+  char brightnessLabel[24];
+  snprintf(brightnessLabel, sizeof(brightnessLabel), "Brightness %s", blLabels[backlightLevel]);
+  int y = 52;
+  int w = (UI_W - MARGIN * 2 - GAP * 2) / 3;
+  drawButton(MARGIN, y, w, 38, brightnessLabel, true);
+  drawButton(MARGIN + w + GAP, y, w, 38, darkMode ? "Dark Mode" : "Light Mode", true);
+  drawButton(MARGIN + (w + GAP) * 2, y, w, 38, "Reboot", false);
+}
+
+bool handleOverlayTouch(int x, int y) {
+  if (baseOtaActive) {
+    if (x >= MARGIN && x <= UI_W - MARGIN &&
+        y >= UI_H - NAV_H - 48 && y <= UI_H - NAV_H - 12) {
+      stopBaseOtaAndReboot();
+      return true;
+    }
+    return true;
+  }
+
+  if (baseOtaConfirmVisible) {
+    int boxW = 360;
+    int boxH = 150;
+    int boxX = (UI_W - boxW) / 2;
+    int boxY = (UI_H - boxH) / 2;
+    if (y >= boxY + 100 && y <= boxY + 134) {
+      if (x >= boxX + 24 && x <= boxX + 154) {
+        baseOtaConfirmVisible = false;
+        screenDirty = true;
+        return true;
+      }
+      if (x >= boxX + boxW - 154 && x <= boxX + boxW - 24) {
+        startBaseOtaMode();
+        return true;
+      }
+    }
+    return true;
+  }
+
+  if (floatOtaPopupVisible) {
+    int boxW = 360;
+    int boxH = 150;
+    int boxX = (UI_W - boxW) / 2;
+    int boxY = (UI_H - boxH) / 2;
+    if (x >= boxX + boxW - 118 && x <= boxX + boxW - 24 &&
+        y >= boxY + 106 && y <= boxY + 138) {
+      floatOtaPopupVisible = false;
+      screenDirty = true;
+      return true;
+    }
+    return true;
+  }
+  if (topbarPulldownVisible) {
+    int panelH = 118;
+    if (y <= panelH) {
+      int buttonY = 52;
+      int buttonW = (UI_W - MARGIN * 2 - GAP * 2) / 3;
+      if (y >= buttonY && y <= buttonY + 38) {
+        if (x >= MARGIN && x <= MARGIN + buttonW) {
+          cycleBacklightLevel();
+          screenDirty = true;
+          return true;
+        }
+        if (x >= MARGIN + buttonW + GAP && x <= MARGIN + (buttonW + GAP) * 2 - GAP) {
+          topbarPulldownVisible = false;
+          toggleTheme();
+          return true;
+        }
+        if (x >= MARGIN + (buttonW + GAP) * 2 && x <= MARGIN + (buttonW + GAP) * 2 + buttonW) {
+          ESP.restart();
+          return true;
+        }
+      }
+      return true;
+    }
+    topbarPulldownVisible = false;
+    screenDirty = true;
+    return true;
+  }
+  return false;
+}
+
+void onFloatOtaStatusReceived(const uint8_t* mac, const uint8_t* data, int len) {
+  (void)mac;
+  if (len != sizeof(sg_float_ota_status_t)) return;
+  sg_float_ota_status_t status;
+  memcpy(&status, data, sizeof(status));
+  uint16_t expected = sg_crc16((const uint8_t*)&status, sizeof(status) - sizeof(status.crc));
+  if (expected != status.crc) return;
+  strncpy(floatOtaPopupSsid, status.ssid, sizeof(floatOtaPopupSsid) - 1);
+  floatOtaPopupSsid[sizeof(floatOtaPopupSsid) - 1] = '\0';
+  strncpy(floatOtaPopupIp, status.ip, sizeof(floatOtaPopupIp) - 1);
+  floatOtaPopupIp[sizeof(floatOtaPopupIp) - 1] = '\0';
+  floatOtaPopupTimeoutS = status.timeout_s;
+  floatOtaPopupVisible = true;
+  screenDirty = true;
+}
+
 void drawBootScreen() {
   tft.fillScreen(lightTheme.background);
   
@@ -5393,6 +6579,30 @@ void checkTouch() {
     
     touchX = x;
     touchY = y;
+
+    if (handleOverlayTouch(touchX, touchY)) {
+      delay(50);
+      return;
+    }
+
+    if (!topbarPulldownVisible && !baseOtaConfirmVisible && !floatOtaPopupVisible) {
+      if (!topbarDragCandidate && touchY <= TOPBAR_H && touchX < UI_W - 95) {
+        topbarDragCandidate = true;
+        topbarDragStartY = touchY;
+        topbarDragStartMs = millis();
+      } else if (topbarDragCandidate) {
+        if (touchY > topbarDragStartY + 34 && millis() - topbarDragStartMs < 900UL) {
+          topbarPulldownVisible = true;
+          topbarDragCandidate = false;
+          screenDirty = true;
+          delay(50);
+          return;
+        }
+        if (millis() - topbarDragStartMs >= 900UL || touchY < topbarDragStartY) {
+          topbarDragCandidate = false;
+        }
+      }
+    }
 
     // Top bar battery icon/percentage opens the dedicated Battery view.
     if (touchY <= TOPBAR_H && touchX >= UI_W - 95) {
@@ -5467,7 +6677,9 @@ void checkTouch() {
       int buttonY = actionY + actionH - 32;
       int buttonW = 86;
       if (touchY >= buttonY && touchY <= buttonY + 28) {
-        if (currentBatchAction.type != ACTION_FLOAT_IN_BREW &&
+        bool singleActionButton = currentBatchAction.type == ACTION_FLOAT_IN_BREW ||
+                                  currentBatchAction.type == ACTION_PACKAGE_COMPLETE;
+        if (!singleActionButton &&
             touchX >= MARGIN + contentW - buttonW * 2 - GAP - 10 &&
             touchX <= MARGIN + contentW - buttonW - GAP - 10) {
           handleCurrentActionChoice(false);
@@ -5477,11 +6689,13 @@ void checkTouch() {
         if (touchX >= MARGIN + contentW - buttonW - 10 &&
             touchX <= MARGIN + contentW - 10) {
           handleCurrentActionChoice(true);
-          delay(50);
-          return;
-        }
-      }
+      delay(50);
+      return;
     }
+  } else {
+    topbarDragCandidate = false;
+  }
+}
 
     if (currentMode == TARGET_CHART_VIEW && touchY < UI_H - NAV_H) {
       currentMode = LIVE_VIEW;
@@ -5580,6 +6794,28 @@ void checkTouch() {
       return;
     }
     
+    if (currentMode == TEMP_GRAPH_VIEW) {
+      int contentY = TOPBAR_H + MARGIN;
+      int switchW = 220;
+      int switchH = 30;
+      int switchX = UI_W - MARGIN - switchW - 6;
+      int switchY = contentY + 6;
+      const int switchPad = 12;
+      if (touchX >= switchX - switchPad && touchX <= switchX + switchW + switchPad &&
+          touchY >= switchY - switchPad && touchY <= switchY + switchH + switchPad) {
+        tempGraphMode = touchX < switchX + switchW / 2
+          ? TEMP_GRAPH_FERMENT
+          : TEMP_GRAPH_POST_PACKAGE;
+        if (tempGraphMode == TEMP_GRAPH_POST_PACKAGE) {
+          postPackageTempGraphLoadAttempted = false;
+        }
+        screenDirty = true;
+        delay(50);
+        return;
+      }
+      return;
+    }
+
     // Handle Graph view button touches
     if (currentMode == GRAPH_VIEW) {
       int buttonW = (UI_W - MARGIN * 2 - GAP * 4) / 5;
@@ -5682,18 +6918,18 @@ void checkTouch() {
     // Handle More view card taps
     if (currentMode == MORE_VIEW) {
       int contentY = TOPBAR_H + MARGIN;
-      int cardH = (UI_H - TOPBAR_H - NAV_H - MARGIN * 2 - GAP * 3) / 4;
+      int cardH = (UI_H - TOPBAR_H - NAV_H - MARGIN * 2 - GAP * 4) / 5;
       int contentW = UI_W - MARGIN * 2;
       int cardW = (contentW - GAP) / 2;
       int leftX = MARGIN;
       int rightX = MARGIN + cardW + GAP;
       
-      // System card (goes to LIVE_DETAILS)
+      // Diagnostic card (goes to LIVE_DETAILS)
       if (touchX >= leftX && touchX <= leftX + cardW &&
           touchY >= contentY && touchY <= contentY + cardH) {
         currentMode = LIVE_DETAILS_VIEW;
         screenDirty = true;
-        LOG_VERBOSELN("Switched to Live Details");
+        LOG_VERBOSELN("Switched to Diagnostic");
       }
 
       // Theme switch
@@ -5744,7 +6980,7 @@ void checkTouch() {
         return;
       }
 
-      // Manage Brew / Reboot row
+      // Manage Brew / Brightness row
       contentY += cardH + GAP;
       if (touchX >= leftX && touchX <= leftX + cardW &&
           touchY >= contentY && touchY <= contentY + cardH) {
@@ -5757,8 +6993,26 @@ void checkTouch() {
       }
       if (touchX >= rightX && touchX <= rightX + cardW &&
           touchY >= contentY && touchY <= contentY + cardH) {
+        cycleBacklightLevel();
+        screenDirty = true;
+        LOG_VERBOSELN("Brightness changed");
+        delay(50);
+        return;
+      }
+
+      // Reboot / OTA row
+      contentY += cardH + GAP;
+      if (touchX >= leftX && touchX <= leftX + cardW &&
+          touchY >= contentY && touchY <= contentY + cardH) {
         LOG_INFOLN("Rebooting...");
         ESP.restart();
+      }
+      if (touchX >= rightX && touchX <= rightX + cardW &&
+          touchY >= contentY && touchY <= contentY + cardH) {
+        baseOtaConfirmVisible = true;
+        screenDirty = true;
+        delay(50);
+        return;
       }
     }
     
@@ -5837,7 +7091,7 @@ void checkTouch() {
     }
     
     // Handle new graph view touches to return to LIVE_VIEW
-    if (currentMode == TEMP_GRAPH_VIEW || currentMode == ANGLE_GRAPH_VIEW || currentMode == ABV_GRAPH_VIEW) {
+    if (currentMode == ANGLE_GRAPH_VIEW || currentMode == ABV_GRAPH_VIEW) {
       // Tap anywhere to return to LIVE_VIEW
       currentMode = LIVE_VIEW;
       screenDirty = true;
@@ -6318,6 +7572,121 @@ bool isPlausibleCsvBeerTemperature(float value) {
   return !isnan(value) && !isinf(value) && value > -5.0f && value < 60.0f;
 }
 
+bool isFermentationCsvDataPoint(const payload_t& data) {
+  return !isnan(data.density) && !isinf(data.density) &&
+         data.density > 0.900f && data.density < 1.300f &&
+         !isnan(data.angle) && !isinf(data.angle);
+}
+
+bool isPostPackageCsvTemperaturePoint(const payload_t& data, uint32_t epoch_s) {
+  uint32_t startEpoch = postPackageTemperatureStartEpoch();
+  if (!isEpochValid(startEpoch) || !isEpochValid(epoch_s) || epoch_s < startEpoch) return false;
+  if (isFermentationCsvDataPoint(data)) return false;
+  return !isnan(data.temperature) && !isinf(data.temperature) &&
+         data.temperature > -5.0f && data.temperature < 60.0f;
+}
+
+bool parsePostPackageCsvTemperaturePoint(const char* line, payload_t* data, uint32_t* epoch_s,
+                                         uint8_t* battery_percent, float* temperatureOut) {
+  if (!line || !data || !epoch_s || !battery_percent || !temperatureOut) return false;
+  if (!parseCSVDataLine(line, data, epoch_s, battery_percent)) return false;
+  uint32_t startEpoch = postPackageTemperatureStartEpoch();
+  if (!isEpochValid(startEpoch) || !isEpochValid(*epoch_s) || *epoch_s < startEpoch) return false;
+  if (isFermentationCsvDataPoint(*data)) return false;
+
+  float airTemperature = NAN;
+  if (parseCsvFloatField(line, 14, &airTemperature) &&
+      airTemperature > -5.0f && airTemperature < 60.0f) {
+    *temperatureOut = airTemperature;
+    return true;
+  }
+
+  if (!isnan(data->temperature) && !isinf(data->temperature) &&
+      data->temperature > -5.0f && data->temperature < 60.0f) {
+    *temperatureOut = data->temperature;
+    return true;
+  }
+  return false;
+}
+
+void clearPostPackageTemperatureGraphData() {
+  postPackageTempGraphCount = 0;
+  postPackageTempGraphLoadAttempted = false;
+  postPackageTempGraphLoadedFile[0] = '\0';
+}
+
+void appendPostPackageTemperatureGraphData(uint32_t epoch_s, float temperatureC) {
+  if (postPackageTempGraphCount >= MAX_DATA_POINTS) {
+    for (int i = 1; i < MAX_DATA_POINTS; i++) {
+      postPackageTempGraphEpochs[i - 1] = postPackageTempGraphEpochs[i];
+      postPackageTempGraphValues[i - 1] = postPackageTempGraphValues[i];
+    }
+    postPackageTempGraphCount = MAX_DATA_POINTS - 1;
+  }
+  postPackageTempGraphEpochs[postPackageTempGraphCount] = epoch_s;
+  postPackageTempGraphValues[postPackageTempGraphCount] = temperatureC;
+  postPackageTempGraphCount++;
+}
+
+bool loadPostPackageTemperatureGraphData() {
+  #if !SD_ENABLED
+    return false;
+  #endif
+
+  postPackageTempGraphLoadAttempted = true;
+  postPackageTempGraphCount = 0;
+  postPackageTempGraphLoadedFile[0] = '\0';
+  if (!brewProfileLoaded || !fermentationFileOpen || currentFermentationFile[0] == '\0') return false;
+
+  File file = SD.open(currentFermentationFile, FILE_READ);
+  if (!file) return false;
+
+  static char line[CSV_LINE_BUFFER_SIZE];
+  int eligibleCount = 0;
+  int lineNum = 0;
+  while (file.available()) {
+    int bytesRead = file.readBytesUntil('\n', line, sizeof(line) - 1);
+    line[bytesRead] = '\0';
+    lineNum++;
+    if (lineNum == 1 || line[0] == '#') continue;
+    payload_t data = {0};
+    uint32_t epoch_s = 0;
+    uint8_t battery_percent = 0;
+    float temperatureC = NAN;
+    if (parsePostPackageCsvTemperaturePoint(line, &data, &epoch_s, &battery_percent, &temperatureC)) {
+      eligibleCount++;
+    }
+  }
+
+  int sampleStep = eligibleCount > MAX_DATA_POINTS
+    ? (eligibleCount + MAX_DATA_POINTS - 1) / MAX_DATA_POINTS
+    : 1;
+  file.seek(0);
+  lineNum = 0;
+  int eligibleIndex = 0;
+  while (file.available()) {
+    int bytesRead = file.readBytesUntil('\n', line, sizeof(line) - 1);
+    line[bytesRead] = '\0';
+    lineNum++;
+    if (lineNum == 1 || line[0] == '#') continue;
+    payload_t data = {0};
+    uint32_t epoch_s = 0;
+    uint8_t battery_percent = 0;
+    float temperatureC = NAN;
+    if (!parsePostPackageCsvTemperaturePoint(line, &data, &epoch_s, &battery_percent, &temperatureC)) {
+      continue;
+    }
+    if (eligibleIndex % sampleStep == 0 || eligibleIndex == eligibleCount - 1) {
+      appendPostPackageTemperatureGraphData(epoch_s, temperatureC);
+    }
+    eligibleIndex++;
+  }
+  file.close();
+  strncpy(postPackageTempGraphLoadedFile, currentFermentationFile, sizeof(postPackageTempGraphLoadedFile) - 1);
+  postPackageTempGraphLoadedFile[sizeof(postPackageTempGraphLoadedFile) - 1] = '\0';
+  return postPackageTempGraphCount > 0;
+}
+
 bool parseCSVDataLine(const char* line, payload_t* data, uint32_t* epoch_s, uint8_t* battery_percent) {
   char timestampText[24] = {0};
   unsigned long parsedEpoch = 0;
@@ -6408,11 +7777,15 @@ bool loadHistoricalDataFromCSV(const char* filename,
     }
     
     if (strlen(line) > 0) {
-      totalDataLines++;
       payload_t data = {0};
       uint32_t epoch_s = 0;
       uint8_t battery_percent = 0;
-      if (parseCSVDataLine(line, &data, &epoch_s, &battery_percent) && isEpochValid(epoch_s)) {
+      if (parseCSVDataLine(line, &data, &epoch_s, &battery_percent) &&
+          isFermentationCsvDataPoint(data)) {
+        totalDataLines++;
+        if (!isEpochValid(epoch_s)) {
+          continue;
+        }
         newestEpoch = epoch_s;
         if (!isEpochValid(oldestEpoch)) oldestEpoch = epoch_s;
         if (isEpochValid(batchStartForScan)) {
@@ -6535,6 +7908,9 @@ bool loadHistoricalDataFromCSV(const char* filename,
     if (!parseCSVDataLine(line, &data, &epoch_s, &battery_percent)) {
       continue;
     }
+    if (!isFermentationCsvDataPoint(data)) {
+      continue;
+    }
     if (filterByBatchStart && isEpochValid(epoch_s) && epoch_s < batchStartEpoch) {
       continue;
     }
@@ -6571,6 +7947,11 @@ bool loadHistoricalDataFromCSV(const char* filename,
     bool parsed = parseCSVDataLine(line, &data, &epoch_s, &battery_percent);
     
     if (parsed) {
+      if (!isFermentationCsvDataPoint(data)) {
+        timeFilteredCount++;
+        continue;
+      }
+
       if (filterByBatchStart && isEpochValid(epoch_s) && epoch_s < batchStartEpoch) {
         timeFilteredCount++;
         batchFilteredCount++;
@@ -6906,6 +8287,11 @@ void completeBrewWizard() {
   activeBrewProfile.ogVerified = false;
   activeBrewProfile.ogNeedsChoice = false;
   BatchActionEngine::applyStyleDefaults(&activeBrewProfile);
+  if (!activeBrewProfile.temperatureProfile.enabled) {
+    TemperatureProfileEngine::generateForProfile(&activeBrewProfile);
+  } else {
+    TemperatureProfileEngine::rebuildPhaseList(&activeBrewProfile.temperatureProfile);
+  }
   brewProfileLoaded = true;
   ogVerificationPending = false;
   targetCurveAvailable = false;
@@ -7156,7 +8542,7 @@ void updateFermentationAssistant(payload_t data, uint32_t epoch_s) {
   originalGravity = activeBrewProfile.effectiveOG;
   ogCaptured = activeBrewProfile.effectiveOG > 1.0f;
 
-  FermentationPhase phase = fermentationStateMachine.update(
+FermentationPhase phase = fermentationStateMachine.update(
     activeBrewProfile,
     data.density,
     fermentationMetrics.expectedFinalGravity,
@@ -7164,6 +8550,7 @@ void updateFermentationAssistant(payload_t data, uint32_t epoch_s) {
     fermentationMetrics.gravityDeltaPerHour,
     data.temperature,
     epoch_s);
+    
   if (activeBrewProfile.fermentationStartAt == 0 &&
       (phase == FERMENTATION_ACTIVE ||
        phase == FERMENTATION_DIACETYL_REST_READY ||
@@ -7172,6 +8559,20 @@ void updateFermentationAssistant(payload_t data, uint32_t epoch_s) {
       isEpochValid(epoch_s) && isEpochValid(activeBrewProfile.createdAt) &&
       epoch_s >= activeBrewProfile.createdAt) {
     activeBrewProfile.fermentationStartAt = epoch_s;
+    if (mountSDTemporarily()) {
+      BrewProfileStore::save(activeBrewProfile);
+      TargetCurveGenerator::generateAndSave(activeBrewProfile);
+      dismountSD();
+    }
+  }
+
+  // NEU: Automatisches Auslösen des Diacetyl-Rests, sobald die State Machine "READY" meldet
+  if (phase == FERMENTATION_DIACETYL_REST_READY && 
+      !activeBrewProfile.dRestDone && 
+      !activeBrewProfile.dRestSkipped) {
+    activeBrewProfile.dRestDone = true;
+    activeBrewProfile.dRestStartedAt = epoch_s;
+    
     if (mountSDTemporarily()) {
       BrewProfileStore::save(activeBrewProfile);
       TargetCurveGenerator::generateAndSave(activeBrewProfile);
@@ -7199,6 +8600,14 @@ void updateFermentationAssistant(payload_t data, uint32_t epoch_s) {
     data.density,
     smoothedGravityDeltaPerHour(9),
     epoch_s);
+  if (autoStartColdCrashIfPlugReady(epoch_s)) {
+    currentBatchAction = evaluateBatchActionWithHysteresis(
+      phase,
+      fermentationMetrics.currentAttenuation,
+      data.density,
+      smoothedGravityDeltaPerHour(9),
+      epoch_s);
+  }
   if ((floatZeroCalCommandPending || floatZeroCalAwaitingConfirmation) &&
       currentBatchAction.type == ACTION_FLOAT_ZERO_CAL) {
     currentBatchAction.requiresChoice = false;
@@ -7243,6 +8652,14 @@ void refreshCurrentBatchAction(float currentSG, unsigned long nowEpoch) {
     currentSG,
     smoothedGravityDeltaPerHour(9),
     nowEpoch);
+  if (autoStartColdCrashIfPlugReady(nowEpoch)) {
+    currentBatchAction = evaluateBatchActionWithHysteresis(
+      fermentationStateMachine.phase(),
+      fermentationMetrics.currentAttenuation,
+      currentSG,
+      smoothedGravityDeltaPerHour(9),
+      nowEpoch);
+  }
   if ((floatZeroCalCommandPending || floatZeroCalAwaitingConfirmation) &&
       currentBatchAction.type == ACTION_FLOAT_ZERO_CAL) {
     currentBatchAction.requiresChoice = false;
@@ -7279,6 +8696,41 @@ BatchAction evaluateBatchActionWithHysteresis(FermentationPhase phase, float att
     return makeLatchedDryHopAction(currentSG);
   }
   return nextAction;
+}
+
+bool autoStartColdCrashIfPlugReady(unsigned long nowEpoch) {
+  if (!brewProfileLoaded) return false;
+  if (currentBatchAction.type != ACTION_COLD_CRASH || !currentBatchAction.requiresChoice) return false;
+  if (!activeBrewProfile.temperatureProfile.enabled || !activeBrewProfile.plugControlEnabled) return false;
+  if (activeBrewProfile.coldCrashDone || activeBrewProfile.coldCrashSkipped) return false;
+  if (!plugMacKnown || !hasFreshPlugStatus()) return false;
+
+  if (!isEpochValid(nowEpoch)) {
+    nowEpoch = getCurrentEpoch();
+  }
+  if (!isEpochValid(nowEpoch)) {
+    nowEpoch = latestPlugStatusValid && latestPlugStatus.uptime_s > 0
+      ? latestPlugStatus.uptime_s
+      : millis() / 1000UL;
+  }
+
+  if (!BatchActionEngine::applyDone(&activeBrewProfile, ACTION_COLD_CRASH, nowEpoch)) {
+    return false;
+  }
+
+  if (mountSDTemporarily()) {
+    BrewProfileStore::save(activeBrewProfile);
+    TargetCurveGenerator::generateAndSave(activeBrewProfile);
+    BrewProfileStore::appendBatchEvent(activeBrewProfile.batchId, nowEpoch,
+                                       "COLD_CRASH_AUTO_STARTED",
+                                       "Plug target switched to cold crash",
+                                       activeBrewProfile.temperatureProfile.advanced.crashC);
+    dismountSD();
+  }
+
+  lastPlugCommandMs = 0;
+  LOG_INFOLN("Cold crash auto-started for Plug temperature profile");
+  return true;
 }
 
 bool shouldKeepDryHopActionLatched(const BatchAction& previousAction,
@@ -7744,13 +9196,19 @@ bool logDataToSD(payload_t data, uint32_t epoch_s) {
   const unsigned long SD_TIMEOUT = 5000; // 5 second timeout
   
   // Write CSV data
+  bool postPackageLog = isPostPackageTemperaturePhase() &&
+                        data.sequence_id == 0 &&
+                        isnan(data.angle) &&
+                        isnan(data.density);
   uint8_t batteryPercent = calculateBatteryPercentage(data.battery_voltage);
   char timestamp[24];
   formatTimestamp(epoch_s, timestamp, sizeof(timestamp));
-  float floatTemperatureForLog = (!isnan(latestFloatTemperatureC) && !isinf(latestFloatTemperatureC))
+  float floatTemperatureForLog = postPackageLog
+    ? NAN
+    : ((!isnan(latestFloatTemperatureC) && !isinf(latestFloatTemperatureC))
     ? latestFloatTemperatureC
-    : data.temperature;
-  float plugBeerTemperatureForLog = hasValidPlugBeerTemperature() ? latestPlugStatus.beer_temp_c : NAN;
+    : data.temperature);
+  float plugBeerTemperatureForLog = postPackageLog ? NAN : currentPlugBeerTemperatureC();
   float plugAirTemperatureForLog = hasValidPlugAirTemperature() ? latestPlugStatus.air_temp_c : NAN;
   bool freshPlugStatusForLog = hasFreshPlugStatus();
   float plugBeerTargetForLog = freshPlugStatusForLog ? latestPlugStatus.beer_target_c : NAN;
@@ -7764,12 +9222,19 @@ bool logDataToSD(payload_t data, uint32_t epoch_s) {
   float plugBeerRateForLog = freshPlugStatusForLog ? latestPlugStatus.beer_rate_c_per_h : NAN;
   float plugKpForLog = freshPlugStatusForLog ? latestPlugStatus.controller_kp : NAN;
   float plugDBrakeForLog = freshPlugStatusForLog ? latestPlugStatus.controller_d_brake_h : NAN;
+  float plugPOffsetForLog = freshPlugStatusForLog && latestPlugComponentsValid ? latestPlugPComponentC : NAN;
+  float plugIOffsetForLog = freshPlugStatusForLog && latestPlugComponentsValid ? latestPlugIComponentC : NAN;
+  float plugDOffsetForLog = freshPlugStatusForLog && latestPlugComponentsValid ? latestPlugDComponentC : NAN;
+  float plugRampTrimForLog = freshPlugStatusForLog && latestPlugComponentsValid ? latestPlugRampTrimC : NAN;
+  float plugRampITrimForLog = freshPlugStatusForLog && latestPlugComponentsValid ? latestPlugRampITrimC : NAN;
+  float plugRampRateErrorForLog = freshPlugStatusForLog && latestPlugComponentsValid ? latestPlugRampRateErrorKPerHour : NAN;
+  float plugBeerRateRawForLog = freshPlugStatusForLog && latestPlugComponentsValid ? latestPlugBeerRateRawCPerHour : NAN;
   LOG_VERBOSE("Writing to SD - SG:%.4f, Temp:%.2f, Batt:%.2fV\n", 
                 data.density, data.temperature, data.battery_voltage);
-  int bytesWritten = file.printf("%s,%lu,%lu,%.2f,%.4f,%.2f,%.2f,%d,%s,%.2f,%.2f,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%u,%.1f,%u,%.2f,%.2f,%.3f,%.2f,%.2f\n",
+  int bytesWritten = file.printf("%s,%lu,%lu,%.2f,%.4f,%.2f,%.2f,%d,%s,%.2f,%.2f,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%u,%.1f,%u,%.2f,%.2f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f\n",
              timestamp, (unsigned long)epoch_s, (unsigned long)data.uptime_s, data.angle, data.density,
              data.temperature, data.battery_voltage, batteryPercent,
-             fermentationStateMachine.phaseName(),
+             postPackageLog ? currentDisplayPhaseName(epoch_s) : fermentationStateMachine.phaseName(),
              fermentationMetrics.currentAttenuation,
              fermentationMetrics.estimatedABV,
              currentRecommendation.code,
@@ -7786,7 +9251,14 @@ bool logDataToSD(payload_t data, uint32_t epoch_s) {
              plugPiTnForLog,
              plugBeerRateForLog,
              plugKpForLog,
-             plugDBrakeForLog);
+             plugDBrakeForLog,
+             plugPOffsetForLog,
+             plugIOffsetForLog,
+             plugDOffsetForLog,
+             plugRampTrimForLog,
+             plugRampITrimForLog,
+             plugRampRateErrorForLog,
+             plugBeerRateRawForLog);
   
   // Check for timeout
   if (millis() - startTime > SD_TIMEOUT) {
@@ -7828,6 +9300,54 @@ bool logDataToSD(payload_t data, uint32_t epoch_s) {
   } else {
     LOG_ERRORLN("Failed to write data to SD file");
     return false;
+  }
+}
+
+void logPostPackagingTemperatureIfDue() {
+  #if !SD_ENABLED
+    return;
+  #endif
+
+  if (!isPostPackageTemperaturePhase()) return;
+  if (!fermentationFileOpen || strlen(currentFermentationFile) == 0) return;
+  if (!hasFreshPlugStatus() || !hasValidPlugAirTemperature()) return;
+
+  uint32_t nowMs = millis();
+  if (lastPostPackageTempLogMs != 0 &&
+      nowMs - lastPostPackageTempLogMs < POST_PACKAGE_TEMP_LOG_INTERVAL_MS) {
+    return;
+  }
+
+  unsigned long timeSinceLastTouch = nowMs - lastTouchTime;
+  unsigned long timeSinceLastSDWrite = nowMs - lastSDWrite;
+  if (timeSinceLastTouch <= TOUCH_TIMEOUT || timeSinceLastSDWrite <= SD_WRITE_INTERVAL) {
+    return;
+  }
+
+  uint32_t epoch = getCurrentEpoch();
+  if (!isEpochValid(epoch)) {
+    epoch = latestPlugStatusValid && latestPlugStatus.uptime_s > 0
+      ? latestPlugStatus.uptime_s
+      : nowMs / 1000UL;
+  }
+
+  payload_t tempOnly = {};
+  tempOnly.version = SG_PROTOCOL_VERSION;
+  tempOnly.uptime_s = nowMs / 1000UL;
+  tempOnly.sequence_id = 0;
+  tempOnly.angle = NAN;
+  tempOnly.density = NAN;
+  tempOnly.temperature = latestPlugStatus.air_temp_c;
+  tempOnly.battery_voltage = 0.0f;
+
+  if (logDataToSD(tempOnly, epoch)) {
+    lastPostPackageTempLogMs = nowMs;
+    lastSDWrite = nowMs;
+    appendPostPackageTemperatureGraphData(epoch, tempOnly.temperature);
+    topbarDirty = true;
+    LOG_VERBOSE("Post-package temperature logged: air %.2f C target %.2f C\n",
+                latestPlugStatus.air_temp_c,
+                hasFreshPlugStatus() ? latestPlugStatus.beer_target_c : NAN);
   }
 }
 
@@ -7957,6 +9477,7 @@ uint8_t calculateBatteryPercentage(float voltage) {
 
 bool getLatestDisplayBatteryVoltage(float* voltageOut) {
   if (voltageOut == NULL) return false;
+  if (isFloatInactiveAfterPackaging()) return false;
 
   if (latestFloatDataValid &&
       latestFloatData.battery_voltage >= 2.5f &&
@@ -7995,6 +9516,15 @@ bool shouldShowSdWarning() {
 }
 
 void drawSdWarningTopbar() {
+  if (shouldShowFloatStillActiveWarning()) {
+    const char* label = "FLOAT";
+    int w = 74;
+    int x = UI_W - MARGIN - w;
+    int y = TOPBAR_H / 2 - 12;
+    tft.fillRoundRect(x, y, w, 24, 4, uiColorError);
+    uiTextCenter(x, y + 3, w, 16, label, FONT_SIZE_XS, uiColorPrimaryText);
+  }
+
   if (!shouldShowSdWarning()) return;
 
   int x = UI_W - MARGIN - 24 - 86;
@@ -8052,13 +9582,15 @@ void drawDetailRow(int* y, const char* label, const char* value) {
 }
 
 void drawDetailSectionAt(int x, int* y, int w, const char* title) {
+  constexpr int DETAIL_VALUE_TOP_FROM_BASELINE = 13;
+  constexpr int DETAIL_SECTION_ROW_GAP = 5;
   tft.setTextColor(uiColorInfo);
   tft.setFreeFont(FONT_SIZE_XS);
   tft.setCursor(x, *y);
   tft.print(title);
   *y += 8;
   tft.drawFastHLine(x, *y, w, uiColorBorder);
-  *y += 4;
+  *y += DETAIL_VALUE_TOP_FROM_BASELINE + DETAIL_SECTION_ROW_GAP;
 }
 
 void drawDetailRowAt(int x, int* y, int w, const char* label, const char* value) {
@@ -8272,18 +9804,18 @@ void drawMoreView() {
   drawViewTopbar("More");
   
   int contentY = TOPBAR_H + MARGIN;
-  int cardH = (UI_H - TOPBAR_H - NAV_H - MARGIN * 2 - GAP * 3) / 4;
+  int cardH = (UI_H - TOPBAR_H - NAV_H - MARGIN * 2 - GAP * 4) / 5;
   int contentW = UI_W - MARGIN * 2;
   int cardW = (contentW - GAP) / 2;
   int leftX = MARGIN;
   int rightX = MARGIN + cardW + GAP;
   
-  // 1) Details
+  // 1) Diagnostic
   uiCard(leftX, contentY, cardW, cardH, CARD_RADIUS);
   tft.setTextColor(uiColorTextPrimary);
   tft.setFreeFont(FONT_SIZE_SM);
   tft.setCursor(leftX + 12, contentY + cardH / 2 + 8);
-  tft.print("Details >");
+  tft.print("Diagnostic >");
 
   uiCard(rightX, contentY, cardW, cardH, CARD_RADIUS);
   tft.setTextColor(uiColorTextPrimary);
@@ -8320,7 +9852,7 @@ void drawMoreView() {
   tft.setCursor(rightX + 12, contentY + cardH / 2 + 8);
   tft.print("Manage Yeast >");
   
-  // 4) Manage Brew / Reboot
+  // 4) Manage Brew / Brightness
   contentY += cardH + GAP;
   uiCard(leftX, contentY, cardW, cardH, CARD_RADIUS);
   tft.setTextColor(uiColorTextPrimary);
@@ -8332,77 +9864,103 @@ void drawMoreView() {
   tft.setTextColor(uiColorTextPrimary);
   tft.setFreeFont(FONT_SIZE_SM);
   tft.setCursor(rightX + 12, contentY + cardH / 2 + 8);
+  const char* blLabels[] = {"Low", "Mid", "High", "Max"};
+  char blText[24];
+  snprintf(blText, sizeof(blText), "Brightness %s", blLabels[backlightLevel]);
+  tft.print(blText);
+
+  // 5) Reboot / OTA
+  contentY += cardH + GAP;
+  uiCard(leftX, contentY, cardW, cardH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(leftX + 12, contentY + cardH / 2 + 8);
   tft.print("Reboot >");
+
+  uiCard(rightX, contentY, cardW, cardH, CARD_RADIUS);
+  tft.setTextColor(uiColorTextPrimary);
+  tft.setFreeFont(FONT_SIZE_SM);
+  tft.setCursor(rightX + 12, contentY + cardH / 2 + 8);
+  tft.print("OTA Update >");
   
   uiDrawBottomNav(TAB_MORE);
 }
 
-// Live Details view - structured cards with KV data
+// Diagnostic view - structured cards with KV data
 void drawLiveDetailsView() {
   tft.fillScreen(uiColorBackground);
-  drawViewTopbar("Details");
+  drawViewTopbar("Diagnostic");
 
   int contentY = TOPBAR_H + MARGIN;
   int contentW = UI_W - MARGIN * 2;
   int navTop = UI_H - NAV_H;
   payload_t latest = {0};
   bool hasData = displayDataCount > 0;
+  bool floatOff = isFloatInactiveAfterPackaging();
   uint32_t latestEpoch = 0;
   if (hasData) {
     latest = displayDataBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
     latestEpoch = displayTimestampBuffer[(displayDataIndex - 1 + MAX_DATA_POINTS) % MAX_DATA_POINTS];
   }
-
-  uiCard(MARGIN, contentY, contentW, 46, CARD_RADIUS);
-  tft.setTextColor(uiColorTextPrimary);
-  tft.setFreeFont(FONT_SIZE_MD);
-  tft.setCursor(MARGIN + 10, contentY + 30);
-  if (hasData) {
-    tft.printf("SG: %.3f", latest.density);
-  } else {
-    tft.print("SG: --");
+  payload_t floatDiag = latest;
+  uint32_t floatDiagEpoch = latestEpoch;
+  bool hasFloatDiag = hasData;
+  if (floatOff && lastPostPackageFloatPacketValid) {
+    floatDiag = lastPostPackageFloatPacket;
+    floatDiagEpoch = lastPostPackageFloatPacketEpoch;
+    hasFloatDiag = true;
   }
 
   char value[48];
-  tft.setTextColor(uiColorTextSecondary);
-  tft.setFreeFont(FONT_SIZE_XS);
-  tft.setCursor(MARGIN + 166, contentY + 16);
-  if (brewProfileLoaded) {
-    char phase[34];
-    uiEllipsize(fermentationStateMachine.phaseName(), 180, phase, sizeof(phase));
-    tft.print(phase);
-  } else {
-    tft.print("No active batch");
-  }
-  tft.setCursor(MARGIN + 166, contentY + 34);
-  if (isEpochValid(latestEpoch)) {
+  char lastText[28];
+  if (isEpochValid(floatDiagEpoch)) {
     char timestamp[24];
-    formatTimestamp(latestEpoch, timestamp, sizeof(timestamp));
-    tft.printf("Last %s", timestamp + 11);
+    formatTimestamp(floatDiagEpoch, timestamp, sizeof(timestamp));
+    snprintf(lastText, sizeof(lastText), "%s", timestamp + 11);
+  } else if (floatOff && lastPostPackageFloatPacketMs > 0) {
+    unsigned long secs = (millis() - lastPostPackageFloatPacketMs) / 1000;
+    snprintf(lastText, sizeof(lastText), "%lus ago", secs);
   } else {
     unsigned long secs = (millis() - lastUpdate) / 1000;
-    tft.printf("Last %lus ago", secs);
+    snprintf(lastText, sizeof(lastText), "%lus ago", secs);
   }
 
   int leftX = MARGIN;
-  int colY = contentY + 61;
+  int colY = contentY + 12;
   int colW = (contentW - GAP) / 2;
   int rightX = MARGIN + colW + GAP;
   int leftY = colY;
   int rightY = colY;
 
-  drawDetailSectionAt(leftX, &leftY, colW, "FERMENTATION");
-  snprintf(value, sizeof(value), "%s", brewProfileLoaded ? fermentationStateMachine.phaseName() : "--");
-  drawDetailRowAt(leftX, &leftY, colW, "Phase", value);
-  snprintf(value, sizeof(value), "%.3f / %.3f", brewProfileLoaded ? activeBrewProfile.effectiveOG : 0.0f,
-           brewProfileLoaded ? activeBrewProfile.expectedFinalGravity : 0.0f);
-  drawDetailRowAt(leftX, &leftY, colW, "OG/FG", brewProfileLoaded ? value : "--");
-  snprintf(value, sizeof(value), "%.0f%% / %.1f%%", fermentationMetrics.currentAttenuation, fermentationMetrics.estimatedABV);
-  drawDetailRowAt(leftX, &leftY, colW, "Att/ABV", hasData ? value : "--");
-  char eta[16];
-  if (currentETA.valid) formatDurationShort(currentETA.secondsToPackaging, eta, sizeof(eta));
-  else strcpy(eta, "--");
-  drawDetailRowAt(leftX, &leftY, colW, "ETA", eta);
+  drawDetailSectionAt(leftX, &leftY, colW, "FLOAT");
+  if (floatOff) {
+    drawDetailRowAt(leftX, &leftY, colW, "State", shouldShowFloatStillActiveWarning() ? "Still active" : "Float off");
+    drawDetailRowAt(leftX, &leftY, colW, "Last seen", hasFloatDiag ? lastText : "--");
+    drawDetailRowAt(leftX, &leftY, colW, "Temp/Ang", "Ignored");
+    if (hasFloatDiag && floatDiag.battery_voltage >= 2.5f && floatDiag.battery_voltage <= 4.5f) {
+      uint8_t battPercent = calculateBatteryPercentage(floatDiag.battery_voltage);
+      snprintf(value, sizeof(value), "%.2fV %d%%", floatDiag.battery_voltage, battPercent);
+      drawDetailRowAt(leftX, &leftY, colW, "Batt", value);
+      snprintf(value, sizeof(value), "#%d", floatDiag.sequence_id);
+      drawDetailRowAt(leftX, &leftY, colW, "Seq", value);
+    } else {
+      drawDetailRowAt(leftX, &leftY, colW, "Batt", "No diag");
+      drawDetailRowAt(leftX, &leftY, colW, "Seq", "--");
+    }
+  } else {
+    float floatTemp = !isnan(latestFloatTemperatureC) && !isinf(latestFloatTemperatureC)
+      ? latestFloatTemperatureC
+      : latestDisplayedTemperatureC();
+    snprintf(value, sizeof(value), "%.1f C / %.1f deg", floatTemp, latest.angle);
+    drawDetailRowAt(leftX, &leftY, colW, "Temp/Ang", hasData ? value : "--");
+    drawDetailRowAt(leftX, &leftY, colW, "Last seen", hasData ? lastText : "--");
+    uint8_t battPercent = hasData ? calculateBatteryPercentage(latest.battery_voltage) : 0;
+    snprintf(value, sizeof(value), "%.2fV %d%%", latest.battery_voltage, battPercent);
+    drawDetailRowAt(leftX, &leftY, colW, "Batt", hasData ? value : "--");
+    snprintf(value, sizeof(value), "#%d", hasData ? latest.sequence_id : 0);
+    drawDetailRowAt(leftX, &leftY, colW, "Seq", hasData ? value : "--");
+  }
+
   leftY += 4;
   drawDetailSectionAt(leftX, &leftY, colW, "SYSTEM");
   snprintf(value, sizeof(value), "%s %d/%d", fermentationFileOpen ? "Log OK" : "Log ERR", bufferedCount, MAX_DATA_BUFFER);
@@ -8416,39 +9974,54 @@ void drawLiveDetailsView() {
   snprintf(value, sizeof(value), "%d dBm", lastRSSI);
   drawDetailRowAt(leftX, &leftY, colW, "RSSI", rssiAvailable ? value : "--");
 
-  drawDetailSectionAt(rightX, &rightY, colW, "FLOAT");
-  float floatTemp = !isnan(latestFloatTemperatureC) && !isinf(latestFloatTemperatureC)
-    ? latestFloatTemperatureC
-    : latestDisplayedTemperatureC();
-  snprintf(value, sizeof(value), "%.1f C / %.1f deg", floatTemp, latest.angle);
-  drawDetailRowAt(rightX, &rightY, colW, "Temp/Ang", hasData ? value : "--");
-  uint8_t battPercent = hasData ? calculateBatteryPercentage(latest.battery_voltage) : 0;
-  snprintf(value, sizeof(value), "%.2fV %d%% #%d", latest.battery_voltage, battPercent, hasData ? latest.sequence_id : 0);
-  drawDetailRowAt(rightX, &rightY, colW, "Batt/Seq", hasData ? value : "--");
-
-  rightY += 4;
   drawDetailSectionAt(rightX, &rightY, colW, "PLUG");
   bool freshPlug = hasFreshPlugStatus();
-  if (hasValidPlugBeerTemperature()) snprintf(value, sizeof(value), "%.1f C", latestPlugStatus.beer_temp_c);
+  float plugBeerC = currentPlugBeerTemperatureC();
+  char beerText[14];
+  char airText[14];
+  if (!isnan(plugBeerC) && !isinf(plugBeerC)) {
+    snprintf(beerText, sizeof(beerText), plugBeerTemperatureMissCount > 0 ? "~%.1f" : "%.1f", plugBeerC);
+  } else {
+    strcpy(beerText, "--");
+  }
+  if (hasValidPlugAirTemperature()) snprintf(airText, sizeof(airText), "%.1f", latestPlugStatus.air_temp_c);
+  else strcpy(airText, "--");
+  snprintf(value, sizeof(value), "%s C", beerText);
+  drawDetailRowAt(rightX, &rightY, colW, "Beer sens", value);
+  snprintf(value, sizeof(value), "%s C", airText);
+  drawDetailRowAt(rightX, &rightY, colW, "Air sens", value);
+  if (freshPlug) snprintf(value, sizeof(value), "%.1f C", latestPlugStatus.beer_target_c);
   else strcpy(value, "--");
-  drawDetailRowAt(rightX, &rightY, colW, "Beer", value);
-  if (hasValidPlugAirTemperature()) snprintf(value, sizeof(value), "%.1f C", latestPlugStatus.air_temp_c);
+  drawDetailRowAt(rightX, &rightY, colW, "Beer tgt", value);
+  if (freshPlug) snprintf(value, sizeof(value), "%.1f C", latestPlugStatus.air_target_c);
   else strcpy(value, "--");
-  drawDetailRowAt(rightX, &rightY, colW, "Air", value);
-  if (freshPlug) snprintf(value, sizeof(value), "%.1f/%.1f C", latestPlugStatus.beer_target_c, latestPlugStatus.air_target_c);
-  else strcpy(value, "--");
-  drawDetailRowAt(rightX, &rightY, colW, "Target", value);
+  drawDetailRowAt(rightX, &rightY, colW, "Air tgt", value);
   if (freshPlug) snprintf(value, sizeof(value), "%.2f/%.2f K/h",
                           latestPlugStatus.ramp_k_per_h,
                           latestPlugStatus.beer_rate_c_per_h);
   else strcpy(value, "--");
-  drawDetailRowAt(rightX, &rightY, colW, "Ramp S/I", value);
-  if (freshPlug) snprintf(value, sizeof(value), "P%.2f I%.2fh D%.1f",
-                          latestPlugStatus.controller_kp,
-                          latestPlugStatus.pi_tn_hours,
-                          latestPlugStatus.controller_d_brake_h);
+  drawDetailRowAt(rightX, &rightY, colW, "Rate S/A", value);
+  if (freshPlug && latestPlugComponentsValid) snprintf(value, sizeof(value), "%+.1f %+.1f %+.1f",
+                                                       latestPlugPComponentC,
+                                                       latestPlugIComponentC,
+                                                       latestPlugDComponentC);
+  else if (freshPlug) snprintf(value, sizeof(value), "P%.2f I%.2fh D%.1f",
+                               latestPlugStatus.controller_kp,
+                               latestPlugStatus.pi_tn_hours,
+                               latestPlugStatus.controller_d_brake_h);
   else strcpy(value, "--");
-  drawDetailRowAt(rightX, &rightY, colW, "Ctrl", value);
+  drawDetailRowAt(rightX, &rightY, colW, freshPlug && latestPlugComponentsValid ? "P/I/D" : "Ctrl", value);
+  if (freshPlug && latestPlugComponentsValid) snprintf(value, sizeof(value), "%+.2f K/h",
+                                                       latestPlugRampRateErrorKPerHour);
+  else strcpy(value, "--");
+  drawDetailRowAt(rightX, &rightY, colW, "Ramp err", value);
+  if (freshPlug && latestPlugComponentsValid) snprintf(value, sizeof(value), "%+.1f K",
+                                                       latestPlugRampTrimC);
+  else strcpy(value, "--");
+  drawDetailRowAt(rightX, &rightY, colW, "Ramp trim", value);
+  if (freshPlug && latestPlugComponentsValid) snprintf(value, sizeof(value), "%+.1f K", latestPlugStatus.pi_offset_c);
+  else strcpy(value, "--");
+  drawDetailRowAt(rightX, &rightY, colW, "PID Sum", value);
   if (freshPlug) snprintf(value, sizeof(value), "%s %.0f%%", latestPlugStatus.relay_on ? "ON" : "OFF", latestPlugStatus.duty_10m_percent);
   else strcpy(value, "--");
   drawDetailRowAt(rightX, &rightY, colW, "Relay", value);
@@ -8520,9 +10093,8 @@ bool handleLiveDetailsTouch(int x, int y) {
   int contentW = UI_W - MARGIN * 2;
   int colW = (contentW - GAP) / 2;
   int rightX = MARGIN + colW + GAP;
-  int colY = contentY + 61;
-  int plugY = colY + 12 + 28 + 4;
-  int plugH = 12 + 7 * 14;
+  int plugY = contentY + 12;
+  int plugH = 12 + 9 * 14;
   if (x < rightX || x > rightX + colW || y < plugY || y > plugY + plugH) {
     plugDetailsTapCount = 0;
     return false;
@@ -9233,6 +10805,7 @@ static const char* uiTestWizardStepName(BrewWizardStep step) {
     case WIZARD_ATTENUATION: return "Attenuation";
     case WIZARD_DIACETYL: return "Diacetyl Rest";
     case WIZARD_YEAST_BEHAVIOR: return "Yeast Behavior";
+    case WIZARD_TEMP_ADVANCED: return "Brew Profile";
     case WIZARD_REVIEW: return "Review";
     default: return "Done";
   }
@@ -9246,7 +10819,7 @@ const char* uiTestScreenName() {
     case BATTERY_VIEW: return "BatteryScreen";
     case MORE_VIEW: return "MoreScreen";
     case POLY_GRAPH_VIEW: return "PolynomialGraphScreen";
-    case LIVE_DETAILS_VIEW: return "DetailsScreen";
+    case LIVE_DETAILS_VIEW: return "DiagnosticScreen";
     case TEMP_GRAPH_VIEW: return "TemperatureGraphScreen";
     case ANGLE_GRAPH_VIEW: return "AngleGraphScreen";
     case ABV_GRAPH_VIEW: return "ABVGraphScreen";
@@ -9296,11 +10869,16 @@ static int uiTestObjects(UITestObject* objects, int maxObjects) {
         int contentW = UI_W - MARGIN * 2;
         int buttonW = 86;
         int buttonY = actionY + actionH - 32;
-        if (currentBatchAction.type != ACTION_FLOAT_IN_BREW) {
+        bool singleActionButton = currentBatchAction.type == ACTION_FLOAT_IN_BREW ||
+                                  currentBatchAction.type == ACTION_PACKAGE_COMPLETE;
+        if (!singleActionButton) {
           addObj("btn_action_skip", "button", "Skip", MARGIN + contentW - buttonW * 2 - GAP - 10, buttonY, buttonW, 28);
         }
+        const char* doneLabel = "Done";
+        if (currentBatchAction.type == ACTION_FLOAT_ZERO_CAL) doneLabel = "Ready";
+        if (currentBatchAction.type == ACTION_PACKAGE_START) doneLabel = "Start";
         addObj("btn_action_done", "button",
-               currentBatchAction.type == ACTION_FLOAT_ZERO_CAL ? "Ready" : "Done",
+               doneLabel,
                MARGIN + contentW - buttonW - 10, buttonY, buttonW, 28);
       }
     }
@@ -9312,12 +10890,12 @@ static int uiTestObjects(UITestObject* objects, int maxObjects) {
     addObj("btn_confirm", "button", "Use Measured", UI_W - MARGIN - 200, 242, 200, 44);
   } else if (currentMode == MORE_VIEW) {
     int contentY = TOPBAR_H + MARGIN;
-    int cardH = (UI_H - TOPBAR_H - NAV_H - MARGIN * 2 - GAP * 3) / 4;
+    int cardH = (UI_H - TOPBAR_H - NAV_H - MARGIN * 2 - GAP * 4) / 5;
     int contentW = UI_W - MARGIN * 2;
     int cardW = (contentW - GAP) / 2;
     int leftX = MARGIN;
     int rightX = MARGIN + cardW + GAP;
-    addObj("btn_details", "button", "Details", leftX, contentY, cardW, cardH);
+    addObj("btn_details", "button", "Diagnostic", leftX, contentY, cardW, cardH);
     addObj("btn_theme", "button", "Theme", rightX, contentY, cardW, cardH);
     contentY += cardH + GAP;
     addObj("btn_calibration", "button", "Calibration", leftX, contentY, cardW, cardH);
@@ -9325,6 +10903,12 @@ static int uiTestObjects(UITestObject* objects, int maxObjects) {
     contentY += cardH + GAP;
     addObj("btn_brew_wizard", "button", "New Brew", leftX, contentY, cardW, cardH);
     addObj("btn_manage_yeast", "button", "Manage Yeast", rightX, contentY, cardW, cardH);
+    contentY += cardH + GAP;
+    addObj("btn_manage_brew", "button", "Manage Brew", leftX, contentY, cardW, cardH);
+    addObj("btn_brightness", "button", "Brightness", rightX, contentY, cardW, cardH);
+    contentY += cardH + GAP;
+    addObj("btn_reboot", "button", "Reboot", leftX, contentY, cardW, cardH);
+    addObj("btn_ota", "button", "OTA Update", rightX, contentY, cardW, cardH);
   } else if (currentMode == MANAGE_BREW_VIEW) {
     if (managedBatchCount > 0) {
       addObj("btn_prev_batch", "button", "<", MANAGE_BREW_PREV_X, MANAGE_BREW_ROW_Y, MANAGE_BREW_NAV_W, MANAGE_BREW_ROW_H);
@@ -9904,12 +11488,12 @@ bool uiTestRunActionButtonTests(char* buffer, size_t bufferSize) {
   activeBrewProfile.coldCrashStartedAt = nowEpoch;
   BatchAction coldCrashWaiting = BatchActionEngine::evaluate(
     activeBrewProfile, FERMENTATION_READY_TO_PACKAGE, 100.0f, 1.010f, 0.0f, nowEpoch + 3600UL);
-  bool packageWaitsForColdCrash = coldCrashWaiting.type == ACTION_PACKAGE &&
+  bool packageWaitsForColdCrash = coldCrashWaiting.type == ACTION_PACKAGE_START &&
                                   !coldCrashWaiting.requiresChoice &&
                                   coldCrashWaiting.secondsUntilDue > 0;
   BatchAction coldCrashElapsed = BatchActionEngine::evaluate(
     activeBrewProfile, FERMENTATION_READY_TO_PACKAGE, 100.0f, 1.010f, 0.0f, nowEpoch + 49UL * 3600UL);
-  bool packageAfterColdCrash = coldCrashElapsed.type == ACTION_PACKAGE &&
+  bool packageAfterColdCrash = coldCrashElapsed.type == ACTION_PACKAGE_START &&
                                coldCrashElapsed.requiresChoice;
 
   if (mountSDTemporarily()) {

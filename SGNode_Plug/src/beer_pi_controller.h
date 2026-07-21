@@ -19,6 +19,11 @@ struct BeerPiSettings {
   float minAirTargetC = 1.0f;
   float maxAirTargetC = 30.0f;
   float targetStepC = 0.25f;
+  float rampControllerKpHours = 0.8f;
+  float rampControllerTnHours = 3.0f;
+  float maxRampTrimC = 1.0f;
+  float rampFadeDistanceC = 1.0f;
+  float rateFilterSamples = 5.0f;
 };
 
 class BeerPiController {
@@ -37,8 +42,15 @@ class BeerPiController {
   float beerAverageC() const;
   float beerControlC() const;
   float beerRateCPerHour() const;
+  float beerRateRawCPerHour() const;
   float airTargetC() const;
   float offsetC() const;
+  float pOffsetC() const;
+  float iOffsetC() const;
+  float dOffsetC() const;
+  float rampTrimC() const;
+  float rampITrimC() const;
+  float rampRateErrorKPerHour() const;
   float tnHours() const;
   float kp() const;
   float dBrakeHours() const;
@@ -53,11 +65,21 @@ class BeerPiController {
   float integral_ = 0.0f;
   float airTargetC_ = NAN;
   float offsetC_ = 0.0f;
+  float pOffsetC_ = 0.0f;
+  float iOffsetC_ = 0.0f;
+  float dOffsetC_ = 0.0f;
+  float rampIntegralC_ = 0.0f;
+  float rampTrimC_ = 0.0f;
+  float rampRateErrorKPerHour_ = 0.0f;
+  float beerRateRawCPerHour_ = 0.0f;
   float tnHours_ = 0.75f;
   float kp_ = DEFAULT_KP;
   float dBrakeHours_ = DEFAULT_D_BRAKE_HOURS;
   float beerRateCPerHour_ = 0.0f;
+  bool beerRateFilterPrimed_ = false;
   float lastBeerTargetC_ = NAN;
   float lastErrorC_ = NAN;
   uint32_t lastUpdateMs_ = 0;
+
+  float calculateBeerRateCPerHour() const;
 };

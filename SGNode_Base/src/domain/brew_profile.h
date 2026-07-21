@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <FS.h>
+#include "temperature_profile.h"
 
 struct BrewProfile {
   char batchId[24];
@@ -47,6 +48,7 @@ struct BrewProfile {
   bool completed;
   unsigned long completedAt;
   bool dryHopEnabled;
+  float dryHopFgOffset;
   float dryHopTriggerSG;
   unsigned long dryHopContactHours;
   bool dryHopDone;
@@ -61,9 +63,12 @@ struct BrewProfile {
   bool coldCrashDone;
   bool coldCrashSkipped;
   unsigned long coldCrashStartedAt;
+  bool packageStarted;
+  unsigned long packageStartedAt;
   bool packageDone;
   bool packageSkipped;
   unsigned long packagedAt;
+  TemperatureProfile temperatureProfile;
 };
 
 struct YeastPerformanceSummary {

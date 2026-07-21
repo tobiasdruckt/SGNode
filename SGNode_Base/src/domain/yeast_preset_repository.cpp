@@ -237,6 +237,7 @@ void YeastPresetRepository::applyToProfile(const YeastPreset& preset, BrewProfil
   profile->fermentationSpeed[sizeof(profile->fermentationSpeed) - 1] = '\0';
   profile->curveTemplate[sizeof(profile->curveTemplate) - 1] = '\0';
   profile->attenuationSource[sizeof(profile->attenuationSource) - 1] = '\0';
+  TemperatureProfileEngine::generateForProfile(profile);
 }
 
 bool YeastPresetRepository::isCustom(const char* id) {

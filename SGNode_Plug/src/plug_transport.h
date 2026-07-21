@@ -9,7 +9,7 @@ class PlugTransport {
   bool hasCommand() const;
   sg_plug_command_t command() const;
   uint32_t lastCommandMs() const;
-  bool sendStatus(sg_plug_status_t* status);
+  bool sendStatus(sg_plug_status_v2_t* status);
 
  private:
   static void onReceive(uint8_t* mac, uint8_t* data, uint8_t len);

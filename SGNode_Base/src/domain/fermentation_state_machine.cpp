@@ -77,9 +77,9 @@ FermentationPhase FermentationStateMachine::update(const BrewProfile& profile, f
 
   float dRestTrigger = 75.0f;
   if (strcmp(profile.curveTemplate, "lager") == 0 || strstr(profile.yeastCategory, "Lager") != NULL) {
-    dRestTrigger = 72.0f;
+    dRestTrigger = 62.0f;
   } else if (profile.diacetylRestRecommendedByYeast) {
-    dRestTrigger = 78.0f;
+    dRestTrigger = 72.0f;
   }
 
   bool nearFG = currentSG <= expectedFG + 0.004f;

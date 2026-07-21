@@ -70,6 +70,18 @@ Recommendation RecommendationEngine::build(const BrewProfile& profile, Fermentat
                                            float expectedFG, float currentSG, float temperatureC,
                                            float gravityDeltaPerHour, unsigned long elapsedSeconds) {
   Recommendation rec = build(phase, ogVerified, ogWarning, attenuation, expectedFG, currentSG);
+
+  if ((profile.packageStarted || profile.packageDone) && !profile.packageSkipped && !profile.completed) {
+    if (profile.temperatureProfile.enabled) {
+      rec.code = 130;
+      strcpy(rec.message, "Post-package temperature profile active");
+    } else {
+      rec.code = 130;
+      strcpy(rec.message, "Packaged, finish via Manage Brew");
+    }
+    return rec;
+  }
+
   if (!profile.autoModeEnabled) return rec;
 
   if (!ogVerified || ogWarning) return rec;

@@ -54,7 +54,7 @@ uint32_t PlugTransport::lastCommandMs() const {
   return lastCommandMs_;
 }
 
-bool PlugTransport::sendStatus(sg_plug_status_t* status) {
+bool PlugTransport::sendStatus(sg_plug_status_v2_t* status) {
   if (!status) {
     return false;
   }
@@ -62,7 +62,7 @@ bool PlugTransport::sendStatus(sg_plug_status_t* status) {
   status->version = SG_PROTOCOL_VERSION;
   status->sequence_id = ++statusSequence_;
   status->crc = sg_crc16(reinterpret_cast<const uint8_t*>(status),
-                         offsetof(sg_plug_status_t, crc));
+                         offsetof(sg_plug_status_v2_t, crc));
   return esp_now_send(baseMac, reinterpret_cast<uint8_t*>(status), sizeof(*status)) == 0;
 }
 
@@ -106,6 +106,11 @@ void PlugTransport::onReceive(uint8_t* mac, uint8_t* data, uint8_t len) {
       !validFloat(incoming.max_air_target_c, 0.0f, 35.0f) ||
       incoming.max_air_target_c <= incoming.min_air_target_c ||
       !validFloat(incoming.target_step_c, 0.0f, 5.0f) ||
+      !validFloat(incoming.ramp_controller_kp_h, 0.0f, 6.0f) ||
+      !validFloat(incoming.ramp_controller_tn_h, 0.0f, 24.0f) ||
+      !validFloat(incoming.max_ramp_trim_c, 0.0f, 3.0f) ||
+      !validFloat(incoming.ramp_fade_distance_c, 0.0f, 5.0f) ||
+      !validFloat(incoming.rate_filter_samples, 1.0f, 20.0f) ||
       incoming.air_turn_on_above_target_c < incoming.air_turn_off_above_target_c) {
     return;
   }

@@ -34,20 +34,53 @@ static const int ATTENUATION_VALUES[] = {65, 68, 70, 72, 74, 75, 76, 78, 80, 82,
 #define WIZ_NAV_Y 276
 #define WIZ_DROPDOWN_Y 112
 #define WIZ_DROPDOWN_H 64
+#define WIZ_TEMP_ADV_Y 88
+#define WIZ_TEMP_ADV_ROW_H 28
+
+enum BrewProfileEditorField : uint8_t {
+  BREW_FIELD_PITCH_TEMP,
+  BREW_FIELD_MAIN_TEMP,
+  BREW_FIELD_MAIN_HOLD,
+  BREW_FIELD_NORMAL_RAMP,
+  BREW_FIELD_DREST_TEMP,
+  BREW_FIELD_DREST_HOLD,
+  BREW_FIELD_DRY_HOP_OFFSET,
+  BREW_FIELD_DRY_HOP_CONTACT,
+  BREW_FIELD_CRASH_TEMP,
+  BREW_FIELD_CRASH_HOLD,
+  BREW_FIELD_CRASH_RAMP,
+  BREW_FIELD_CARB_TEMP,
+  BREW_FIELD_CARB_DAYS,
+  BREW_FIELD_TARGET_CO2,
+  BREW_FIELD_STORAGE_TEMP,
+  BREW_FIELD_STORAGE_DAYS,
+  BREW_PROFILE_FIELD_COUNT
+};
 
 static bool hitRect(int px, int py, int x, int y, int w, int h) {
   return px >= x && px <= x + w && py >= y && py <= y + h;
 }
 
+static float clampWizardFloat(float value, float minimum, float maximum) {
+  if (value < minimum) return minimum;
+  if (value > maximum) return maximum;
+  return value;
+}
+
+static size_t wizardTextCursor = 0;
+
 static void appendChar(char* buffer, size_t bufferSize, char c, bool* clearOnInput) {
   if (clearOnInput && *clearOnInput) {
     buffer[0] = '\0';
     *clearOnInput = false;
+    wizardTextCursor = 0;
   }
   size_t l = strlen(buffer);
+  if (wizardTextCursor > l) wizardTextCursor = l;
   if (l + 1 < bufferSize) {
-    buffer[l] = c;
-    buffer[l + 1] = '\0';
+    memmove(buffer + wizardTextCursor + 1, buffer + wizardTextCursor, l - wizardTextCursor + 1);
+    buffer[wizardTextCursor] = c;
+    wizardTextCursor++;
   }
 }
 
@@ -100,6 +133,15 @@ void VirtualKeyboardInput::drawText(TFT_eSPI& tft, const char* value) {
   tft.setFreeFont(FONT_SIZE_SM_BOLD);
   tft.setCursor(MARGIN + 12, WIZ_INPUT_Y + 26);
   tft.print(value);
+  size_t valueLen = strlen(value);
+  if (wizardTextCursor > valueLen) wizardTextCursor = valueLen;
+  char beforeCursor[40];
+  size_t cursorLen = wizardTextCursor;
+  if (cursorLen >= sizeof(beforeCursor)) cursorLen = sizeof(beforeCursor) - 1;
+  memcpy(beforeCursor, value, cursorLen);
+  beforeCursor[cursorLen] = '\0';
+  int cursorX = MARGIN + 12 + tft.textWidth(beforeCursor);
+  tft.drawFastVLine(cursorX, WIZ_INPUT_Y + 8, WIZ_INPUT_H - 14, uiColorGold);
 
   const char* rows[] = {"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"};
   int y = WIZ_TEXT_KEY_Y;
@@ -113,8 +155,10 @@ void VirtualKeyboardInput::drawText(TFT_eSPI& tft, const char* value) {
     }
     y += 34;
   }
-  drawKey(tft, MARGIN, 232, 94, WIZ_KEY_H, "SPACE");
-  drawKey(tft, MARGIN + 102, 232, 94, WIZ_KEY_H, "DEL");
+  drawKey(tft, MARGIN, 232, 52, WIZ_KEY_H, "<");
+  drawKey(tft, MARGIN + 60, 232, 120, WIZ_KEY_H, "SPACE");
+  drawKey(tft, MARGIN + 188, 232, 52, WIZ_KEY_H, ">");
+  drawKey(tft, MARGIN + 248, 232, 94, WIZ_KEY_H, "DEL");
 }
 
 void VirtualKeyboardInput::drawNumber(TFT_eSPI& tft, const char* value) {
@@ -151,18 +195,32 @@ bool VirtualKeyboardInput::handleTextTouch(int x, int y, char* buffer, size_t bu
     }
     keyY += 34;
   }
-  if (hitRect(x, y, MARGIN, 232, 94, WIZ_KEY_H)) {
+  if (hitRect(x, y, MARGIN, 232, 52, WIZ_KEY_H)) {
+    if (wizardTextCursor > 0) wizardTextCursor--;
+    return true;
+  }
+  if (hitRect(x, y, MARGIN + 60, 232, 120, WIZ_KEY_H)) {
     appendChar(buffer, bufferSize, ' ', clearOnInput);
     return true;
   }
-  if (hitRect(x, y, MARGIN + 102, 232, 94, WIZ_KEY_H)) {
+  if (hitRect(x, y, MARGIN + 188, 232, 52, WIZ_KEY_H)) {
+    size_t l = strlen(buffer);
+    if (wizardTextCursor < l) wizardTextCursor++;
+    return true;
+  }
+  if (hitRect(x, y, MARGIN + 248, 232, 94, WIZ_KEY_H)) {
     if (clearOnInput && *clearOnInput) {
       buffer[0] = '\0';
       *clearOnInput = false;
+      wizardTextCursor = 0;
       return true;
     }
     size_t l = strlen(buffer);
-    if (l > 0) buffer[l - 1] = '\0';
+    if (wizardTextCursor > l) wizardTextCursor = l;
+    if (wizardTextCursor > 0 && l > 0) {
+      memmove(buffer + wizardTextCursor - 1, buffer + wizardTextCursor, l - wizardTextCursor + 1);
+      wizardTextCursor--;
+    }
     return true;
   }
   return false;
@@ -204,6 +262,8 @@ BrewWizardController::BrewWizardController() {
   keyboardUpper = true;
   editPristine = false;
   yeastHistoryCount = 0;
+  brewProfileSelectedIndex = 0;
+  brewProfileFirstVisibleIndex = 0;
 }
 
 void BrewWizardController::begin(BrewProfile* targetProfile) {
@@ -215,6 +275,8 @@ void BrewWizardController::begin(BrewProfile* targetProfile) {
   validationMessage[0] = '\0';
   yeastHistoryCount = BrewProfileStore::loadYeastHistory(yeastHistory, 3);
   if (profile && profile->autoModeEnabled) applySelectedPreset();
+  brewProfileSelectedIndex = 0;
+  brewProfileFirstVisibleIndex = 0;
   loadStepBuffer();
 }
 
@@ -231,6 +293,7 @@ void BrewWizardController::loadStepBuffer() {
     case WIZARD_BATCH_NAME:
       strncpy(editBuffer, profile->batchName, sizeof(editBuffer));
       editPristine = true;
+      wizardTextCursor = strlen(editBuffer);
       break;
     case WIZARD_BATCH_SIZE:
       snprintf(editBuffer, sizeof(editBuffer), "%.1f", profile->batchSizeLiters);
@@ -243,6 +306,7 @@ void BrewWizardController::loadStepBuffer() {
     case WIZARD_YEAST:
       strncpy(editBuffer, profile->yeastName, sizeof(editBuffer));
       editPristine = true;
+      wizardTextCursor = strlen(editBuffer);
       break;
     default:
       editBuffer[0] = '\0';
@@ -328,6 +392,9 @@ void BrewWizardController::drawCancelConfirmation(TFT_eSPI& tft) {
 void BrewWizardController::nextStep() {
   if (!validateCurrentStep()) return;
   commitStepBuffer();
+  if (step == WIZARD_TEMP_ADVANCED) {
+    syncBrewProfileDerivedFields();
+  }
   if (step == WIZARD_REVIEW) {
     isComplete = true;
     step = WIZARD_DONE;
@@ -338,14 +405,21 @@ void BrewWizardController::nextStep() {
   } else if (profile && profile->autoModeEnabled && step == WIZARD_YEAST) {
     step = WIZARD_YEAST_BEHAVIOR;
   } else if (profile && profile->autoModeEnabled && step == WIZARD_YEAST_BEHAVIOR) {
-    step = WIZARD_REVIEW;
+    step = WIZARD_TEMP_ADVANCED;
   } else if (profile && !profile->autoModeEnabled && step == WIZARD_DIACETYL) {
+    step = WIZARD_TEMP_ADVANCED;
+  } else if (step == WIZARD_TEMP_ADVANCED) {
     step = WIZARD_REVIEW;
   } else {
     step = (BrewWizardStep)((int)step + 1);
   }
-  if (step == WIZARD_REVIEW && profile) {
-    BatchActionEngine::applyStyleDefaults(profile);
+  if (step == WIZARD_TEMP_ADVANCED && profile && !profile->temperatureProfile.enabled) {
+    TemperatureProfileEngine::generateForProfile(profile);
+  }
+  if (step == WIZARD_TEMP_ADVANCED) {
+    syncBrewProfileDerivedFields();
+    brewProfileSelectedIndex = 0;
+    brewProfileFirstVisibleIndex = 0;
   }
   loadStepBuffer();
 }
@@ -358,9 +432,11 @@ void BrewWizardController::previousStep() {
   commitStepBuffer();
   if (profile && step == WIZARD_PLUG_CONTROL) {
     step = WIZARD_AUTO_MODE;
-  } else if (profile && profile->autoModeEnabled && step == WIZARD_REVIEW) {
+  } else if (step == WIZARD_REVIEW) {
+    step = WIZARD_TEMP_ADVANCED;
+  } else if (profile && profile->autoModeEnabled && step == WIZARD_TEMP_ADVANCED) {
     step = WIZARD_YEAST_BEHAVIOR;
-  } else if (profile && !profile->autoModeEnabled && step == WIZARD_REVIEW) {
+  } else if (profile && !profile->autoModeEnabled && step == WIZARD_TEMP_ADVANCED) {
     step = WIZARD_DIACETYL;
   } else if (profile && profile->autoModeEnabled && step == WIZARD_YEAST) {
     step = WIZARD_PLUG_CONTROL;
@@ -375,7 +451,7 @@ void BrewWizardController::previousStep() {
 void BrewWizardController::drawFrame(TFT_eSPI& tft, const char* title) {
   tft.fillScreen(uiColorBackground);
   uiDrawTopbar("Brew Wizard", true, true, 0);
-  WizardStepper::draw(tft, (int)step, 11, MARGIN, TOPBAR_H + 10, UI_W - MARGIN * 2);
+  WizardStepper::draw(tft, (int)step, 12, MARGIN, TOPBAR_H + 10, UI_W - MARGIN * 2);
   tft.setTextColor(uiColorTextPrimary);
   tft.setFreeFont(FONT_SIZE_SM_BOLD);
   tft.setCursor(MARGIN, TOPBAR_H + 42);
@@ -395,11 +471,12 @@ void BrewWizardController::drawNav(TFT_eSPI& tft, bool showBack, bool showNext, 
 }
 
 void BrewWizardController::drawDropdownSelector(TFT_eSPI& tft, const char* title, const char* selected, const char* hint) {
-  tft.setTextColor(uiColorTextSecondary);
-  tft.setFreeFont(FONT_SIZE_SM);
-  tft.setCursor(MARGIN, 94);
-  tft.print(title);
-
+  if (title && title[0]) {
+    tft.setTextColor(uiColorTextSecondary);
+    tft.setFreeFont(FONT_SIZE_SM);
+    tft.setCursor(MARGIN, 94);
+    tft.print(title);
+  }
   tft.fillRoundRect(MARGIN, WIZ_DROPDOWN_Y, 58, WIZ_DROPDOWN_H, 8, uiColorCardBackground);
   tft.drawRoundRect(MARGIN, WIZ_DROPDOWN_Y, 58, WIZ_DROPDOWN_H, 8, uiColorBorder);
   uiTextCenter(MARGIN, WIZ_DROPDOWN_Y, 58, WIZ_DROPDOWN_H, "<", FONT_SIZE_MD, uiColorTextPrimary);
@@ -461,6 +538,7 @@ void BrewWizardController::applySelectedPreset() {
   if (!profile) return;
   const YeastPreset* preset = YeastPresetRepository::findById(profile->selectedYeastPresetId);
   YeastPresetRepository::applyToProfile(*preset, profile);
+  syncBrewProfileDerivedFields();
 }
 
 void BrewWizardController::drawPresetSummary(TFT_eSPI& tft) {
@@ -477,9 +555,199 @@ void BrewWizardController::drawPresetSummary(TFT_eSPI& tft) {
   tft.setCursor(MARGIN + 12, 168);
   tft.printf("Temp: %.0f-%.0f C, %s", profile->recommendedTempMinC, profile->recommendedTempMaxC, profile->fermentationSpeed);
   tft.setCursor(MARGIN + 12, 194);
-  tft.printf("Duration: %.0f h, lag %.0f h", profile->typicalDurationHours, profile->lagPhaseHours);
+  tft.printf("Profile: %.0f C pitch, %.0f C main",
+             profile->temperatureProfile.advanced.pitchC,
+             profile->temperatureProfile.advanced.mainC);
   tft.setCursor(MARGIN + 12, 220);
-  tft.printf("D-rest: %s", profile->diacetylRestRecommendedByYeast ? "recommended" : "not typical");
+  if (profile->temperatureProfile.advanced.dRestHoldHours > 0) {
+    tft.printf("D-rest %.0f C, crash %.0f C",
+               profile->temperatureProfile.advanced.dRestC,
+               profile->temperatureProfile.advanced.crashC);
+  } else {
+    tft.printf("Crash %.0f C, package %.0f C",
+               profile->temperatureProfile.advanced.crashC,
+               profile->temperatureProfile.advanced.carbonationC);
+  }
+}
+
+static const char* brewProfileFieldLabel(uint8_t index) {
+  switch (index) {
+    case BREW_FIELD_PITCH_TEMP: return "Pitch Temperature";
+    case BREW_FIELD_MAIN_TEMP: return "Main Temperature";
+    case BREW_FIELD_MAIN_HOLD: return "Main Hold Time";
+    case BREW_FIELD_NORMAL_RAMP: return "Normal Ramp";
+    case BREW_FIELD_DREST_TEMP: return "Diacetyl Rest Temperature";
+    case BREW_FIELD_DREST_HOLD: return "Diacetyl Rest Hold Time";
+    case BREW_FIELD_DRY_HOP_OFFSET: return "Dry Hop SG Offset";
+    case BREW_FIELD_DRY_HOP_CONTACT: return "Dry Hop Contact Time";
+    case BREW_FIELD_CRASH_TEMP: return "Cold Crash Temperature";
+    case BREW_FIELD_CRASH_HOLD: return "Cold Crash Hold Time";
+    case BREW_FIELD_CRASH_RAMP: return "Cold Crash Ramp";
+    case BREW_FIELD_CARB_TEMP: return "Carbonation Temperature";
+    case BREW_FIELD_CARB_DAYS: return "Carbonation Days";
+    case BREW_FIELD_TARGET_CO2: return "Target CO2";
+    case BREW_FIELD_STORAGE_TEMP: return "Storage Temperature";
+    case BREW_FIELD_STORAGE_DAYS: return "Storage Days Hint";
+    default: return "";
+  }
+}
+
+void BrewWizardController::syncBrewProfileDerivedFields() {
+  if (!profile) return;
+  TemperatureProfileAdvanced& adv = profile->temperatureProfile.advanced;
+  profile->temperatureProfile.enabled = true;
+  profile->diacetylRestEnabled = adv.dRestHoldHours > 0;
+  profile->dryHopEnabled = profile->dryHopFgOffset > 0.0f && profile->dryHopContactHours > 0;
+  if (profile->expectedFinalGravity > 1.0f) {
+    profile->dryHopTriggerSG = profile->expectedFinalGravity + profile->dryHopFgOffset;
+  }
+  profile->estimatedABV = DerivedCalculations::abv(profile->effectiveOG, profile->expectedFinalGravity);
+  TemperatureProfileEngine::rebuildPhaseList(&profile->temperatureProfile);
+}
+
+void BrewWizardController::drawTemperatureAdvanced(TFT_eSPI& tft) {
+  if (!profile) return;
+  const uint8_t visibleRows = 6;
+  const int listX = MARGIN;
+  const int listY = 82;
+  const int listW = UI_W - MARGIN * 2;
+  const int rowH = 30;
+
+  if (brewProfileSelectedIndex >= BREW_PROFILE_FIELD_COUNT) brewProfileSelectedIndex = 0;
+  if (brewProfileSelectedIndex < brewProfileFirstVisibleIndex) {
+    brewProfileFirstVisibleIndex = brewProfileSelectedIndex;
+  }
+  if (brewProfileSelectedIndex >= brewProfileFirstVisibleIndex + visibleRows) {
+    brewProfileFirstVisibleIndex = brewProfileSelectedIndex - visibleRows + 1;
+  }
+  if (brewProfileFirstVisibleIndex + visibleRows > BREW_PROFILE_FIELD_COUNT) {
+    brewProfileFirstVisibleIndex = BREW_PROFILE_FIELD_COUNT > visibleRows
+      ? BREW_PROFILE_FIELD_COUNT - visibleRows
+      : 0;
+  }
+
+  char value[20];
+  const TemperatureProfileAdvanced& adv = profile->temperatureProfile.advanced;
+  for (uint8_t row = 0; row < visibleRows; row++) {
+    uint8_t index = brewProfileFirstVisibleIndex + row;
+    if (index >= BREW_PROFILE_FIELD_COUNT) break;
+    int y = listY + row * rowH;
+    bool selected = index == brewProfileSelectedIndex;
+    if (selected) {
+      tft.fillRoundRect(listX, y - 2, listW, rowH - 2, 6, uiColorGold);
+    } else {
+      tft.fillRoundRect(listX, y - 2, listW, rowH - 2, 6, uiColorCardBackground);
+      tft.drawRoundRect(listX, y - 2, listW, rowH - 2, 6, uiColorBorder);
+    }
+    switch (index) {
+      case BREW_FIELD_PITCH_TEMP: snprintf(value, sizeof(value), "%.1f C", adv.pitchC); break;
+      case BREW_FIELD_MAIN_TEMP: snprintf(value, sizeof(value), "%.1f C", adv.mainC); break;
+      case BREW_FIELD_MAIN_HOLD: snprintf(value, sizeof(value), "%lu h", adv.mainHoldHours); break;
+      case BREW_FIELD_DREST_TEMP: snprintf(value, sizeof(value), "%.1f C", adv.dRestC); break;
+      case BREW_FIELD_DREST_HOLD: snprintf(value, sizeof(value), adv.dRestHoldHours == 0 ? "N/A" : "%lu h", adv.dRestHoldHours); break;
+      case BREW_FIELD_CRASH_TEMP: snprintf(value, sizeof(value), "%.1f C", adv.crashC); break;
+      case BREW_FIELD_CRASH_HOLD: snprintf(value, sizeof(value), adv.crashHoldHours == 0 ? "N/A" : "%lu h", adv.crashHoldHours); break;
+      case BREW_FIELD_NORMAL_RAMP: snprintf(value, sizeof(value), "%.1f K/h", adv.normalRampKPerH); break;
+      case BREW_FIELD_CRASH_RAMP: snprintf(value, sizeof(value), "%.1f K/h", adv.coldCrashRampKPerH); break;
+      case BREW_FIELD_CARB_TEMP: snprintf(value, sizeof(value), "%.1f C", adv.carbonationC); break;
+      case BREW_FIELD_CARB_DAYS: snprintf(value, sizeof(value), "%lu d", adv.carbonationDays); break;
+      case BREW_FIELD_TARGET_CO2: snprintf(value, sizeof(value), "%.1f vol", adv.targetCO2); break;
+      case BREW_FIELD_STORAGE_TEMP: snprintf(value, sizeof(value), "%.1f C", adv.storageC); break;
+      case BREW_FIELD_STORAGE_DAYS: snprintf(value, sizeof(value), "%lu d", adv.storageDaysHint); break;
+      case BREW_FIELD_DRY_HOP_OFFSET: snprintf(value, sizeof(value), profile->dryHopFgOffset <= 0.0f ? "N/A" : "+%.3f SG", profile->dryHopFgOffset); break;
+      case BREW_FIELD_DRY_HOP_CONTACT: snprintf(value, sizeof(value), profile->dryHopContactHours == 0 ? "N/A" : "%lu h", profile->dryHopContactHours); break;
+      default: value[0] = '\0'; break;
+    }
+    tft.setFreeFont(selected ? FONT_SIZE_SM_BOLD : FONT_SIZE_SM);
+    tft.setTextColor(selected ? uiColorPrimaryText : uiColorTextSecondary);
+    tft.setCursor(listX + 10, y + 18);
+    tft.print(brewProfileFieldLabel(index));
+    uiTextRight(listX + 275, y + 1, listW - 288, 20, value,
+                FONT_SIZE_SM, selected ? uiColorPrimaryText : uiColorTextPrimary);
+  }
+
+  const int ctrlY = WIZ_NAV_Y;
+  const int ctrlW = 38;
+  const int ctrlX0 = MARGIN + 136;
+  const char* labels[] = {"UP", "DN", "-", "+"};
+  for (int i = 0; i < 4; i++) {
+    int bx = ctrlX0 + i * 42;
+    tft.fillRoundRect(bx, ctrlY, ctrlW, 36, 8, uiColorCardBackground);
+    tft.drawRoundRect(bx, ctrlY, ctrlW, 36, 8, uiColorBorder);
+    uiTextCenter(bx, ctrlY, ctrlW, 36, labels[i], FONT_SIZE_SM, uiColorTextPrimary);
+  }
+}
+
+bool BrewWizardController::handleTemperatureAdvancedTouch(int x, int y) {
+  if (!profile) return false;
+  const uint8_t visibleRows = 6;
+  const int listY = 82;
+  const int rowH = 30;
+  if (y >= listY && y < listY + visibleRows * rowH) {
+    uint8_t row = (y - listY) / rowH;
+    uint8_t index = brewProfileFirstVisibleIndex + row;
+    if (index < BREW_PROFILE_FIELD_COUNT) {
+      brewProfileSelectedIndex = index;
+      return true;
+    }
+  }
+  if (y < WIZ_NAV_Y || y > WIZ_NAV_Y + 36) return false;
+  const int ctrlW = 38;
+  const int ctrlX0 = MARGIN + 136;
+  if (hitRect(x, y, ctrlX0, WIZ_NAV_Y, ctrlW, 36)) {
+    if (brewProfileSelectedIndex > 0) brewProfileSelectedIndex--;
+    return true;
+  }
+  if (hitRect(x, y, ctrlX0 + 42, WIZ_NAV_Y, ctrlW, 36)) {
+    if (brewProfileSelectedIndex + 1 < BREW_PROFILE_FIELD_COUNT) brewProfileSelectedIndex++;
+    return true;
+  }
+  bool minus = hitRect(x, y, ctrlX0 + 84, WIZ_NAV_Y, ctrlW, 36);
+  bool plus = hitRect(x, y, ctrlX0 + 126, WIZ_NAV_Y, ctrlW, 36);
+  if (!minus && !plus) return false;
+
+  float dir = plus ? 1.0f : -1.0f;
+  TemperatureProfileAdvanced& adv = profile->temperatureProfile.advanced;
+  switch (brewProfileSelectedIndex) {
+    case BREW_FIELD_PITCH_TEMP: adv.pitchC = clampWizardFloat(adv.pitchC + dir * 0.5f, -2.0f, 35.0f); break;
+    case BREW_FIELD_MAIN_TEMP: adv.mainC = clampWizardFloat(adv.mainC + dir * 0.5f, -2.0f, 35.0f); break;
+    case BREW_FIELD_MAIN_HOLD:
+      if (plus && adv.mainHoldHours < 336) adv.mainHoldHours += 12;
+      if (minus && adv.mainHoldHours > 12) adv.mainHoldHours -= 12;
+      break;
+    case BREW_FIELD_DREST_TEMP: adv.dRestC = clampWizardFloat(adv.dRestC + dir * 0.5f, 0.0f, 35.0f); break;
+    case BREW_FIELD_DREST_HOLD:
+      if (plus && adv.dRestHoldHours < 96) adv.dRestHoldHours += 12;
+      if (minus && adv.dRestHoldHours >= 12) adv.dRestHoldHours -= 12;
+      break;
+    case BREW_FIELD_CRASH_TEMP: adv.crashC = clampWizardFloat(adv.crashC + dir * 0.5f, 0.0f, 12.0f); break;
+    case BREW_FIELD_CRASH_HOLD:
+      if (plus && adv.crashHoldHours < 96) adv.crashHoldHours += 12;
+      if (minus && adv.crashHoldHours >= 12) adv.crashHoldHours -= 12;
+      break;
+    case BREW_FIELD_NORMAL_RAMP: adv.normalRampKPerH = clampWizardFloat(adv.normalRampKPerH + dir * 0.1f, 0.0f, 2.0f); break;
+    case BREW_FIELD_CRASH_RAMP: adv.coldCrashRampKPerH = clampWizardFloat(adv.coldCrashRampKPerH + dir * 0.1f, 0.0f, 4.0f); break;
+    case BREW_FIELD_CARB_TEMP: adv.carbonationC = clampWizardFloat(adv.carbonationC + dir * 0.5f, 10.0f, 25.0f); break;
+    case BREW_FIELD_CARB_DAYS:
+      if (plus && adv.carbonationDays < 30) adv.carbonationDays++;
+      if (minus && adv.carbonationDays > 1) adv.carbonationDays--;
+      break;
+    case BREW_FIELD_TARGET_CO2: adv.targetCO2 = clampWizardFloat(adv.targetCO2 + dir * 0.1f, 1.5f, 4.0f); break;
+    case BREW_FIELD_STORAGE_TEMP: adv.storageC = clampWizardFloat(adv.storageC + dir * 0.5f, 0.0f, 12.0f); break;
+    case BREW_FIELD_STORAGE_DAYS:
+      if (plus && adv.storageDaysHint < 180) adv.storageDaysHint++;
+      if (minus && adv.storageDaysHint > 1) adv.storageDaysHint--;
+      break;
+    case BREW_FIELD_DRY_HOP_OFFSET:
+      profile->dryHopFgOffset = clampWizardFloat(profile->dryHopFgOffset + dir * 0.001f, 0.0f, 0.020f);
+      break;
+    case BREW_FIELD_DRY_HOP_CONTACT:
+      if (plus && profile->dryHopContactHours < 168) profile->dryHopContactHours += 12;
+      if (minus && profile->dryHopContactHours >= 12) profile->dryHopContactHours -= 12;
+      break;
+  }
+  syncBrewProfileDerivedFields();
+  return true;
 }
 
 int BrewWizardController::currentStyleIndex() const {
@@ -507,6 +775,8 @@ void BrewWizardController::selectStyleOffset(int offset) {
   strncpy(profile->beerStyle, StyleDropdown::valueAt(idx), sizeof(profile->beerStyle) - 1);
   profile->beerStyle[sizeof(profile->beerStyle) - 1] = '\0';
   BatchActionEngine::applyStyleDefaults(profile);
+  TemperatureProfileEngine::generateForProfile(profile);
+  syncBrewProfileDerivedFields();
 }
 
 void BrewWizardController::selectPresetOffset(int offset) {
@@ -528,7 +798,7 @@ void BrewWizardController::draw(TFT_eSPI& tft) {
       break;
     case WIZARD_BEER_STYLE:
       drawFrame(tft, "Beer Style");
-      drawDropdownSelector(tft, "Style", profile->beerStyle, "Use arrows to choose the beer style");
+      drawDropdownSelector(tft, "", profile->beerStyle, "Use arrows to choose the beer style");
       drawNav(tft, true, true, "NEXT");
       break;
     case WIZARD_BATCH_SIZE:
@@ -599,26 +869,39 @@ void BrewWizardController::draw(TFT_eSPI& tft) {
       drawPresetSummary(tft);
       drawNav(tft, true, true, "NEXT");
       break;
+    case WIZARD_TEMP_ADVANCED:
+      drawFrame(tft, "Brew Profile");
+      drawTemperatureAdvanced(tft);
+      drawNav(tft, true, true, "NEXT");
+      break;
     case WIZARD_REVIEW:
       drawFrame(tft, "Review Batch");
       tft.setTextColor(uiColorTextPrimary);
+      tft.setFreeFont(FONT_SIZE_SM_BOLD);
+      tft.setCursor(MARGIN, 88);
+      tft.print(profile->batchName);
       tft.setFreeFont(FONT_SIZE_SM);
-      tft.setCursor(MARGIN, 92); tft.printf("%s / %s", profile->batchName, profile->beerStyle);
-      tft.setCursor(MARGIN, 122); tft.printf("%.1f L, %.1f Brix, OG %.3f", profile->batchSizeLiters, profile->recipeBrix, profile->recipeOG);
-      tft.setCursor(MARGIN, 152); tft.printf("%s, %d%% attenuation", profile->yeastName, profile->expectedApparentAttenuation);
-      tft.setCursor(MARGIN, 182); tft.printf("Expected FG %.3f", profile->expectedFinalGravity);
-      tft.setCursor(MARGIN, 212);
-      tft.printf("%s / D-rest: %s", profile->autoModeEnabled ? "Auto" : "Manual", profile->diacetylRestEnabled ? "On" : "Off");
-      tft.setFreeFont(FONT_SIZE_XS);
-      tft.setCursor(MARGIN, 232);
-      tft.printf("Plug: %s", profile->plugControlEnabled ? "Auto control" : "Monitor only");
-      tft.setTextColor(profile->dryHopEnabled ? uiColorTextPrimary : uiColorTextSecondary);
-      tft.setCursor(MARGIN, 252);
-      if (profile->dryHopEnabled) {
-        tft.printf("Dry hop SG %.3f, contact %lu h", profile->dryHopTriggerSG, profile->dryHopContactHours);
-      } else {
-        tft.print("Dry hop: Off");
-      }
+      tft.setTextColor(uiColorTextSecondary);
+      tft.setCursor(MARGIN, 112);
+      tft.printf("%s | %.1f L | %.1f Brix", profile->beerStyle, profile->batchSizeLiters, profile->recipeBrix);
+      tft.setCursor(MARGIN, 138);
+      tft.printf("OG %.3f  FG %.3f  ABV %.1f%%", profile->recipeOG, profile->expectedFinalGravity, profile->estimatedABV);
+      tft.setCursor(MARGIN, 164);
+      tft.printf("%s | Atten %d%%", profile->yeastName, profile->expectedApparentAttenuation);
+      tft.setCursor(MARGIN, 190);
+      tft.printf("Temp %.1f -> %.1f C, Ramp %.1f K/h",
+                 profile->temperatureProfile.advanced.pitchC,
+                 profile->temperatureProfile.advanced.mainC,
+                 profile->temperatureProfile.advanced.normalRampKPerH);
+      tft.setCursor(MARGIN, 216);
+      tft.printf("D-rest %s | Crash %s",
+                 profile->temperatureProfile.advanced.dRestHoldHours > 0 ? "On" : "N/A",
+                 profile->temperatureProfile.advanced.crashHoldHours > 0 ? "On" : "N/A");
+      tft.setCursor(MARGIN, 242);
+      if (profile->dryHopEnabled) tft.printf("Dry hop +%.3f SG, %lu h", profile->dryHopFgOffset, profile->dryHopContactHours);
+      else tft.print("Dry hop N/A");
+      tft.setCursor(MARGIN + 230, 242);
+      tft.printf("Plug %s", profile->plugControlEnabled ? "On" : "Off");
       drawNav(tft, true, true, "START");
       break;
     default:
@@ -733,9 +1016,12 @@ bool BrewWizardController::handleTouch(int x, int y) {
     case WIZARD_DIACETYL:
       if (IOSSwitch::hit(x, y, UI_W - MARGIN - 74, 104)) {
         profile->diacetylRestEnabled = !profile->diacetylRestEnabled;
+        TemperatureProfileEngine::generateForProfile(profile);
         return true;
       }
       break;
+    case WIZARD_TEMP_ADVANCED:
+      return handleTemperatureAdvancedTouch(x, y);
     default:
       break;
   }

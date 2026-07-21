@@ -9,7 +9,6 @@
 #define MARGIN          14   // General margin spacing
 #define GAP             12   // Gap between elements
 #define CARD_RADIUS     8    // Card corner radius, compact for 4-inch UI
-#define TILE_H          80   // Standard tile height
 #define HERO_H          120  // Hero section height
 
 // Spacing tokens

@@ -27,6 +27,11 @@ SGNode remains in **alpha** while SGNode Plug temperature control is still await
 - Local persistence on SD card under `/data/batches/<batch_id>/`
 - Debug levels for quieter serial output
 - Light/dark theme with persistent setting
+- Integration of SGNode Plug temperature control for precise fermentation temperatures
+- Enhanced batch management: versioning and rollback options for stored batches
+- Improved yeast management: compatibility with more yeast types and strain-specific parameters
+- Real-time alerts for critical conditions such as excessive tilt or low battery voltage
+- User feedback system for providing immediate suggestions based on sensor data and recipe adjustments
 
 ### Float Unit
 - BMI160 tilt measurement and BMI160 chip-temperature diagnostics

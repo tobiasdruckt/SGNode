@@ -13,10 +13,13 @@
 
 #include <WiFi.h>
 #include <esp_now.h>
+#include <WebServer.h>
+#include <Update.h>
 #include <Wire.h>
 #include <BMI160Gen.h>
 #include "polynomial_calibration.h"
 #include "../SGNode_Shared/sg_protocol.h"
+#include "../SGNode_Shared/sg_logo_png.h"
 
 // I2C pins for BMI160
 #define I2C_SDA 26
@@ -137,6 +140,15 @@ const unsigned long CALIBRATION_NO_COMM_TIMEOUT = 60000; // 1 minute timeout for
 unsigned long lastLedToggle = 0;
 const unsigned long LED_BLINK_INTERVAL = 500; // 500ms blink interval
 bool ledState = false;
+const unsigned long OTA_LONG_PRESS_MS = 5000UL;
+const unsigned long OTA_TIMEOUT_MS = 20UL * 60UL * 1000UL;
+WebServer floatOtaServer(80);
+bool floatOtaActive = false;
+bool floatOtaUploadInProgress = false;
+unsigned long floatOtaStartedMs = 0;
+unsigned long floatOtaButtonPressMs = 0;
+bool floatOtaButtonWasPressed = false;
+char floatOtaSsid[32] = "";
 
 // Rate limiting for calibration responses
 unsigned long lastCalibrationResponse = 0;
@@ -201,6 +213,11 @@ void initESPNow();
 void configureUnusedGPIOs();
 void suspendBMI160();
 void ensureDebugSerial();
+bool detectOtaLongPressAtBoot(bool switchPressed);
+void startFloatOtaMode();
+void handleFloatOtaMode();
+void stopFloatOtaAndReboot();
+void sendFloatOtaActiveStatus();
 float measureTilt();
 float measureImuTemperature();
 float measureTemperature();
@@ -273,6 +290,11 @@ void setup() {
   
   // Check calibration switch state at boot (before deepsleep)
   bool switchPressed = (digitalRead(CALIBRATION_SWITCH_PIN) == LOW);
+
+  if (detectOtaLongPressAtBoot(switchPressed)) {
+    startFloatOtaMode();
+    return;
+  }
   
   // Activate calibration mode if switch is pressed OR woke up from calibration interrupt
   if (switchPressed || calibrationWakeup) {
@@ -366,6 +388,12 @@ void setup() {
 }
 
 void loop() {
+  if (floatOtaActive) {
+    handleFloatOtaMode();
+    delay(5);
+    return;
+  }
+
   #if SGNODE_FLOAT_TEST_HARNESS
   handleFloatTestHarness();
   if (harnessPauseStateMachine) {
@@ -515,6 +543,186 @@ void loop() {
   }
   
   delay(10);
+}
+
+bool detectOtaLongPressAtBoot(bool switchPressed) {
+  if (!switchPressed) return false;
+  unsigned long startMs = millis();
+  while (digitalRead(CALIBRATION_SWITCH_PIN) == LOW) {
+    if (millis() - lastLedToggle > 200UL) {
+      ledState = !ledState;
+      digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
+      lastLedToggle = millis();
+    }
+    if (millis() - startMs >= OTA_LONG_PRESS_MS) {
+      digitalWrite(LED_BUILTIN, LOW);
+      return true;
+    }
+    delay(10);
+  }
+  digitalWrite(LED_BUILTIN, LOW);
+  return false;
+}
+
+String floatOtaDiagHtml() {
+  String html;
+  html.reserve(1200);
+  uint32_t elapsed = (millis() - floatOtaStartedMs) / 1000UL;
+  uint32_t remain = elapsed < (OTA_TIMEOUT_MS / 1000UL) ? (OTA_TIMEOUT_MS / 1000UL) - elapsed : 0UL;
+  html += "<pre>";
+  html += "Firmware: SGNode Float ";
+  html += __DATE__;
+  html += " ";
+  html += __TIME__;
+  html += "\nChip: ";
+  html += String((uint32_t)ESP.getEfuseMac(), HEX);
+  html += "\nMAC: ";
+  html += WiFi.macAddress();
+  html += "\nFlash: ";
+  html += String(ESP.getFlashChipSize());
+  html += "\nSketch: ";
+  html += String(ESP.getSketchSize());
+  html += "\nFree sketch: ";
+  html += String(ESP.getFreeSketchSpace());
+  html += "\nFree heap: ";
+  html += String(ESP.getFreeHeap());
+  html += "\nUptime: ";
+  html += String(millis() / 1000UL);
+  html += " s\nReset: ";
+  html += String((int)esp_reset_reason());
+  html += "\nAP SSID: ";
+  html += floatOtaSsid;
+  html += "\nAP IP: ";
+  html += WiFi.softAPIP().toString();
+  html += "\nOTA rest: ";
+  html += String(remain);
+  html += " s\nBattery: ";
+  html += String(cachedBatteryVoltage, 2);
+  html += " V\nSeq: ";
+  html += String(rtcSequenceCounter);
+  html += "\nCalibration: ";
+  html += calibrationMode ? "on" : "off";
+  html += "\nRetry buffer: ";
+  int retryCount = 0;
+  for (int i = 0; i < RETRY_BUFFER_SIZE; i++) {
+    if (retryBuffer[i].valid) retryCount++;
+  }
+  html += String(retryCount);
+  html += "</pre>";
+  return html;
+}
+
+String floatOtaPageHtml() {
+  String html;
+  html.reserve(2200);
+  html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>SGNode Float OTA</title><style>body{font-family:sans-serif;margin:24px;max-width:720px}";
+  html += "button,input{font-size:16px;padding:10px;margin:6px 0}pre{background:#f3f4f6;padding:12px;overflow:auto}";
+  html += ".hdr{display:flex;align-items:center;gap:14px;margin-bottom:16px}.logo{width:96px;height:auto}</style></head><body>";
+  html += "<div class='hdr'><img class='logo' src='/logo.png' alt='SGNode'><h2>Float OTA</h2></div>";
+  html += "<form method='POST' action='/update' enctype='multipart/form-data'>";
+  html += "<input type='file' name='update'><br><button type='submit'>Upload firmware</button></form>";
+  html += "<p><a href='/diag'>Refresh diagnostics</a> | <a href='/reboot'>Reboot normal mode</a></p>";
+  html += floatOtaDiagHtml();
+  html += "</body></html>";
+  return html;
+}
+
+void sendFloatOtaActiveStatus() {
+  initESPNow();
+  sg_float_ota_status_t status = {};
+  status.packet_type = SG_FLOAT_OTA_STATUS_TYPE;
+  status.version = SG_PROTOCOL_VERSION;
+  status.sequence_id = rtcSequenceCounter++;
+  status.uptime_s = millis() / 1000UL;
+  strncpy(status.ssid, floatOtaSsid, sizeof(status.ssid) - 1);
+  strncpy(status.ip, "192.168.4.1", sizeof(status.ip) - 1);
+  status.timeout_s = OTA_TIMEOUT_MS / 1000UL;
+  status.crc = sg_crc16((const uint8_t*)&status, sizeof(status) - sizeof(status.crc));
+  esp_now_send(baseStationMac, (uint8_t*)&status, sizeof(status));
+  delay(80);
+  esp_now_deinit();
+  WiFi.mode(WIFI_OFF);
+}
+
+void startFloatOtaMode() {
+  ensureDebugSerial();
+  debug_mode = true;
+  calibrationMode = false;
+  floatOtaActive = true;
+  floatOtaUploadInProgress = false;
+  floatOtaStartedMs = millis();
+  snprintf(floatOtaSsid, sizeof(floatOtaSsid), "SGNode-Float-OTA-%06X", (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
+
+  sendFloatOtaActiveStatus();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(floatOtaSsid);
+  floatOtaServer.on("/", HTTP_GET, []() {
+    floatOtaServer.send(200, "text/html", floatOtaPageHtml());
+  });
+  floatOtaServer.on("/diag", HTTP_GET, []() {
+    floatOtaServer.send(200, "text/html", floatOtaPageHtml());
+  });
+  floatOtaServer.on("/logo.png", HTTP_GET, []() {
+    floatOtaServer.send_P(200, "image/png", (const char*)SGNODE_LOGO_PNG, SGNODE_LOGO_PNG_SIZE);
+  });
+  floatOtaServer.on("/reboot", HTTP_GET, []() {
+    floatOtaServer.send(200, "text/html", "<html><body>Rebooting...</body></html>");
+    delay(100);
+    stopFloatOtaAndReboot();
+  });
+  floatOtaServer.on("/update", HTTP_POST, []() {
+    bool ok = !Update.hasError();
+    floatOtaServer.send(ok ? 200 : 500, "text/html", ok ? "<html><body>OK. Rebooting...</body></html>" : "<html><body>Update failed.</body></html>");
+    delay(250);
+    if (ok) stopFloatOtaAndReboot();
+  }, []() {
+    HTTPUpload& upload = floatOtaServer.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      floatOtaUploadInProgress = true;
+      Update.begin(UPDATE_SIZE_UNKNOWN);
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      Update.write(upload.buf, upload.currentSize);
+    } else if (upload.status == UPLOAD_FILE_END) {
+      Update.end(true);
+      floatOtaUploadInProgress = false;
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+      Update.end();
+      floatOtaUploadInProgress = false;
+    }
+  });
+  floatOtaServer.begin();
+}
+
+void stopFloatOtaAndReboot() {
+  floatOtaServer.stop();
+  WiFi.softAPdisconnect(true);
+  delay(100);
+  ESP.restart();
+}
+
+void handleFloatOtaMode() {
+  floatOtaServer.handleClient();
+  if (millis() - floatOtaStartedMs > OTA_TIMEOUT_MS && !floatOtaUploadInProgress) {
+    stopFloatOtaAndReboot();
+  }
+
+  bool pressed = digitalRead(CALIBRATION_SWITCH_PIN) == LOW;
+  if (pressed && !floatOtaButtonWasPressed) {
+    floatOtaButtonWasPressed = true;
+    floatOtaButtonPressMs = millis();
+  } else if (!pressed) {
+    floatOtaButtonWasPressed = false;
+  } else if (millis() - floatOtaButtonPressMs >= OTA_LONG_PRESS_MS) {
+    stopFloatOtaAndReboot();
+  }
+
+  if (millis() - lastLedToggle > 250UL) {
+    ledState = !ledState;
+    digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
+    lastLedToggle = millis();
+  }
 }
 
 // BMI160 address (confirmed by scanner)

@@ -7,6 +7,7 @@
 
 #define SG_PLUG_COMMAND_TYPE 0xC1
 #define SG_PLUG_STATUS_TYPE 0xC2
+#define SG_FLOAT_OTA_STATUS_TYPE 0xF1
 #define SG_PLUG_COMMAND_ENABLE 0x01
 #define SG_PLUG_FAULT_AIR_SENSOR 0x0001
 #define SG_PLUG_FAULT_BEER_SENSOR 0x0002
@@ -79,6 +80,17 @@ typedef struct __attribute__((packed)) {
   uint8_t packet_type;
   uint8_t version;
   uint16_t sequence_id;
+  uint32_t uptime_s;
+  char ssid[28];
+  char ip[16];
+  uint16_t timeout_s;
+  uint16_t crc;
+} sg_float_ota_status_t;
+
+typedef struct __attribute__((packed)) {
+  uint8_t packet_type;
+  uint8_t version;
+  uint16_t sequence_id;
   uint32_t base_epoch;
   float beer_target_c;
   float ramp_k_per_h;
@@ -105,6 +117,11 @@ typedef struct __attribute__((packed)) {
   float min_air_target_c;
   float max_air_target_c;
   float target_step_c;
+  float ramp_controller_kp_h;
+  float ramp_controller_tn_h;
+  float max_ramp_trim_c;
+  float ramp_fade_distance_c;
+  float rate_filter_samples;
   uint8_t flags;
   uint16_t crc;
 } sg_plug_command_t;
@@ -133,6 +150,37 @@ typedef struct __attribute__((packed)) {
   uint16_t crc;
 } sg_plug_status_t;
 
+typedef struct __attribute__((packed)) {
+  uint8_t packet_type;
+  uint8_t version;
+  uint16_t sequence_id;
+  uint16_t command_sequence_id;
+  uint32_t uptime_s;
+  float air_temp_c;
+  float beer_temp_c;
+  float beer_target_c;
+  float air_target_c;
+  float duty_10m_percent;
+  float pi_offset_c;
+  float pi_tn_hours;
+  float controller_kp;
+  float controller_d_brake_h;
+  float beer_rate_c_per_h;
+  float ramp_k_per_h;
+  uint8_t control_mode;
+  uint16_t faults;
+  uint8_t relay_on;
+  uint8_t pattern_ready;
+  float p_offset_c;
+  float i_offset_c;
+  float d_offset_c;
+  float ramp_trim_c;
+  float ramp_i_offset_c;
+  float ramp_rate_error_k_per_h;
+  float beer_rate_raw_c_per_h;
+  uint16_t crc;
+} sg_plug_status_v2_t;
+
 static inline uint16_t sg_crc16(const uint8_t* data, size_t length) {
   uint16_t crc = 0xFFFF;
   for (size_t i = 0; i < length; ++i) {
@@ -150,5 +198,7 @@ static_assert(sizeof(calib_command_t) == 6, "calib_command_t size mismatch");
 static_assert(sizeof(ack_packet_t) == 7, "ack_packet_t size mismatch");
 static_assert(sizeof(calib_response_t) == 42, "calib_response_t size mismatch");
 static_assert(sizeof(calib_coeffs_t) == 26, "calib_coeffs_t size mismatch");
-static_assert(sizeof(sg_plug_command_t) == 107, "sg_plug_command_t size mismatch");
+static_assert(sizeof(sg_float_ota_status_t) == 56, "sg_float_ota_status_t size mismatch");
+static_assert(sizeof(sg_plug_command_t) == 127, "sg_plug_command_t size mismatch");
 static_assert(sizeof(sg_plug_status_t) == 61, "sg_plug_status_t size mismatch");
+static_assert(sizeof(sg_plug_status_v2_t) == 89, "sg_plug_status_v2_t size mismatch");

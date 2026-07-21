@@ -41,6 +41,28 @@ The Base learns the MAC of the first valid Plug status packet and stores it in
 EEPROM. Plug control remains disabled by default and can be enabled per batch
 with the Brew Wizard `SGNode Plug` step.
 
+## OTA update mode
+
+Hold the Plug button for 5 seconds to enter OTA update mode. The relay is
+switched off immediately and stays off. Normal ESP-NOW control is paused, and
+the Plug starts an open SoftAP named `SGNode-Plug-OTA-<ChipId>`.
+
+Connect to the AP and open:
+
+- `http://192.168.4.1/`
+- `http://192.168.4.1/update`
+- `http://192.168.4.1/diag`
+
+The root/update page contains a minimal firmware upload form, a normal-mode
+reboot button, and compact diagnostics. After a successful upload the Plug
+reboots. OTA mode remains active while a client is connected to the SoftAP. If
+no upload is in progress and no client is connected for 180 seconds, OTA mode
+times out and reboots so ESP-NOW starts cleanly again. Holding the hardware
+button for 5 seconds while already in OTA mode also reboots to normal mode.
+
+During OTA both LEDs blink. The secondary LED is on GPIO1/UART TX and may also
+flicker when serial output is active.
+
 ## Build target
 
 Use `Generic ESP8266 Module`, 1 MB flash, DOUT flash mode, and 80 MHz CPU.

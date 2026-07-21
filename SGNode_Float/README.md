@@ -26,6 +26,18 @@ The float measures tilt, diagnostic BMI160 chip temperature, and battery voltage
 
 Calibration switch ON keeps the float awake for the base station calibration workflow.
 
+## OTA Update
+
+Float OTA is a manual service mode.
+
+1. Wake or power the float while holding the calibration switch.
+2. Keep the switch held for 5 seconds.
+3. The float sends an `OTA Active` packet to the base station, then starts a SoftAP such as `SGNode-Float-OTA-xxxxxx`.
+4. Connect to the SoftAP and open `http://192.168.4.1/`.
+5. Upload the new `.bin`.
+
+During OTA the float does not enter deep sleep. The mode has a hard 20 minute timeout to protect the battery. Holding the calibration switch for 5 seconds while OTA is active reboots back to normal mode. The web page also has a `Reboot normal mode` link and compact diagnostics at `/diag`.
+
 ## Required Libraries
 
 - EmotiBit BMI160

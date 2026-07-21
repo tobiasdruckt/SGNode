@@ -21,10 +21,16 @@ static void csvEscapePrint(File& file, const char* text) {
 
 static bool extractString(const char* json, const char* key, char* out, size_t outSize) {
   char pattern[32];
-  snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
   const char* start = strstr(json, pattern);
   if (!start) return false;
   start += strlen(pattern);
+  while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+  if (*start != ':') return false;
+  start++;
+  while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+  if (*start != '"') return false;
+  start++;
   const char* end = strchr(start, '"');
   if (!end) return false;
   size_t len = end - start;
@@ -36,10 +42,15 @@ static bool extractString(const char* json, const char* key, char* out, size_t o
 
 static float extractFloat(const char* json, const char* key, float fallback) {
   char pattern[32];
-  snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
   const char* start = strstr(json, pattern);
   if (!start) return fallback;
-  return atof(start + strlen(pattern));
+  start += strlen(pattern);
+  while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+  if (*start != ':') return fallback;
+  start++;
+  while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+  return atof(start);
 }
 
 static int extractInt(const char* json, const char* key, int fallback) {
@@ -48,18 +59,27 @@ static int extractInt(const char* json, const char* key, int fallback) {
 
 static unsigned long extractULong(const char* json, const char* key, unsigned long fallback) {
   char pattern[32];
-  snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
   const char* start = strstr(json, pattern);
   if (!start) return fallback;
-  return strtoul(start + strlen(pattern), NULL, 10);
+  start += strlen(pattern);
+  while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+  if (*start != ':') return fallback;
+  start++;
+  while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+  return strtoul(start, NULL, 10);
 }
 
 static bool extractBool(const char* json, const char* key, bool fallback) {
   char pattern[32];
-  snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
   const char* start = strstr(json, pattern);
   if (!start) return fallback;
   start += strlen(pattern);
+  while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+  if (*start != ':') return fallback;
+  start++;
+  while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
   return strncmp(start, "true", 4) == 0;
 }
 
@@ -68,7 +88,7 @@ void BrewProfileStore::setDefaults(BrewProfile* profile) {
   strcpy(profile->batchId, "batch_001");
   strcpy(profile->batchName, "New Batch");
   strcpy(profile->beerStyle, "German Pils");
-  profile->batchSizeLiters = 20.0f;
+  profile->batchSizeLiters = 14.0f;
   profile->recipeBrix = 12.0f;
   profile->recipeOG = 1.048f;
   profile->measuredOG = 0.0f;
@@ -84,7 +104,7 @@ void BrewProfileStore::setDefaults(BrewProfile* profile) {
   profile->ogVerified = false;
   profile->ogNeedsChoice = false;
   profile->autoModeEnabled = true;
-  profile->plugControlEnabled = false;
+  profile->plugControlEnabled = true;
   profile->floatZeroCalDone = false;
   profile->floatZeroCalSkipped = false;
   profile->floatZeroCalibratedAt = 0;
@@ -107,6 +127,7 @@ void BrewProfileStore::setDefaults(BrewProfile* profile) {
   profile->completed = false;
   profile->completedAt = 0;
   profile->dryHopEnabled = false;
+  profile->dryHopFgOffset = 0.0f;
   profile->dryHopTriggerSG = 1.014f;
   profile->dryHopContactHours = 48;
   profile->dryHopDone = false;
@@ -121,9 +142,12 @@ void BrewProfileStore::setDefaults(BrewProfile* profile) {
   profile->coldCrashDone = false;
   profile->coldCrashSkipped = false;
   profile->coldCrashStartedAt = 0;
+  profile->packageStarted = false;
+  profile->packageStartedAt = 0;
   profile->packageDone = false;
   profile->packageSkipped = false;
   profile->packagedAt = 0;
+  TemperatureProfileEngine::setDefaults(&profile->temperatureProfile);
 }
 
 void BrewProfileStore::buildBatchId(int number, char* buffer, size_t bufferSize) {
@@ -247,6 +271,7 @@ bool BrewProfileStore::save(const BrewProfile& profile) {
   file.printf("  \"completed\":%s,\n", profile.completed ? "true" : "false");
   file.printf("  \"completedAt\":%lu,\n", profile.completedAt);
   file.printf("  \"dryHopEnabled\":%s,\n", profile.dryHopEnabled ? "true" : "false");
+  file.printf("  \"dryHopFgOffset\":%.5f,\n", profile.dryHopFgOffset);
   file.printf("  \"dryHopTriggerSG\":%.5f,\n", profile.dryHopTriggerSG);
   file.printf("  \"dryHopContactHours\":%lu,\n", profile.dryHopContactHours);
   file.printf("  \"dryHopDone\":%s,\n", profile.dryHopDone ? "true" : "false");
@@ -261,9 +286,12 @@ bool BrewProfileStore::save(const BrewProfile& profile) {
   file.printf("  \"coldCrashDone\":%s,\n", profile.coldCrashDone ? "true" : "false");
   file.printf("  \"coldCrashSkipped\":%s,\n", profile.coldCrashSkipped ? "true" : "false");
   file.printf("  \"coldCrashStartedAt\":%lu,\n", profile.coldCrashStartedAt);
+  file.printf("  \"packageStarted\":%s,\n", profile.packageStarted ? "true" : "false");
+  file.printf("  \"packageStartedAt\":%lu,\n", profile.packageStartedAt);
   file.printf("  \"packageDone\":%s,\n", profile.packageDone ? "true" : "false");
   file.printf("  \"packageSkipped\":%s,\n", profile.packageSkipped ? "true" : "false");
-  file.printf("  \"packagedAt\":%lu\n", profile.packagedAt);
+  file.printf("  \"packagedAt\":%lu,\n", profile.packagedAt);
+  TemperatureProfileEngine::writeJson(file, profile.temperatureProfile, "  ", false);
   file.println("}");
   file.close();
   return true;
@@ -279,8 +307,8 @@ bool BrewProfileStore::loadFromPath(const char* path, BrewProfile* profile) {
   File file = SD.open(path, FILE_READ);
   if (!file) return false;
   size_t size = file.size();
-  if (size > 4095) size = 4095;
-  static char json[4096];
+  if (size > 8191) size = 8191;
+  static char json[8192];
   size_t read = file.readBytes(json, size);
   json[read] = '\0';
   file.close();
@@ -328,8 +356,19 @@ bool BrewProfileStore::loadFromPath(const char* path, BrewProfile* profile) {
   profile->completed = extractBool(json, "completed", profile->completed);
   profile->completedAt = extractULong(json, "completedAt", profile->completedAt);
   profile->dryHopEnabled = extractBool(json, "dryHopEnabled", profile->dryHopEnabled);
+  profile->dryHopFgOffset = extractFloat(json, "dryHopFgOffset", profile->dryHopFgOffset);
   profile->dryHopTriggerSG = extractFloat(json, "dryHopTriggerSG", profile->dryHopTriggerSG);
   profile->dryHopContactHours = extractULong(json, "dryHopContactHours", profile->dryHopContactHours);
+  if (profile->dryHopFgOffset <= 0.0f && profile->dryHopEnabled &&
+      profile->expectedFinalGravity > 1.0f && profile->dryHopTriggerSG > profile->expectedFinalGravity) {
+    profile->dryHopFgOffset = profile->dryHopTriggerSG - profile->expectedFinalGravity;
+  }
+  if (profile->dryHopFgOffset > 0.0f && profile->expectedFinalGravity > 1.0f) {
+    profile->dryHopTriggerSG = profile->expectedFinalGravity + profile->dryHopFgOffset;
+  }
+  profile->dryHopEnabled = profile->dryHopEnabled &&
+                            profile->dryHopFgOffset > 0.0f &&
+                            profile->dryHopContactHours > 0;
   profile->dryHopDone = extractBool(json, "dryHopDone", profile->dryHopDone);
   profile->dryHopSkipped = extractBool(json, "dryHopSkipped", profile->dryHopSkipped);
   profile->dryHopStartTime = extractULong(json, "dryHopStartTime", profile->dryHopStartTime);
@@ -342,9 +381,16 @@ bool BrewProfileStore::loadFromPath(const char* path, BrewProfile* profile) {
   profile->coldCrashDone = extractBool(json, "coldCrashDone", profile->coldCrashDone);
   profile->coldCrashSkipped = extractBool(json, "coldCrashSkipped", profile->coldCrashSkipped);
   profile->coldCrashStartedAt = extractULong(json, "coldCrashStartedAt", profile->coldCrashStartedAt);
+  profile->packageStarted = extractBool(json, "packageStarted", profile->packageStarted);
+  profile->packageStartedAt = extractULong(json, "packageStartedAt", profile->packageStartedAt);
   profile->packageDone = extractBool(json, "packageDone", profile->packageDone);
   profile->packageSkipped = extractBool(json, "packageSkipped", profile->packageSkipped);
   profile->packagedAt = extractULong(json, "packagedAt", profile->packagedAt);
+  if (profile->packageDone && !profile->packageStarted) {
+    profile->packageStarted = true;
+    profile->packageStartedAt = profile->packagedAt;
+  }
+  TemperatureProfileEngine::loadFromJson(json, &profile->temperatureProfile);
   return true;
 }
 

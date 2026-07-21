@@ -17,6 +17,7 @@ enum BrewWizardStep {
   WIZARD_ATTENUATION,
   WIZARD_DIACETYL,
   WIZARD_YEAST_BEHAVIOR,
+  WIZARD_TEMP_ADVANCED,
   WIZARD_REVIEW,
   WIZARD_DONE
 };
@@ -76,6 +77,8 @@ private:
   bool editPristine;
   char yeastHistory[3][32];
   int yeastHistoryCount;
+  uint8_t brewProfileSelectedIndex;
+  uint8_t brewProfileFirstVisibleIndex;
 
   void loadStepBuffer();
   void commitStepBuffer();
@@ -90,6 +93,9 @@ private:
   void drawAttenuationList(TFT_eSPI& tft);
   void drawYeastHistory(TFT_eSPI& tft);
   void drawPresetSummary(TFT_eSPI& tft);
+  void drawTemperatureAdvanced(TFT_eSPI& tft);
+  bool handleTemperatureAdvancedTouch(int x, int y);
+  void syncBrewProfileDerivedFields();
   void applySelectedPreset();
   int currentStyleIndex() const;
   int currentPresetIndex() const;
