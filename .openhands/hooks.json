@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "post-commit": {
+      "command": ".openhands/hooks/update_librarian.sh",
+      "description": "Update librarian memory after commits"
+    },
+    "post-merge": {
+      "command": ".openhands/hooks/update_librarian.sh",
+      "description": "Update librarian memory after merges"
+    }
+  },
+  "update_scripts": {
+    "python": ".openhands/librarian/update_librarian.py",
+    "shell": ".openhands/hooks/update_librarian.sh"
+  }
+}
