@@ -30,6 +30,40 @@ docs/             - Technical documentation
 - **Lint:** None (Arduino IDE handles compilation)
 - **Start:** Upload firmware to ESP32/ESP8266 devices
 
+## Librarian System
+
+### When to Update
+
+**After any code changes** (new files, modified headers, updated functions/structs), the librarian must be updated to keep the documentation synchronized with the source code.
+
+### How to Update
+
+```bash
+python3 .openhands/librarian/update_librarian.py
+```
+
+This will:
+- Detect changed files via git
+- Update the file map with new/modified entries
+- Regenerate file cards for changed files with full API details
+
+For a full regeneration (not incremental):
+
+```bash
+python3 .openhands/librarian/generate_file_cards_improved.py
+```
+
+### What Gets Updated
+
+- **file-map.json**: Updated with new file entries and hashes
+- **files/*.md**: Detailed API cards for each source file including:
+  - Structs/classes with all fields and methods
+  - Function signatures with parameters and return types
+  - Enums with all values
+  - Dependencies (local and system includes)
+  - Side effects and hardware access
+  - Change risk assessment
+
 ## Important Conventions
 
 - **Code is truth:** Librarian memory supplements, never replaces, reading source code

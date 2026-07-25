@@ -187,7 +187,8 @@ def main():
     print(f"Existing file map entries: {len(file_map)}")
     
     # Build new file map
-    new_file_map = []
+    # Use a dict to track entries by path (key = path, value = entry)
+    new_file_entries = {}
     
     if full_update:
         # Full update: scan all relevant files
@@ -196,7 +197,7 @@ def main():
         for rel_path in relevant_files:
             entry = update_file_entry(project_root, file_map, rel_path)
             if entry:
-                new_file_map.append(entry)
+                new_file_entries[rel_path] = entry
     else:
         # Incremental update: only update changed files
         relevant_extensions = {'.h', '.cpp', '.ino', '.json', '.md', '.py', '.sh'}
@@ -212,16 +213,17 @@ def main():
             
             entry = update_file_entry(project_root, file_map, rel_path)
             if entry:
-                new_file_map.append(entry)
+                new_file_entries[rel_path] = entry
                 print(f"Updated: {rel_path}")
         
-        # Also keep unchanged entries
+        # Also keep unchanged entries (merge with existing)
         for entry in file_map:
-            if entry not in new_file_map:
-                new_file_map.append(entry)
+            path = entry['path']
+            if path not in new_file_entries:
+                new_file_entries[path] = entry
     
-    # Sort by path
-    new_file_map.sort(key=lambda x: x['path'])
+    # Convert dict to list, sorted by path
+    new_file_map = sorted(new_file_entries.values(), key=lambda x: x['path'])
     
     # Write updated file map
     map_path = script_dir / 'file-map.json'
@@ -235,93 +237,96 @@ def main():
     files_dir = script_dir / 'files'
     files_dir.mkdir(parents=True, exist_ok=True)
     
-    if full_update:
-        print("\nRegenerating all file cards...")
-        # Import and use the improved generator
-        sys.path.insert(0, str(script_dir))
-        try:
-            from generate_file_cards_improved import generate_file_card
-            import importlib
+    # Import and use the improved generator
+    sys.path.insert(0, str(script_dir))
+    try:
+        from generate_file_cards_improved import generate_file_card
+        
+        # Determine which files to update
+        key_files = [
+            # High-priority entry points
+            "SGNode_Base/SGNode_Base.ino",
+            "SGNode_Float/SGNode_Float.ino",
+            "SGNode_Plug/SGNode_Plug.ino",
             
-            # Re-run the improved generator
+            # High-risk shared/protocol/control files
+            "SGNode_Shared/sg_protocol.h",
+            "SGNode_Shared/plug_hardware.h",
+            
+            # Plug transport and control
+            "SGNode_Plug/src/plug_transport.cpp",
+            "SGNode_Plug/src/plug_transport.h",
+            "SGNode_Plug/src/plug_sensors.cpp",
+            "SGNode_Plug/src/plug_sensors.h",
+            "SGNode_Plug/src/plug_types.h",
+            "SGNode_Plug/src/plug_selfcheck.cpp",
+            "SGNode_Plug/src/plug_selfcheck.h",
+            "SGNode_Plug/src/beer_pi_controller.cpp",
+            "SGNode_Plug/src/beer_pi_controller.h",
+            "SGNode_Plug/src/air_controller.cpp",
+            "SGNode_Plug/src/air_controller.h",
+            "SGNode_Plug/src/relay_history.cpp",
+            "SGNode_Plug/src/relay_history.h",
+            
+            # Base domain and calculations
+            "SGNode_Base/src/domain/yeast_preset_repository.cpp",
+            "SGNode_Base/src/domain/yeast_preset_repository.h",
+            "SGNode_Base/src/domain/batch_action.cpp",
+            "SGNode_Base/src/domain/batch_action.h",
+            "SGNode_Base/src/domain/fermentation_state_machine.cpp",
+            "SGNode_Base/src/domain/fermentation_state_machine.h",
+            "SGNode_Base/src/domain/recommendation_engine.cpp",
+            "SGNode_Base/src/domain/recommendation_engine.h",
+            "SGNode_Base/src/domain/brew_profile.cpp",
+            "SGNode_Base/src/domain/brew_profile.h",
+            "SGNode_Base/src/domain/yeast_preset.cpp",
+            "SGNode_Base/src/domain/yeast_preset.h",
+            "SGNode_Base/src/calculations/brix_converter.cpp",
+            "SGNode_Base/src/calculations/brix_converter.h",
+            "SGNode_Base/src/calculations/derived_calculations.cpp",
+            "SGNode_Base/src/calculations/derived_calculations.h",
+            "SGNode_Base/src/calculations/eta_predictor.cpp",
+            "SGNode_Base/src/calculations/eta_predictor.h",
+            "SGNode_Base/src/calculations/og_verifier.cpp",
+            "SGNode_Base/src/calculations/og_verifier.h",
+            "SGNode_Base/src/calculations/target_curve.cpp",
+            "SGNode_Base/src/calculations/target_curve.h",
+            "SGNode_Base/src/calculations/polynomial_calibration.h",
+            
+            # Base UI
+            "SGNode_Base/src/ui/brew_wizard_controller.cpp",
+            "SGNode_Base/src/ui/brew_wizard_controller.h",
+            "SGNode_Base/src/ui/ui_components.cpp",
+            "SGNode_Base/src/ui/ui_components.h",
+            "SGNode_Base/src/ui/ui_tokens.h",
+            
+            # Test harness
+            "SGNode_Base/src/test/ui_test_harness.cpp",
+            "SGNode_Base/src/test/ui_test_harness.h",
+            
+            # Core shared
+            "SGNode_Float/polynomial_calibration.h",
+            
+            # Assets
+            "SGNode_Base/src/assets/Logo2_Optimized.h",
+            "SGNode_Base/src/assets/Logo2_Optimized_Data.h",
+        ]
+        
+        # Filter to relevant files (only source files, not markdown/other)
+        source_extensions = {'.h', '.cpp', '.ino'}
+        files_to_update = [
+            f for f in key_files 
+            if Path(f).suffix.lower() in source_extensions 
+            and (full_update or f in changed_files)
+        ]
+        
+        if files_to_update:
+            print(f"\nRegenerating file cards for {len(files_to_update)} changed source files...")
             print(f"SGNode File Card Generator (Improved)")
             print(f"======================================")
             print(f"Project: {project_root}")
             print(f"Output: {files_dir}")
             print()
-            
-            # Key files to process (priority order)
-            key_files = [
-                # High-priority entry points
-                "SGNode_Base/SGNode_Base.ino",
-                "SGNode_Float/SGNode_Float.ino",
-                "SGNode_Plug/SGNode_Plug.ino",
-                
-                # High-risk shared/protocol/control files
-                "SGNode_Shared/sg_protocol.h",
-                "SGNode_Shared/plug_hardware.h",
-                
-                # Plug transport and control
-                "SGNode_Plug/src/plug_transport.cpp",
-                "SGNode_Plug/src/plug_transport.h",
-                "SGNode_Plug/src/plug_sensors.cpp",
-                "SGNode_Plug/src/plug_sensors.h",
-                "SGNode_Plug/src/plug_types.h",
-                "SGNode_Plug/src/plug_selfcheck.cpp",
-                "SGNode_Plug/src/plug_selfcheck.h",
-                "SGNode_Plug/src/beer_pi_controller.cpp",
-                "SGNode_Plug/src/beer_pi_controller.h",
-                "SGNode_Plug/src/air_controller.cpp",
-                "SGNode_Plug/src/air_controller.h",
-                "SGNode_Plug/src/relay_history.cpp",
-                "SGNode_Plug/src/relay_history.h",
-                
-                # Base domain and calculations
-                "SGNode_Base/src/domain/yeast_preset_repository.cpp",
-                "SGNode_Base/src/domain/yeast_preset_repository.h",
-                "SGNode_Base/src/domain/batch_action.cpp",
-                "SGNode_Base/src/domain/batch_action.h",
-                "SGNode_Base/src/domain/fermentation_state_machine.cpp",
-                "SGNode_Base/src/domain/fermentation_state_machine.h",
-                "SGNode_Base/src/domain/recommendation_engine.cpp",
-                "SGNode_Base/src/domain/recommendation_engine.h",
-                "SGNode_Base/src/domain/brew_profile.cpp",
-                "SGNode_Base/src/domain/brew_profile.h",
-                "SGNode_Base/src/domain/yeast_preset.cpp",
-                "SGNode_Base/src/domain/yeast_preset.h",
-                "SGNode_Base/src/calculations/brix_converter.cpp",
-                "SGNode_Base/src/calculations/brix_converter.h",
-                "SGNode_Base/src/calculations/derived_calculations.cpp",
-                "SGNode_Base/src/calculations/derived_calculations.h",
-                "SGNode_Base/src/calculations/eta_predictor.cpp",
-                "SGNode_Base/src/calculations/eta_predictor.h",
-                "SGNode_Base/src/calculations/og_verifier.cpp",
-                "SGNode_Base/src/calculations/og_verifier.h",
-                "SGNode_Base/src/calculations/target_curve.cpp",
-                "SGNode_Base/src/calculations/target_curve.h",
-                "SGNode_Base/src/calculations/polynomial_calibration.h",
-                
-                # Base UI
-                "SGNode_Base/src/ui/brew_wizard_controller.cpp",
-                "SGNode_Base/src/ui/brew_wizard_controller.h",
-                "SGNode_Base/src/ui/ui_components.cpp",
-                "SGNode_Base/src/ui/ui_components.h",
-                "SGNode_Base/src/ui/ui_tokens.h",
-                
-                # Test harness
-                "SGNode_Base/src/test/ui_test_harness.cpp",
-                "SGNode_Base/src/test/ui_test_harness.h",
-                
-                # Core shared
-                "SGNode_Float/polynomial_calibration.h",
-                
-                # Assets
-                "SGNode_Base/src/assets/Logo2_Optimized.h",
-                "SGNode_Base/src/assets/Logo2_Optimized_Data.h",
-            ]
-            
-            # Filter to only changed files if incremental
-            files_to_update = key_files if full_update else [f for f in key_files if f in changed_files]
             
             generated_count = 0
             for rel_path in files_to_update:
@@ -337,17 +342,19 @@ def main():
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(card_content)
                 
-                print(f"  Updated: {safe_filename}.md")
+                print(f"  Generated: {safe_filename}.md")
                 generated_count += 1
             
             print()
             print(f"Generated/updated {generated_count} file cards")
-        except Exception as e:
-            print(f"Warning: Could not generate file cards: {e}")
-            print("Run python3 generate_file_cards_improved.py manually")
-    else:
-        print()
-        print(f"Run python3 generate_file_cards_improved.py to regenerate file cards")
+        else:
+            print()
+            print("No source files to regenerate (only documentation changes)")
+    except Exception as e:
+        print(f"Warning: Could not generate file cards: {e}")
+        import traceback
+        traceback.print_exc()
+        print("Run python3 generate_file_cards_improved.py manually")
     
     return 0
 

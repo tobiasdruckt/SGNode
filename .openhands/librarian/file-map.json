@@ -22,8 +22,8 @@
   },
   {
     "path": "README.md",
-    "role": "Project README / Entry Point",
-    "hash": "9168c297af79cc5e150c9732cfa3497c0b9149b36549e70d6f31515cfd422f24",
+    "role": "Documentation",
+    "hash": "8e56110a1bd17977f67148e3d12ff000f455c3a2c0f2a065229517c39274a9e6",
     "detail_md": "files/README.md",
     "type": "Markdown"
   },
@@ -49,17 +49,17 @@
     "type": "Markdown"
   },
   {
-    "path": "SGNode_Base/SGNode_Base.ino",
-    "role": "Base Station Main Entry",
-    "hash": "021bfb086bdfe16ee3be9bbf6a5c70ac53af4d45f4d652bd59bd9ad7b334ab67",
-    "detail_md": "files/SGNode_Base_SGNode_Base.md",
-    "type": "Arduino Sketch"
+    "path": "SGNode_Base/README.md",
+    "role": "Base Station Component",
+    "hash": "6bdb3a843dacdc400d5780420ea365602d008de9d50e48dcffbe5c6cf89efbfc",
+    "detail_md": "files/SGNode_Base_README.md",
+    "type": "Markdown"
   },
   {
     "path": "SGNode_Base/SGNode_Base.ino",
     "role": "Base Station Main Entry",
-    "hash": "021bfb086bdfe16ee3be9bbf6a5c70ac53af4d45f4d652bd59bd9ad7b334ab67",
-    "detail_md": "files/SGNode_Base_SGNode_Base.ino.md",
+    "hash": "13bce0a2e95b785e0de0d517c402f774edc6f345c7a4d577b6123963380441d2",
+    "detail_md": "files/SGNode_Base_SGNode_Base.md",
     "type": "Arduino Sketch"
   },
   {
@@ -142,36 +142,36 @@
   {
     "path": "SGNode_Base/src/domain/batch_action.cpp",
     "role": "Business Logic / Domain Model",
-    "hash": "ed7d2828eb97454d1950951fd79d7f0772b1fb62e2d61fdb86339919a3610e81",
-    "detail_md": "files/SGNode_Base_src_domain_batch_action.cpp.md",
+    "hash": "5bb6a02fbbacd0b61f6fcf70c4fe90bb3cea46d1087506f3b95b181fed34c22d",
+    "detail_md": "files/SGNode_Base_src_domain_batch_action.md",
     "type": "C++ Source"
   },
   {
     "path": "SGNode_Base/src/domain/batch_action.h",
     "role": "Business Logic / Domain Model",
-    "hash": "cc4561e8239351c93ec19e92246e3ac046810b8edf2029d3946a3bc6921fdaf9",
-    "detail_md": "files/SGNode_Base_src_domain_batch_action.h.md",
+    "hash": "69b5bb81298f175b256d3641e80867a21e7a85e1f5823774d41d02a8a19d0d1f",
+    "detail_md": "files/SGNode_Base_src_domain_batch_action.md",
     "type": "C++ Header"
   },
   {
     "path": "SGNode_Base/src/domain/brew_profile.cpp",
     "role": "Business Logic / Domain Model",
-    "hash": "ab1eee0e5c1df98c27090f92a08d49c1fb8af1556863c4ad435c97304917ebff",
-    "detail_md": "files/SGNode_Base_src_domain_brew_profile.cpp.md",
+    "hash": "3493903bdd746e02acba991dd531f85dd2aff5fbe26d4116defa473a74c4fef7",
+    "detail_md": "files/SGNode_Base_src_domain_brew_profile.md",
     "type": "C++ Source"
   },
   {
     "path": "SGNode_Base/src/domain/brew_profile.h",
     "role": "Business Logic / Domain Model",
-    "hash": "2bf1b492c7a21453322534c9263c1e0c7dc81097476c2b381d323894f42ee210",
-    "detail_md": "files/SGNode_Base_src_domain_brew_profile.h.md",
+    "hash": "39a7e5d7e5e4314020e97ed2c4b21e81f104dc94d6b50846b94a7cb22fa7c69b",
+    "detail_md": "files/SGNode_Base_src_domain_brew_profile.md",
     "type": "C++ Header"
   },
   {
     "path": "SGNode_Base/src/domain/fermentation_state_machine.cpp",
     "role": "Business Logic / Domain Model",
-    "hash": "71d73df27df8817eb58265d4235f8c493b128876dbfcff03a1731ca5927ffc5e",
-    "detail_md": "files/SGNode_Base_src_domain_fermentation_state_machine.cpp.md",
+    "hash": "85c9c0fe3334b569d3dfbc181e86587ae184140bab53634ce565394a4c4d1c88",
+    "detail_md": "files/SGNode_Base_src_domain_fermentation_state_machine.md",
     "type": "C++ Source"
   },
   {
@@ -184,8 +184,8 @@
   {
     "path": "SGNode_Base/src/domain/recommendation_engine.cpp",
     "role": "Business Logic / Domain Model",
-    "hash": "44fa0dcaa99a26cea6cf4d270c6d1a39235bf2a53b29f756c2b7e4ae1aaa27c2",
-    "detail_md": "files/SGNode_Base_src_domain_recommendation_engine.cpp.md",
+    "hash": "d3c7b44387fc126476ee545b7ae7c8e799146917b08d747409dab619912bea5f",
+    "detail_md": "files/SGNode_Base_src_domain_recommendation_engine.md",
     "type": "C++ Source"
   },
   {
@@ -193,6 +193,20 @@
     "role": "Business Logic / Domain Model",
     "hash": "fa4882eb5244ddfa582fef8a0998f3cfdc4fa52632f430e79083fce5230b9a16",
     "detail_md": "files/SGNode_Base_src_domain_recommendation_engine.h.md",
+    "type": "C++ Header"
+  },
+  {
+    "path": "SGNode_Base/src/domain/temperature_profile.cpp",
+    "role": "Business Logic / Domain Model",
+    "hash": "f86fb1225d360388f08c7ce70565e5a3c1602e673c71e9e421cc54a23adcbb10",
+    "detail_md": "files/SGNode_Base_src_domain_temperature_profile.md",
+    "type": "C++ Source"
+  },
+  {
+    "path": "SGNode_Base/src/domain/temperature_profile.h",
+    "role": "Business Logic / Domain Model",
+    "hash": "eeb16714df9a3e9eca1fbcac21b6354dc101101a00c8d0eee1e072e1a188c05d",
+    "detail_md": "files/SGNode_Base_src_domain_temperature_profile.md",
     "type": "C++ Header"
   },
   {
@@ -212,8 +226,8 @@
   {
     "path": "SGNode_Base/src/domain/yeast_preset_repository.cpp",
     "role": "Business Logic / Domain Model",
-    "hash": "67f7b075e8782d79c3a8b7fac8a101b5cb65cc198c717a41dce7ef259aebb5d2",
-    "detail_md": "files/SGNode_Base_src_domain_yeast_preset_repository.cpp.md",
+    "hash": "a295cf48c5417c1f6a9f884b584d4dad993fae32cf4b2e48aace3d0ee182153f",
+    "detail_md": "files/SGNode_Base_src_domain_yeast_preset_repository.md",
     "type": "C++ Source"
   },
   {
@@ -240,15 +254,15 @@
   {
     "path": "SGNode_Base/src/ui/brew_wizard_controller.cpp",
     "role": "User Interface Component",
-    "hash": "8a2ad353e3025ee3d69cd504459354e8b6a03088a560efbd0799c135a079b7ed",
-    "detail_md": "files/SGNode_Base_src_ui_brew_wizard_controller.cpp.md",
+    "hash": "e385792235a90f6444bce0b7f424fc4e461d06f3123e1e0e1badbd54b0297a92",
+    "detail_md": "files/SGNode_Base_src_ui_brew_wizard_controller.md",
     "type": "C++ Source"
   },
   {
     "path": "SGNode_Base/src/ui/brew_wizard_controller.h",
     "role": "User Interface Component",
-    "hash": "402d01940dfb781f971f2dc086219334e5958b499bc3ebb8d340eff37e6c521d",
-    "detail_md": "files/SGNode_Base_src_ui_brew_wizard_controller.h.md",
+    "hash": "e6a99a71c857fba0a83d92e6623486c5f1bd6fabed9310bd792dc3acadfcc989",
+    "detail_md": "files/SGNode_Base_src_ui_brew_wizard_controller.md",
     "type": "C++ Header"
   },
   {
@@ -268,22 +282,22 @@
   {
     "path": "SGNode_Base/src/ui/ui_tokens.h",
     "role": "User Interface Component",
-    "hash": "b66e78fc84c8e0ac1aaf987366e8da169580bf831fdd6b88a70602f1c9a8864e",
-    "detail_md": "files/SGNode_Base_src_ui_ui_tokens.h.md",
+    "hash": "81e7a9e8c39ebcd3e68f7c3f386d6396a2682b14abef90656b2ec9db0fd2cd3e",
+    "detail_md": "files/SGNode_Base_src_ui_ui_tokens.md",
     "type": "C++ Header"
   },
   {
     "path": "SGNode_Float/README.md",
     "role": "Float Unit Component",
-    "hash": "35418c49b5597ad930b8b3f4d2c2e0859f48d70745af5e3b020eb86c09f7a5c3",
+    "hash": "38221583ec28b67e6f88ee2fd87a8f7d8dbfa16dbbdf5c1d0963ceeb831fac8a",
     "detail_md": "files/SGNode_Float_README.md",
     "type": "Markdown"
   },
   {
     "path": "SGNode_Float/SGNode_Float.ino",
     "role": "Float Unit Main Entry",
-    "hash": "3f178f02a19c8e4524398c8d33c996b82d669cfd9eecfabeeb3e3d4d054ec34d",
-    "detail_md": "files/SGNode_Float_SGNode_Float.ino.md",
+    "hash": "766b927d8caee6c782ad5918f859abfb233d3e6ea66a65b48d30be009dc58318",
+    "detail_md": "files/SGNode_Float_SGNode_Float.md",
     "type": "Arduino Sketch"
   },
   {
@@ -296,36 +310,22 @@
   {
     "path": "SGNode_Plug/README.md",
     "role": "Plug Component",
-    "hash": "b0f617ab9ccd47f1c88af13fb6f730b85acd0ed4a14c402d181e19dff9da2ea4",
+    "hash": "8e33879cc1ee4a1143ea81f0810221ed1dad48c94512a7f1cf1f46916aa8c767",
     "detail_md": "files/SGNode_Plug_README.md",
     "type": "Markdown"
   },
   {
     "path": "SGNode_Plug/SGNode_Plug.ino",
     "role": "Plug Main Entry",
-    "hash": "328629a377f053a2d4831d89c57e913e6fd26ec8657b2f4a0ddb5f2aaffe9b44",
+    "hash": "210d7b82468cb15e6b0205495257e4a68aac291dbe3e847a0a39edf12e2b821d",
     "detail_md": "files/SGNode_Plug_SGNode_Plug.md",
     "type": "Arduino Sketch"
   },
   {
-    "path": "SGNode_Plug/SGNode_Plug.ino",
-    "role": "Plug Main Entry",
-    "hash": "328629a377f053a2d4831d89c57e913e6fd26ec8657b2f4a0ddb5f2aaffe9b44",
-    "detail_md": "files/SGNode_Plug_SGNode_Plug.ino.md",
-    "type": "Arduino Sketch"
-  },
-  {
     "path": "SGNode_Plug/src/air_controller.cpp",
     "role": "Plug Component",
     "hash": "b248bae18930b3aa64b92f2377d433a76ca59011eff188d4ce9633acebb0ee92",
     "detail_md": "files/SGNode_Plug_src_air_controller.md",
-    "type": "C++ Source"
-  },
-  {
-    "path": "SGNode_Plug/src/air_controller.cpp",
-    "role": "Plug Component",
-    "hash": "b248bae18930b3aa64b92f2377d433a76ca59011eff188d4ce9633acebb0ee92",
-    "detail_md": "files/SGNode_Plug_src_air_controller.cpp.md",
     "type": "C++ Source"
   },
   {
@@ -336,38 +336,17 @@
     "type": "C++ Header"
   },
   {
-    "path": "SGNode_Plug/src/air_controller.h",
-    "role": "Plug Component",
-    "hash": "8307e315ba311d8ae50e1e14f3aa872aa893262df997e26e768ca7ebc397dfbf",
-    "detail_md": "files/SGNode_Plug_src_air_controller.h.md",
-    "type": "C++ Header"
-  },
-  {
     "path": "SGNode_Plug/src/beer_pi_controller.cpp",
     "role": "Plug Component",
-    "hash": "c45046ace1e277c611efcb66f5792b2fe1937e23db833b2f24a6c1d674a3fed1",
+    "hash": "c48a41b1a2ff77fc068aac006b5c77dcdc2339efcadc2f91e447f0e1bf1d4483",
     "detail_md": "files/SGNode_Plug_src_beer_pi_controller.md",
-    "type": "C++ Source"
-  },
-  {
-    "path": "SGNode_Plug/src/beer_pi_controller.cpp",
-    "role": "Plug Component",
-    "hash": "c45046ace1e277c611efcb66f5792b2fe1937e23db833b2f24a6c1d674a3fed1",
-    "detail_md": "files/SGNode_Plug_src_beer_pi_controller.cpp.md",
     "type": "C++ Source"
   },
   {
     "path": "SGNode_Plug/src/beer_pi_controller.h",
     "role": "Plug Component",
-    "hash": "788747aae890c235e9dc87a8beb9a4ea898bded5d79dc93e7830d6da0caa8d65",
+    "hash": "80c80c35ad307ca0777c2a7cdc5647b42fa00c524eb49c43914abe0a8b6b7383",
     "detail_md": "files/SGNode_Plug_src_beer_pi_controller.md",
-    "type": "C++ Header"
-  },
-  {
-    "path": "SGNode_Plug/src/beer_pi_controller.h",
-    "role": "Plug Component",
-    "hash": "788747aae890c235e9dc87a8beb9a4ea898bded5d79dc93e7830d6da0caa8d65",
-    "detail_md": "files/SGNode_Plug_src_beer_pi_controller.h.md",
     "type": "C++ Header"
   },
   {
@@ -375,13 +354,6 @@
     "role": "Plug Component",
     "hash": "f7e16b5fd0735f0429bd1fba9a79b6136e53fec66378537161f92474696c5c88",
     "detail_md": "files/SGNode_Plug_src_plug_selfcheck.md",
-    "type": "C++ Source"
-  },
-  {
-    "path": "SGNode_Plug/src/plug_selfcheck.cpp",
-    "role": "Plug Component",
-    "hash": "f7e16b5fd0735f0429bd1fba9a79b6136e53fec66378537161f92474696c5c88",
-    "detail_md": "files/SGNode_Plug_src_plug_selfcheck.cpp.md",
     "type": "C++ Source"
   },
   {
@@ -408,22 +380,15 @@
   {
     "path": "SGNode_Plug/src/plug_transport.cpp",
     "role": "Plug Component",
-    "hash": "d9c4d1ee53a94c792954c3559bfd12f9043fbcb99ebba7589db8b052a209353b",
+    "hash": "f372885ae28e8186877f350cb3e12cf074fec23d06c26551872940d5ceaec1ff",
     "detail_md": "files/SGNode_Plug_src_plug_transport.md",
-    "type": "C++ Source"
-  },
-  {
-    "path": "SGNode_Plug/src/plug_transport.cpp",
-    "role": "Plug Component",
-    "hash": "d9c4d1ee53a94c792954c3559bfd12f9043fbcb99ebba7589db8b052a209353b",
-    "detail_md": "files/SGNode_Plug_src_plug_transport.cpp.md",
     "type": "C++ Source"
   },
   {
     "path": "SGNode_Plug/src/plug_transport.h",
     "role": "Plug Component",
-    "hash": "c5f03b4bd983e4b1c55153e3edbc8ea55bb9e342c8efd9fb4064104756ac84df",
-    "detail_md": "files/SGNode_Plug_src_plug_transport.h.md",
+    "hash": "071491b33f29388db606c98974c5e80d810b3e8e6d416629234cba9f1407e810",
+    "detail_md": "files/SGNode_Plug_src_plug_transport.md",
     "type": "C++ Header"
   },
   {
@@ -455,17 +420,17 @@
     "type": "C++ Header"
   },
   {
-    "path": "SGNode_Shared/sg_protocol.h",
+    "path": "SGNode_Shared/sg_logo_png.h",
     "role": "Shared Header / Protocol",
-    "hash": "1a1c39d03d752bb6043717f632a80a7701d9321eb9f4254b5f8468d61444f30f",
-    "detail_md": "files/SGNode_Shared_sg_protocol.md",
+    "hash": "5a6a106e423a63a031508d443334d44ba465ef80cbfb963ed9d62a3114f9fcd9",
+    "detail_md": "files/SGNode_Shared_sg_logo_png.md",
     "type": "C++ Header"
   },
   {
     "path": "SGNode_Shared/sg_protocol.h",
     "role": "Shared Header / Protocol",
-    "hash": "1a1c39d03d752bb6043717f632a80a7701d9321eb9f4254b5f8468d61444f30f",
-    "detail_md": "files/SGNode_Shared_sg_protocol.h.md",
+    "hash": "4a349e41c279633b6493caa3db926265a8265f92a8558487be1d6c10f8ca56f1",
+    "detail_md": "files/SGNode_Shared_sg_protocol.md",
     "type": "C++ Header"
   },
   {
